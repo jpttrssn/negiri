@@ -7,8 +7,9 @@
 use std::path::Path;
 
 use crate::app::{
-    AppModel, Message, Roll, RollDateField, THUMB_SIZE, TILE_ASPECT, Tile, Thumb,
-    detail_zoom_delta, highlight_lift, highlight_power_for_lift, shadow_lift, shadow_power_for_lift,
+    AppModel, Message, Roll, RollDateField, THUMB_SIZE, TILE_ASPECT, Tile, Thumb, contrast_lift,
+    contrast_power_for_lift, detail_zoom_delta, highlight_lift, highlight_power_for_lift,
+    shadow_lift, shadow_power_for_lift,
 };
 use crate::detail_area::DetailArea;
 use crate::error::FrameError;
@@ -216,20 +217,26 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // via a uniform-only remap — contrast pivots at the image's measured
     // mid-gray, shadows at the measured white point, highlights at the
     // measured shadow anchor. Grid thumbnails are unaffected; every detail
-    // open starts from the stored edits. The Highlights and Shadows sliders
-    // expose their power as a stop-based "lift value" (`highlight_lift`/
-    // `shadow_lift`) centered on the identity, so dragging right brightens the
-    // region instead of crushing it — the direction other photo apps use, with
-    // the sweet spot in the middle of the track. The two arms use opposite
-    // power↔lift maps because their pivots sit at opposite ends. Contrast keeps
-    // its conventional sense (up = more contrast).
+    // open starts from the stored edits. All three sliders expose their power
+    // as a stop-based "lift value" centered on the identity, so dragging right
+    // raises contrast / brightens the region — the direction other photo apps
+    // use, with the sweet spot in the middle of the track. Contrast spans ±3
+    // stops (power `0.125..8.0`) via `contrast_lift`; Highlights/Shadows span
+    // ±2 and use opposite power↔lift maps because their pivots sit at opposite
+    // ends.
     let contrast_label = widget::text(fl!("contrast-label"));
     let contrast_slider = widget::slider(
-        0.25..=4.0,
-        app.curve_contrast,
+        -3.0..=3.0,
+        contrast_lift(app.curve_contrast),
         // When any slider moves, the other values travel along so the
         // remap always composes the full curve, not a half-updated one.
-        move |contrast| Message::CurveChanged(contrast, app.curve_highlights, app.curve_shadows),
+        move |lift| {
+            Message::CurveChanged(
+                contrast_power_for_lift(lift),
+                app.curve_highlights,
+                app.curve_shadows,
+            )
+        },
     )
     .step(0.05_f32)
     // A finished drag is an edit flush point, like exposure.

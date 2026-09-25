@@ -59,19 +59,28 @@ where `s`, `m`, `w` are the existing measured anchors (10th / 50th / 98th
 percentile of the displayed positive; for film negatives derived per-EV by
 `film_pivots_at_gain`, unchanged).
 
-Tangents `T = [t0, ts, tc, th, t4]`, identity `1.0`:
+Tangents `T = [t0, ts, tm, th, t4]`, identity `1.0`:
 
-| Slider     | Tangent | Knot  |
-|------------|---------|-------|
-| Contrast   | `tc`    | `m`   |
-| Shadows    | `ts`    | `s`   |
-| Highlights | `th`    | `w`   |
-| (endpoint) | `t0`    | `0`   |
-| (endpoint) | `t4`    | `1`   |
+| Slider     | Tangent         | Knot  |
+|------------|-----------------|-------|
+| Shadows    | `ts`            | `s`   |
+| Highlights | `th`            | `w`   |
+| (mid)      | `tm = 1` (fixed) | `m`   |
+| (endpoint) | `t0 = 1`        | `0`   |
+| (endpoint) | `t4 = 1`        | `1`   |
 
-`t0 = t4 = 1` keeps the extreme ends linear. The stored manifest fields keep
-their names and their identity value `1.0`; only their meaning changes from
-"power" to "tangent" (pre-release, so no migration).
+`t0 = t4 = 1` keeps the extreme ends linear.
+
+**Contrast stays an outer global power, not a tangent.** The Hermite `H` carries
+only the regional Shadows/Highlights shape; the final curve is
+
+```
+T(p) = C(H(p)),   C(q) = mid^(1-kc)·q^kc
+```
+
+with `kc` the existing mid-pivoted contrast power. This keeps contrast's full
+±3-stop range (`0.125..8.0`) decoupled from the tangent monotonicity bound, and
+it is why the mid tangent is fixed at `1`.
 
 ### Control → tangent
 
@@ -79,33 +88,39 @@ Reuse the existing lift maps, which already produce the right direction:
 
 - Shadows lift `L` → `ts = 2^-L` (a lift bows the lower segment above the chord)
 - Highlights lift `L` → `th = 2^+L`
-- Contrast is the raw mid tangent (no lift mapping, as today)
+- Contrast is the outer power `kc` (unchanged semantics, now log2-lift UI)
 
 ### Monotonicity by construction
 
 Because the knots lie on the diagonal, every secant is exactly `1`
 (`(y_{i+1}-y_i)/(x_{i+1}-x_i) = 1`). Fritsch–Carlson guarantees monotonicity of
 a cubic Hermite segment when `alpha^2 + beta^2 <= 9`, with `alpha = m_i/Δ` and
-`beta = m_{i+1}/Δ`. With `Δ = 1`, clamping every tangent independently to
-`[1/3, 2.0]` gives a worst case of `2^2 + 2^2 = 8 < 9`, so:
+`beta = m_{i+1}/Δ`. With `Δ = 1` and the mid/endpoint tangents fixed at `1`,
+each adjacent tangent pair contains at most **one** variable tangent, so a
+region tangent can be clamped independently up to `sqrt(8) ≈ 2.83` (worst case
+`1^2 + 2.83^2 = 9 - ε`) with no neighbor coupling:
 
 - the curve is monotone for **all** slider combinations, and
 - no neighbor coupling is introduced (each control's tangent stands alone).
 
-Full Fritsch–Carlson (which would allow tangents up to ~3) is rejected: it can
-rescale a tangent shared by two segments, so a Shadows change could leak across
-`m` into the highlights. Exact isolation is worth the narrower range.
+Full Fritsch–Carlson (which can also rescale a tangent shared by two segments)
+is rejected for the same reason: it would let a Shadows change leak across `m`
+into the highlights.
+
+`C` is a monotone power, so monotonicity of `H` carries through to `T`.
 
 ### Isolation (exact, from the knot structure)
 
-- `T(0) = 0`, `T(s) = s`, `T(m) = m`, `T(w) = w`, `T(1) = 1` for every setting.
-- The segments above `m` depend only on `(m,m)`, `(w,w)`, `(1,1)`, `tc`, `th`,
-  `t4` ⇒ **Shadows never changes `T(p)` for `p >= m`.**
+- `H(0) = 0`, `H(s) = s`, `H(m) = m`, `H(w) = w`, `H(1) = 1` for every setting.
+- The segments above `m` depend only on `(m,m)`, `(w,w)`, `(1,1)`, `th`, `t4`
+  ⇒ **Shadows never changes `H(p)` for `p >= m`.**
 - The segments below `m` are independent of `th` ⇒ **Highlights never changes
-  `T(p)` for `p <= m`.**
-- Contrast affects only `[s, w]`.
-- Endpoints are pinned and the curve is monotone, so `T ∈ [0, 1]` with **no
-  interior clipping** — a highlight lift can no longer blow mids to white.
+  `H(p)` for `p <= m`.**
+- Contrast is a separate outer power applied after `H`; it deliberately touches
+  the whole range (a global control), and so is not "isolated" by design.
+- Endpoints are pinned and `H` is monotone, so `H ∈ [0, 1]`; `C` is a monotone
+  power mapping `[0,1]→[0,1]`, so `T ∈ [0, 1]` with **no interior clipping** — a
+  highlight lift can no longer blow mids to white.
 
 ### Evaluation
 
@@ -132,28 +147,26 @@ No `powf`; this is cheaper than the current `build_tone_lut` (2048 powf).
 ## What changes
 
 - `src/shader.rs`
-  - Replace `curve_remap` / `tone_model` with
-    `ToneCurve { x: [f32; 5], m: [f32; 5] }` + `ToneCurve::eval`.
-  - `build_tone_lut` and `apply_curve` keep their current signatures and build /
-    evaluate the curve internally, so `pipeline.rs` and `app.rs` call sites are
-    untouched.
-  - Update `DetailProgram` docs: `contrast` / `highlights` / `shadows` are
-    tangents.
+  - Replace `curve_remap` / `tone_model` with a `ToneCurve` holding the Hermite
+    knots/tangents **plus** the contrast power, and `ToneCurve::eval` applying
+    `C(H(p))`.
+  - `build_tone_lut` and `apply_curve` keep their current signatures, so
+    `pipeline.rs` call sites are untouched.
+  - `DetailProgram`: `highlights` / `shadows` become region-lift tangents;
+    `contrast` stays the outer mid-pivoted power.
   - Rewrite the pivot/identity/LUT-parity tests (see below).
 - `src/app.rs`
-  - `clamp_curve_power` range `[0.25, 4.0]` → `[1/3, 2.0]`.
+  - Region tangent clamp: independently up to `sqrt(8) ≈ 2.83` (was `[1/3, 2.0]`
+    under a shared-mid design).
+  - `contrast_lift` / `contrast_power_for_lift` (already added with the ±3-stop
+    log2 UI) drive the outer power, unchanged.
   - `shadow_lift` / `highlight_lift` / `shadow_power_for_lift` /
-    `highlight_power_for_lift` are unchanged (they already map to tangents).
-  - Comment updates only.
-- `src/ui.rs`
-  - Contrast slider range `0.25..=4.0` → `1.0/3.0..=2.0`.
-  - Highlights/Shadows sliders unchanged.
-  - Comment updates.
-- `src/edit_manifest.rs`
-  - Field / constant docs only. Values stay `1.0`; no serde or migration change.
-- `src/pipeline.rs`
-  - Unchanged.
-- `src/shader/exposure.wgsl`
+    `highlight_power_for_lift` are unchanged.
+- `src/ui.rs` / `src/edit_manifest.rs`
+  - Unchanged by the redesign: contrast is already a ±3-stop log2 control
+    (`contrast_lift`, `curve_contrast_lift_ticks`) and the region sliders are
+    already ±2-stop lifts.
+- `src/pipeline.rs`, `src/shader/exposure.wgsl`
   - Unchanged.
 - `NOTES.md`
   - Update the three-pivoted-power ADR, the tone-model description, and item 8
@@ -161,12 +174,12 @@ No `powf`; this is cheaper than the current `build_tone_lut` (2048 powf).
 
 ## Tests / acceptance criteria
 
-- **Identity**: all tangents `1` ⇒ `T(p) = p` exactly (a Hermite with all
-  tangents equal to the common secant collapses to the straight line).
-- **Pinning**: `T(0)=0`, `T(s)=s`, `T(m)=m`, `T(w)=w`, `T(1)=1` across
+- **Identity**: all tangents `1` and contrast `1` ⇒ `T(p) = p` exactly (a
+  Hermite with all tangents equal to the common secant collapses to the line).
+- **Pinning**: `H(0)=0`, `H(s)=s`, `H(m)=m`, `H(w)=w`, `H(1)=1` across
   randomized anchors and strengths.
-- **Isolation**: changing the Shadows tangent leaves `T(p)` bit-identical for
-  `p >= m`; changing the Highlights tangent leaves `T(p)` bit-identical for
+- **Isolation**: changing the Shadows tangent leaves `H(p)` bit-identical for
+  `p >= m`; changing the Highlights tangent leaves `H(p)` bit-identical for
   `p <= m`.
 - **Monotonicity**: a dense value grid × randomized anchors × slider extremes is
   non-decreasing.
@@ -180,16 +193,16 @@ No `powf`; this is cheaper than the current `build_tone_lut` (2048 powf).
 
 The sliders have no numeric readout, so "stops" in comments is only a label.
 After implementing, measure `ΔT` per slider step on a real film negative and a
-real positive RAW and choose the final tangent clamps (range and symmetry) so
-both arms feel comparable. The clamp lives in one constant (`clamp_curve_power`
-/ its tangent equivalent) plus the contrast slider range.
+real positive RAW and choose the final region tangent clamp up to `sqrt(8) ≈
+2.83` so the arms feel comparable. Contrast is independent (`contrast_lift`) and
+already calibrated.
 
 ## Risks / open questions
 
-- **Range trade**: the independent clamp caps the mid tangent at `2.0` (the old
-  power allowed `4.0`). If contrast feels weak, widen to `sqrt(4.5) ≈ 2.121`
-  (still monotone with all secants `1`), or accept limited coupling via full
-  Fritsch–Carlson.
+- **Region range**: the independent tangent clamp caps at `sqrt(8) ≈ 2.83`
+  (i.e. ~±1.5 stops of tangent swing); beyond that, exact isolation would have to
+  give way to full Fritsch–Carlson. Contrast is unaffected (outer power, ±3
+  stops).
 - Every persisted edit re-renders once (acceptable pre-release).
 - Anchors remain the current percentile definition; changing it later changes
   every edit's look.

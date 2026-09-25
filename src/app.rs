@@ -3903,8 +3903,11 @@ impl AppModel {
             }
             // Each tone arm only changes one power; the others keep their
             // current values so the composed curve stays fully defined.
+            // Contrast steps its stop lift (like the other two), so the
+            // "increase" keys `]` raise the mid-pivoted power.
             EditAdjust::Contrast(delta) => {
-                let contrast = clamp_curve_power(self.curve_contrast + delta);
+                let contrast =
+                    contrast_power_for_lift(contrast_lift(self.curve_contrast) + delta);
                 self.set_curve(contrast, self.curve_highlights, self.curve_shadows);
             }
             // Highlights and Shadows step their user-facing LIFT value in
@@ -4648,12 +4651,35 @@ fn clamp_ev(ev: f32) -> f32 {
     ev.clamp(-3.0, 4.0)
 }
 
-/// Clamps a tone-curve power (contrast/highlights/shadows) to the slider's
-/// range (0.25..=4.0) so a keyboard shortcut and the slider agree on bounds.
-/// The range is a symmetric reciprocal pair around the `1.0` identity, so the
-/// stop-based lift scales below span an even ±2 stops.
-fn clamp_curve_power(power: f32) -> f32 {
+/// Clamps the Contrast power (a mid-pivoted power) to the slider's range
+/// `0.125..=8.0` so a keyboard shortcut and the slider agree on bounds. The
+/// range is a symmetric reciprocal pair around the `1.0` identity, so the
+/// stop-based lift scale spans an even ±3 stops.
+fn clamp_contrast_power(power: f32) -> f32 {
+    power.clamp(0.125, 8.0)
+}
+
+/// Clamps a Highlights/Shadows region power to the slider's range
+/// `0.25..=4.0`. A symmetric reciprocal pair around `1.0`, spanning ±2 stops
+/// like [`clamp_contrast_power`] but narrower, since the region controls act on
+/// one end of the tone range.
+fn clamp_tone_lift_power(power: f32) -> f32 {
     power.clamp(0.25, 4.0)
+}
+
+/// The Contrast slider's user-facing "lift value" in stops: `+log2(power)`, so
+/// INCREASING it raises contrast (steeper mid slope). Identity at `0.0` (power
+/// `1.0` ⇔ 0 stops), at the CENTER of the symmetric `−3..=3` track; power 2.0
+/// is +1 stop, power 0.5 is −1 stop.
+pub(crate) fn contrast_lift(power: f32) -> f32 {
+    power.log2()
+}
+
+/// The stored contrast power for a lift value (in stops) picked by a slider or
+/// keyboard step. Bound-sensitive inverse of [`contrast_lift`] across the power
+/// range (round-trip `lift ↔ power` is exact within the range).
+pub(crate) fn contrast_power_for_lift(value: f32) -> f32 {
+    clamp_contrast_power(value.exp2())
 }
 
 /// The Shadows slider's user-facing "lift value" in stops: `-log2(power)`, so
@@ -4661,8 +4687,7 @@ fn clamp_curve_power(power: f32) -> f32 {
 /// the white point, so a lift drives the power BELOW 1.0 (a lower-tones lift
 /// with white pinned). Identity at `0.0` (power 1.0 ⇔ 0 stops), at the CENTER
 /// of the symmetric `−2..=2` track; power 0.5 is +1 stop of lift, power 2.0 is
-/// −1 stop (crush). Two stops of lift is a 4× (0.25) power, two of crush a 4×
-/// (4.0) power — equal perceptual reach each way.
+/// −1 stop (crush).
 pub(crate) fn shadow_lift(power: f32) -> f32 {
     -(power.log2())
 }
@@ -4670,10 +4695,10 @@ pub(crate) fn shadow_lift(power: f32) -> f32 {
 /// The stored shadows power for a lift value (in stops) picked by a slider or
 /// keyboard step. Bound-sensitive inverse of [`shadow_lift`] across the power
 /// range, so a value that exits `−2..=2` clamps to the same endpoints
-/// `clamp_curve_power` produces (round-trip `lift ↔ power` is exact within the
-/// range).
+/// `clamp_tone_lift_power` produces (round-trip `lift ↔ power` is exact within
+/// the range).
 pub(crate) fn shadow_power_for_lift(value: f32) -> f32 {
-    clamp_curve_power((-value).exp2())
+    clamp_tone_lift_power((-value).exp2())
 }
 
 /// The Highlights slider's user-facing "lift value" in stops: `+log2(power)`,
@@ -4691,7 +4716,7 @@ pub(crate) fn highlight_lift(power: f32) -> f32 {
 /// or keyboard step. Bound-sensitive inverse of [`highlight_lift`] across the
 /// power range (round-trip `lift ↔ power` is exact within the range).
 pub(crate) fn highlight_power_for_lift(value: f32) -> f32 {
-    clamp_curve_power(value.exp2())
+    clamp_tone_lift_power(value.exp2())
 }
 
 /// Translates the crop window by `delta_px` in `direction`, keeping the window
@@ -6004,10 +6029,28 @@ mod tests {
     }
 
     #[test]
-    fn clamp_curve_power_bounds_to_the_slider_range() {
-        assert_eq!(clamp_curve_power(0.0), 0.25);
-        assert_eq!(clamp_curve_power(9.0), 4.0);
-        assert_eq!(clamp_curve_power(1.0), 1.0);
+    fn clamp_contrast_power_bounds_to_the_slider_range() {
+        assert_eq!(clamp_contrast_power(0.0), 0.125);
+        assert_eq!(clamp_contrast_power(99.0), 8.0);
+        assert_eq!(clamp_contrast_power(1.0), 1.0);
+    }
+
+    #[test]
+    fn clamp_tone_lift_power_bounds_to_the_slider_range() {
+        assert_eq!(clamp_tone_lift_power(0.0), 0.25);
+        assert_eq!(clamp_tone_lift_power(99.0), 4.0);
+        assert_eq!(clamp_tone_lift_power(1.0), 1.0);
+    }
+
+    #[test]
+    fn contrast_lift_value_follows_the_power_direction() {
+        // Identity sits at the center 0.0; raising the power raises contrast.
+        assert!((contrast_lift(1.0) - 0.0).abs() < 1e-6);
+        assert!((contrast_lift(2.0) - 1.0).abs() < 1e-6);
+        assert!((contrast_lift(0.5) - (-1.0)).abs() < 1e-6);
+        // Monotone increasing in the power, like the highlights arm.
+        let (a, b) = (contrast_lift(0.6), contrast_lift(1.4));
+        assert!(a < b);
     }
 
     #[test]
@@ -6052,16 +6095,26 @@ mod tests {
                 "highlights power {power} round-tripped to {highlight_back}"
             );
         }
-        // Values leaving the symmetric ±2-stop window clamp to the power
-        // endpoints, so an exited lift track and `clamp_curve_power` agree on
-        // bounds.
+        for power in [0.125_f32, 0.25, 1.0, 2.0, 4.0, 8.0] {
+            let contrast_back = contrast_power_for_lift(contrast_lift(power));
+            assert!(
+                (contrast_back - power).abs() < 1e-5,
+                "contrast power {power} round-tripped to {contrast_back}"
+            );
+        }
+        // Values leaving the symmetric windows clamp to the power endpoints, so
+        // an exited lift track and the clamps agree on bounds. Contrast spans
+        // ±3 stops; Highlights/Shadows ±2.
         assert_eq!(shadow_power_for_lift(3.0), 0.25);
         assert_eq!(shadow_power_for_lift(-3.0), 4.0);
         assert_eq!(highlight_power_for_lift(3.0), 4.0);
         assert_eq!(highlight_power_for_lift(-3.0), 0.25);
-        // The identity lift value maps to the identity power on both arms.
+        assert_eq!(contrast_power_for_lift(3.0), 8.0);
+        assert_eq!(contrast_power_for_lift(-3.0), 0.125);
+        // The identity lift value maps to the identity power on every arm.
         assert!((shadow_power_for_lift(0.0) - 1.0).abs() < 1e-6);
         assert!((highlight_power_for_lift(0.0) - 1.0).abs() < 1e-6);
+        assert!((contrast_power_for_lift(0.0) - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -6678,9 +6731,11 @@ mod tests {
             let ev = rng.next() * 7.0 - 3.0;
             let tone = edit_manifest::ToneEdit {
                 exposure_ev: ev,
-                curve_contrast: rng.next() * 1.5 + 0.5,
-                curve_highlights: rng.next() * 1.5 + 0.5,
-                curve_shadows: rng.next() * 1.5 + 0.5,
+                // Contrast spans its full ±3-stop power range (0.125..8.0);
+                // Highlights/Shadows their ±2-stop range (0.25..4.0).
+                curve_contrast: (rng.next() * 6.0 - 3.0).exp2(),
+                curve_highlights: (rng.next() * 4.0 - 2.0).exp2(),
+                curve_shadows: (rng.next() * 4.0 - 2.0).exp2(),
             };
             let preset = if rng.next() < 0.5 {
                 FilmPreset::None
