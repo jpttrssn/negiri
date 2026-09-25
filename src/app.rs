@@ -79,6 +79,8 @@ const DETAIL_PRELOAD_DISTANCE: usize = 1;
 /// with a bare key.
 const EDIT_STEP_EV: f32 = 0.50;
 /// Keyboard shortcut nudge step for exposure (EV) with the Shift modifier.
+/// Equal to `edit_manifest::EV_TICK` (and the exposure slider's step), so every
+/// exposure edit lands on the fixed-point storage grid.
 const EDIT_NUDGE_EV: f32 = 0.05;
 /// Keyboard shortcut step for a tone-curve power (contrast/highlights/shadows)
 /// with a bare key. Highlights and Shadows apply it to their user-facing lift

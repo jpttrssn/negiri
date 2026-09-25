@@ -205,8 +205,10 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     }
 
     let label = widget::text(fl!("exposure-label"));
+    // The `0.05 EV` step matches `edit_manifest::EV_TICK`, the keyboard nudge,
+    // and the fixed-point storage grid.
     let slider = widget::slider(-3.0..=4.0, app.exposure_ev, Message::ExposureChanged)
-        .step(0.01_f32)
+        .step(0.05_f32)
         // A finished drag is an edit flush point.
         .on_release(Message::EditSave);
 
