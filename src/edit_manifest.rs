@@ -30,24 +30,118 @@ pub const DEFAULT_CURVE_HIGHLIGHTS: f32 = 1.0;
 /// edit records otherwise (identity `1.0`).
 pub const DEFAULT_CURVE_SHADOWS: f32 = 1.0;
 
-/// Serializable per-file edits.
+/// Fixed-point quantum for the stored exposure (EV). The manifest stores an
+/// integer tick count so on-disk values are exact and carry no f32 noise;
+/// `0.05 EV` matches the keyboard nudge and keeps the `0.7 EV` default at 14.
+pub const EV_TICK: f32 = 0.05;
+
+/// Fixed-point quantum for the stored tone controls: all three (Contrast,
+/// Highlights, Shadows) are stop-based lifts. Matches every tone slider's step.
+pub const TONE_TICK: f32 = 0.05;
+
+/// Stored exposure tick bounds (the exposure slider's −3..+4 EV range).
+const EXPOSURE_TICK_MIN: i16 = -60;
+const EXPOSURE_TICK_MAX: i16 = 80;
+/// Stored contrast lift-tick bounds (the centered `−3..=3` stop track, power
+/// `0.125..=8.0`).
+const CONTRAST_TICK_MIN: i16 = -60;
+const CONTRAST_TICK_MAX: i16 = 60;
+/// Stored Highlights/Shadows lift-tick bounds (the centered `−2..=2` track).
+const TONE_LIFT_TICK_MIN: i16 = -40;
+const TONE_LIFT_TICK_MAX: i16 = 40;
+
+/// `+0.7 EV` default in ticks (`0.7 / EV_TICK`).
+const DEFAULT_EXPOSURE_TICKS: i16 = 14;
+/// Identity contrast lift in ticks (power `1.0` ⇔ `0` stops).
+const DEFAULT_CONTRAST_LIFT_TICKS: i16 = 0;
+
+/// Rounds `value` to the nearest tick and clamps to `[min, max]`, so every
+/// stored edit lands on the fixed-point grid.
+#[allow(clippy::cast_possible_truncation)]
+fn quantize_tick(value: f32, tick: f32, min: i16, max: i16) -> i16 {
+    ((value / tick).round() as i32).clamp(i32::from(min), i32::from(max)) as i16
+}
+
+/// The stored exposure tick for an EV value.
+fn exposure_ticks(ev: f32) -> i16 {
+    quantize_tick(ev, EV_TICK, EXPOSURE_TICK_MIN, EXPOSURE_TICK_MAX)
+}
+
+/// The exposure EV a stored tick decodes to.
+fn exposure_ev(ticks: i16) -> f32 {
+    f32::from(ticks) * EV_TICK
+}
+
+/// The stored contrast lift tick for a mid-pivoted power. The lift is
+/// `+log2(power)` (a rightward drag raises contrast), stored in the lift domain
+/// so the `0.05` slider grid is exact through the integer round-trip.
+fn contrast_lift_ticks(power: f32) -> i16 {
+    quantize_tick(
+        power.clamp(0.125, 8.0).log2(),
+        TONE_TICK,
+        CONTRAST_TICK_MIN,
+        CONTRAST_TICK_MAX,
+    )
+}
+
+/// The contrast power a stored lift tick decodes to.
+fn contrast_power(ticks: i16) -> f32 {
+    (f32::from(ticks) * TONE_TICK).exp2()
+}
+
+/// The stored Highlights lift tick for a shadow-pivoted power. The lift is
+/// `+log2(power)` (a rightward drag brightens); storing it in the lift domain
+/// keeps the `0.05` slider grid exact through the integer round-trip.
+fn highlight_lift_ticks(power: f32) -> i16 {
+    quantize_tick(
+        power.clamp(0.25, 4.0).log2(),
+        TONE_TICK,
+        TONE_LIFT_TICK_MIN,
+        TONE_LIFT_TICK_MAX,
+    )
+}
+
+/// The Highlights power a stored lift tick decodes to.
+fn highlight_power(ticks: i16) -> f32 {
+    (f32::from(ticks) * TONE_TICK).exp2()
+}
+
+/// The stored Shadows lift tick for a white-pivoted power. The lift is
+/// `-log2(power)` (a rightward drag brightens), the opposite power direction
+/// from Highlights.
+fn shadow_lift_ticks(power: f32) -> i16 {
+    quantize_tick(
+        -power.clamp(0.25, 4.0).log2(),
+        TONE_TICK,
+        TONE_LIFT_TICK_MIN,
+        TONE_LIFT_TICK_MAX,
+    )
+}
+
+/// The Shadows power a stored lift tick decodes to.
+fn shadow_power(ticks: i16) -> f32 {
+    (-f32::from(ticks) * TONE_TICK).exp2()
+}
+
+/// Serializable per-file edits, stored as exact integer ticks (see [`EV_TICK`]
+/// / [`TONE_TICK`]) rather than f32.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EditData {
-    /// Exposure compensation in EV (−3.00 to +4.00).
-    #[serde(default = "default_exposure")]
-    pub exposure_ev: f32,
-    /// Tone-curve contrast power (pivoted at the image's measured mid-gray),
-    /// `1.0` = identity. Missing in older manifests stays `1.0`.
-    #[serde(default = "default_curve_identity")]
-    pub curve_contrast: f32,
-    /// Tone-curve highlights power (pivoted at the image's measured shadow
-    /// anchor), `1.0` = identity. Missing in older manifests stays `1.0`.
-    #[serde(default = "default_curve_identity")]
-    pub curve_highlights: f32,
-    /// Tone-curve shadows power (pivoted at the image's measured white point),
-    /// `1.0` = identity. Missing in older manifests stays `1.0`.
-    #[serde(default = "default_curve_identity")]
-    pub curve_shadows: f32,
+    /// Exposure compensation in [`EV_TICK`] ticks (`14` = `+0.70 EV`).
+    #[serde(default = "default_exposure_ticks")]
+    pub exposure_ticks: i16,
+    /// Contrast lift in stop ticks (mid-pivoted power, `+log2`), `0` =
+    /// identity.
+    #[serde(default = "default_contrast_lift_ticks")]
+    pub curve_contrast_lift_ticks: i16,
+    /// Highlights lift in stop ticks (shadow-pivoted power, `+log2`), `0` =
+    /// identity.
+    #[serde(default = "default_identity_lift_ticks")]
+    pub curve_highlights_ticks: i16,
+    /// Shadows lift in stop ticks (white-pivoted power, `-log2`), `0` =
+    /// identity.
+    #[serde(default = "default_identity_lift_ticks")]
+    pub curve_shadows_ticks: i16,
     /// Source-pixel crop margins removed from each edge. Missing in older
     /// manifests stays the all-zero (no-crop) [`CropMargins::default`].
     ///
@@ -66,39 +160,47 @@ pub struct EditData {
 }
 
 impl Default for EditData {
-    /// A fresh, un-edited entry: zero exposure, identity tone curve, no crop.
+    /// A fresh, un-edited entry: default exposure, identity tone curve, no crop.
     fn default() -> Self {
         Self {
-            exposure_ev: DEFAULT_EXPOSURE_EV,
-            curve_contrast: DEFAULT_CURVE_CONTRAST,
-            curve_highlights: DEFAULT_CURVE_HIGHLIGHTS,
-            curve_shadows: DEFAULT_CURVE_SHADOWS,
+            exposure_ticks: DEFAULT_EXPOSURE_TICKS,
+            curve_contrast_lift_ticks: DEFAULT_CONTRAST_LIFT_TICKS,
+            curve_highlights_ticks: 0,
+            curve_shadows_ticks: 0,
             crop: CropMargins::default(),
             rotation: 0,
         }
     }
 }
 
-/// `#[serde(default)]` target so a legacy manifest entry without the curve
-/// fields loads as the identity curve.
+/// `#[serde(default)]` target so a legacy manifest entry without the exposure
+/// field loads the current base exposure rather than a raw `0`.
 #[allow(clippy::unnecessary_wraps)]
-fn default_curve_identity() -> f32 {
-    1.0
+fn default_exposure_ticks() -> i16 {
+    DEFAULT_EXPOSURE_TICKS
 }
 
-/// `#[serde(default)]` target so a legacy manifest entry without an exposure
-/// field loads the current base exposure rather than a raw `0.0`.
+/// `#[serde(default)]` target so a legacy manifest entry without the contrast
+/// field loads the identity contrast lift.
 #[allow(clippy::unnecessary_wraps)]
-fn default_exposure() -> f32 {
-    DEFAULT_EXPOSURE_EV
+fn default_contrast_lift_ticks() -> i16 {
+    DEFAULT_CONTRAST_LIFT_TICKS
+}
+
+/// `#[serde(default)]` target for the identity Highlights/Shadows lift.
+#[allow(clippy::unnecessary_wraps)]
+fn default_identity_lift_ticks() -> i16 {
+    0
 }
 
 /// A per-file edit aggregated into one value the decode/thumbnail pipelines
 /// can thread through without a 5-tuple or per-field reads.
 ///
-/// All fields are identities at `Default`: zero exposure, identity powers.
-/// `Default` must match the un-edited rendering exactly so a manifest entry
-/// without an edit paints identical to `EditData::default()`.
+/// This is the runtime `f32` view decoded from the manifest's exact integer
+/// ticks ([`EditData`]); the shader, LUT, and bakes consume these powers
+/// directly. All fields are identities at `Default`: default exposure, identity
+/// powers. `Default` must match the un-edited rendering exactly so a manifest
+/// entry without an edit paints identical to `EditData::default()`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ToneEdit {
     pub exposure_ev: f32,
@@ -238,13 +340,14 @@ impl RollManifest {
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn set_exposure(&mut self, name: &str, exposure_ev: f32) {
+        let ticks = exposure_ticks(exposure_ev);
         if let Some(edit) = self.edits.get_mut(name) {
-            edit.exposure_ev = exposure_ev;
+            edit.exposure_ticks = ticks;
         } else {
             self.edits.insert(
                 name.to_owned(),
                 EditData {
-                    exposure_ev,
+                    exposure_ticks: ticks,
                     ..Default::default()
                 },
             );
@@ -252,22 +355,25 @@ impl RollManifest {
     }
 
     /// Records the tone curve for `name` (contrast + highlights + shadows),
-    /// updating an existing entry in place. All identities are `1.0`.
+    /// updating an existing entry in place. Powers are quantized to
+    /// [`TONE_TICK`]; the identities are contrast `1.0`, both lifts `0.0`.
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn set_curve(&mut self, name: &str, contrast: f32, highlights: f32, shadows: f32) {
+        let contrast = contrast_lift_ticks(contrast);
+        let highlights = highlight_lift_ticks(highlights);
+        let shadows = shadow_lift_ticks(shadows);
         if let Some(edit) = self.edits.get_mut(name) {
-            edit.curve_contrast = contrast;
-            edit.curve_highlights = highlights;
-            edit.curve_shadows = shadows;
+            edit.curve_contrast_lift_ticks = contrast;
+            edit.curve_highlights_ticks = highlights;
+            edit.curve_shadows_ticks = shadows;
         } else {
             self.edits.insert(
                 name.to_owned(),
                 EditData {
-                    exposure_ev: DEFAULT_EXPOSURE_EV,
-                    curve_contrast: contrast,
-                    curve_highlights: highlights,
-                    curve_shadows: shadows,
+                    curve_contrast_lift_ticks: contrast,
+                    curve_highlights_ticks: highlights,
+                    curve_shadows_ticks: shadows,
                     ..EditData::default()
                 },
             );
@@ -275,8 +381,8 @@ impl RollManifest {
     }
 
     /// The full edit for `name` as a single [`ToneEdit`], merging exposure
-    /// and the curve powers. Files (or manifest fields) never touched fall
-    /// back to their identities.
+    /// and the curve powers (decoded from their stored ticks). Files (or
+    /// manifest fields) never touched fall back to their identities.
     ///
     /// The crop margins are intentionally NOT part of this aggregate: it is
     /// the copy/paste payload, and a crop must never be copied/pasted.
@@ -285,10 +391,10 @@ impl RollManifest {
         self.edits
             .get(name)
             .map_or_else(ToneEdit::identity, |edit| ToneEdit {
-                exposure_ev: edit.exposure_ev,
-                curve_contrast: edit.curve_contrast,
-                curve_highlights: edit.curve_highlights,
-                curve_shadows: edit.curve_shadows,
+                exposure_ev: exposure_ev(edit.exposure_ticks),
+                curve_contrast: contrast_power(edit.curve_contrast_lift_ticks),
+                curve_highlights: highlight_power(edit.curve_highlights_ticks),
+                curve_shadows: shadow_power(edit.curve_shadows_ticks),
             })
     }
 
@@ -297,7 +403,7 @@ impl RollManifest {
     ///
     /// A paste never touches the target's crop or rotation: the crop margins
     /// and the user rotation survive [`Self::set_tone`] unchanged (or stay
-    /// default on a fresh file).
+    /// default on a fresh file). Powers are quantized to [`TONE_TICK`].
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn set_tone(&mut self, name: &str, tone: ToneEdit) {
@@ -309,10 +415,10 @@ impl RollManifest {
         self.edits.insert(
             name.to_owned(),
             EditData {
-                exposure_ev: tone.exposure_ev,
-                curve_contrast: tone.curve_contrast,
-                curve_highlights: tone.curve_highlights,
-                curve_shadows: tone.curve_shadows,
+                exposure_ticks: exposure_ticks(tone.exposure_ev),
+                curve_contrast_lift_ticks: contrast_lift_ticks(tone.curve_contrast),
+                curve_highlights_ticks: highlight_lift_ticks(tone.curve_highlights),
+                curve_shadows_ticks: shadow_lift_ticks(tone.curve_shadows),
                 crop: existing,
                 rotation,
             },
@@ -596,6 +702,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// A Contrast power on the stored lift-tick grid (mid-pivoted, `+log2`).
+    fn cpow(tick: i16) -> f32 {
+        contrast_power(tick)
+    }
+
+    /// A Highlights power on the stored tick grid (shadow-pivoted, `+log2`).
+    fn hpow(tick: i16) -> f32 {
+        highlight_power(tick)
+    }
+
+    /// A Shadows power on the stored tick grid (white-pivoted, `-log2`).
+    fn spow(tick: i16) -> f32 {
+        shadow_power(tick)
+    }
+
     /// A unique scratch directory under the OS temp dir, caller-created and
     /// caller-cleaned.
     fn temp_dir(label: &str) -> PathBuf {
@@ -612,9 +733,9 @@ mod tests {
         let dir = temp_dir("roundtrip");
         std::fs::create_dir_all(&dir).unwrap();
         let mut manifest = RollManifest::default();
-        manifest.set_exposure("IMG_0001.DNG", 0.42);
+        manifest.set_exposure("IMG_0001.DNG", 0.40);
         manifest.set_exposure("IMG_0002.RAW", -0.75);
-        manifest.set_curve("IMG_0001.DNG", 0.85, 1.15, 1.1);
+        manifest.set_curve("IMG_0001.DNG", cpow(-4), hpow(4), spow(-3));
         manifest.set_rotation("IMG_0001.DNG", 1);
 
         save_roll_manifest(&dir, &manifest).unwrap();
@@ -623,12 +744,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded, manifest);
-        assert_eq!(loaded.tone("IMG_0001.DNG").exposure_ev, 0.42);
+        assert_eq!(loaded.tone("IMG_0001.DNG").exposure_ev, 0.40);
         assert_eq!(loaded.tone("IMG_0002.RAW").exposure_ev, -0.75);
         let tone_one = loaded.tone("IMG_0001.DNG");
-        assert_eq!(tone_one.curve_contrast, 0.85);
-        assert_eq!(tone_one.curve_highlights, 1.15);
-        assert_eq!(tone_one.curve_shadows, 1.1);
+        assert_eq!(tone_one.curve_contrast, cpow(-4));
+        assert_eq!(tone_one.curve_highlights, hpow(4));
+        assert_eq!(tone_one.curve_shadows, spow(-3));
         // The second image carried only an exposure edit → curve identity.
         assert_eq!(
             loaded.tone("IMG_0002.RAW"),
@@ -736,7 +857,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             manifest_path(&dir),
-            "version = 1\nfortune = 42\n\n[edits.\"a.DNG\"]\nexposure_ev = 1.5\n",
+            "version = 1\nfortune = 42\n\n[edits.\"a.DNG\"]\nexposure_ticks = 30\n",
         )
         .unwrap();
 
@@ -770,7 +891,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             manifest_path(&dir),
-            "version = 1\n\n[edits.\"a.DNG\"]\nexposure_ev = 0.75\n",
+            "version = 1\n\n[edits.\"a.DNG\"]\nexposure_ticks = 15\n",
         )
         .unwrap();
 
@@ -789,8 +910,8 @@ mod tests {
         let dir = temp_dir("curve-roundtrip");
         std::fs::create_dir_all(&dir).unwrap();
         let mut manifest = RollManifest::default();
-        manifest.set_exposure("IMG_0001.DNG", 0.42);
-        manifest.set_curve("IMG_0001.DNG", 0.8, 1.2, 1.05);
+        manifest.set_exposure("IMG_0001.DNG", 0.40);
+        manifest.set_curve("IMG_0001.DNG", cpow(5), hpow(5), spow(-1));
 
         save_roll_manifest(&dir, &manifest).unwrap();
 
@@ -799,18 +920,18 @@ mod tests {
 
         assert_eq!(loaded, manifest);
         let tone = loaded.tone("IMG_0001.DNG");
-        assert_eq!(tone.curve_contrast, 0.8);
-        assert_eq!(tone.curve_highlights, 1.2);
-        assert_eq!(tone.curve_shadows, 1.05);
+        assert_eq!(tone.curve_contrast, cpow(5));
+        assert_eq!(tone.curve_highlights, hpow(5));
+        assert_eq!(tone.curve_shadows, spow(-1));
         // Exposure survives alongside the curve on the same edit.
-        assert_eq!(tone.exposure_ev, 0.42);
+        assert_eq!(tone.exposure_ev, 0.40);
     }
 
     #[test]
     fn set_curve_updates_in_place() {
         let mut manifest = RollManifest::default();
-        manifest.set_curve("a.DNG", 0.9, 1.1, 1.0);
-        manifest.set_curve("a.DNG", 1.0, 1.0, 1.0);
+        manifest.set_curve("a.DNG", cpow(-2), 1.1, 1.0);
+        manifest.set_curve("a.DNG", cpow(0), 1.0, 1.0);
 
         assert_eq!(manifest.edits.len(), 1);
         let tone = manifest.tone("a.DNG");
@@ -828,7 +949,7 @@ mod tests {
         manifest.set_exposure("a.DNG", 0.3);
         assert_eq!(manifest.tone("a.DNG").curve_contrast, 1.0);
 
-        manifest.set_curve("a.DNG", 1.2, 0.9, 1.1);
+        manifest.set_curve("a.DNG", cpow(4), 0.9, 1.1);
         let tone = manifest.tone("a.DNG");
         assert_eq!(tone.exposure_ev, 0.3);
         assert_eq!(manifest.edits.len(), 1);
@@ -838,37 +959,37 @@ mod tests {
     fn tone_merges_exposure_and_curve() {
         let mut manifest = RollManifest::default();
         manifest.set_exposure("a.DNG", -0.5);
-        manifest.set_curve("a.DNG", 1.2, 0.8, 0.9);
+        manifest.set_curve("a.DNG", cpow(6), hpow(-6), spow(3));
 
         let tone = manifest.tone("a.DNG");
         assert_eq!(tone.exposure_ev, -0.5);
-        assert_eq!(tone.curve_contrast, 1.2);
-        assert_eq!(tone.curve_highlights, 0.8);
-        assert_eq!(tone.curve_shadows, 0.9);
+        assert_eq!(tone.curve_contrast, cpow(6));
+        assert_eq!(tone.curve_highlights, hpow(-6));
+        assert_eq!(tone.curve_shadows, spow(3));
     }
 
     #[test]
     fn set_tone_replaces_the_full_edit_in_one_step() {
         let mut manifest = RollManifest::default();
         manifest.set_exposure("a.DNG", 0.3);
-        manifest.set_curve("a.DNG", 1.2, 0.9, 1.1);
+        manifest.set_curve("a.DNG", cpow(6), hpow(2), spow(-2));
 
         // A copy/paste replaces every field at once.
         manifest.set_tone(
             "a.DNG",
             ToneEdit {
                 exposure_ev: -1.2,
-                curve_contrast: 0.7,
-                curve_highlights: 1.4,
-                curve_shadows: 1.3,
+                curve_contrast: cpow(-16),
+                curve_highlights: hpow(10),
+                curve_shadows: spow(-8),
             },
         );
 
         let tone = manifest.tone("a.DNG");
         assert_eq!(tone.exposure_ev, -1.2);
-        assert_eq!(tone.curve_contrast, 0.7);
-        assert_eq!(tone.curve_highlights, 1.4);
-        assert_eq!(tone.curve_shadows, 1.3);
+        assert_eq!(tone.curve_contrast, cpow(-16));
+        assert_eq!(tone.curve_highlights, hpow(10));
+        assert_eq!(tone.curve_shadows, spow(-8));
         assert_eq!(manifest.edits.len(), 1);
     }
 
@@ -879,9 +1000,9 @@ mod tests {
             "b.DNG",
             ToneEdit {
                 exposure_ev: 0.4,
-                curve_contrast: 1.1,
-                curve_highlights: 0.9,
-                curve_shadows: 1.0,
+                curve_contrast: cpow(2),
+                curve_highlights: hpow(-3),
+                curve_shadows: spow(0),
             },
         );
         assert_eq!(manifest.tone("b.DNG").exposure_ev, 0.4);
@@ -946,7 +1067,7 @@ mod tests {
         // A manifest without the crop field.
         std::fs::write(
             manifest_path(&dir),
-            "version = 1\n\n[edits.\"a.DNG\"]\nexposure_ev = 0.75\n",
+            "version = 1\n\n[edits.\"a.DNG\"]\nexposure_ticks = 15\n",
         )
         .unwrap();
 
@@ -962,7 +1083,7 @@ mod tests {
     fn crop_coexists_with_tone_edits_on_one_entry() {
         let mut manifest = RollManifest::default();
         manifest.set_exposure("a.DNG", 0.3);
-        manifest.set_curve("a.DNG", 1.2, 0.9, 1.1);
+        manifest.set_curve("a.DNG", cpow(6), 0.9, 1.1);
         let crop = CropMargins {
             top: 5,
             right: 6,
@@ -975,7 +1096,7 @@ mod tests {
         assert_eq!(manifest.crop("a.DNG"), crop);
         let tone = manifest.tone("a.DNG");
         assert_eq!(tone.exposure_ev, 0.3);
-        assert_eq!(tone.curve_contrast, 1.2);
+        assert_eq!(tone.curve_contrast, cpow(6));
     }
 
     #[test]
@@ -1002,7 +1123,7 @@ mod tests {
         // A manifest without the rotation field.
         std::fs::write(
             manifest_path(&dir),
-            "version = 1\n\n[edits.\"a.DNG\"]\nexposure_ev = 0.75\n",
+            "version = 1\n\n[edits.\"a.DNG\"]\nexposure_ticks = 15\n",
         )
         .unwrap();
 
@@ -1018,7 +1139,7 @@ mod tests {
     fn rotation_coexists_with_tone_and_crop_on_one_entry() {
         let mut manifest = RollManifest::default();
         manifest.set_exposure("a.DNG", 0.3);
-        manifest.set_curve("a.DNG", 1.2, 0.9, 1.1);
+        manifest.set_curve("a.DNG", cpow(6), 0.9, 1.1);
         let crop = CropMargins {
             top: 5,
             right: 6,
@@ -1033,7 +1154,7 @@ mod tests {
         assert_eq!(manifest.crop("a.DNG"), crop);
         let tone = manifest.tone("a.DNG");
         assert_eq!(tone.exposure_ev, 0.3);
-        assert_eq!(tone.curve_contrast, 1.2);
+        assert_eq!(tone.curve_contrast, cpow(6));
     }
 
     #[test]
@@ -1070,9 +1191,9 @@ mod tests {
             "a.DNG",
             ToneEdit {
                 exposure_ev: -1.2,
-                curve_contrast: 0.7,
-                curve_highlights: 1.4,
-                curve_shadows: 1.3,
+                curve_contrast: cpow(8),
+                curve_highlights: hpow(7),
+                curve_shadows: spow(-6),
             },
         );
 
@@ -1124,14 +1245,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut manifest = RollManifest::default();
         manifest.set_preset(FilmPreset::Hp5Plus);
-        manifest.set_exposure("IMG_0001.DNG", 0.42);
+        manifest.set_exposure("IMG_0001.DNG", 0.40);
 
         save_roll_manifest(&dir, &manifest).unwrap();
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded.preset(), FilmPreset::Hp5Plus);
-        assert_eq!(loaded.tone("IMG_0001.DNG").exposure_ev, 0.42);
+        assert_eq!(loaded.tone("IMG_0001.DNG").exposure_ev, 0.40);
     }
 
     #[test]
@@ -1232,7 +1353,7 @@ mod tests {
         // A manifest without the base fields.
         std::fs::write(
             manifest_path(&dir),
-            "version = 1\n\n[edits.\"a.DNG\"]\nexposure_ev = 0.75\n",
+            "version = 1\n\n[edits.\"a.DNG\"]\nexposure_ticks = 15\n",
         )
         .unwrap();
 
@@ -1348,7 +1469,7 @@ mod tests {
         manifest.set_preset(FilmPreset::Hp5Plus);
         manifest.set_base_mode(BaseMode::AutoSelectedFrame);
         manifest.set_calibrated_base(0.7);
-        manifest.set_exposure("IMG_0001.DNG", 0.42);
+        manifest.set_exposure("IMG_0001.DNG", 0.40);
 
         save_roll_manifest(&dir, &manifest).unwrap();
         let loaded = load_roll_manifest(&dir);
@@ -1357,6 +1478,81 @@ mod tests {
         assert_eq!(loaded.preset(), FilmPreset::Hp5Plus);
         assert_eq!(loaded.base_mode(), BaseMode::AutoSelectedFrame);
         assert_eq!(loaded.calibrated_base(), Some(0.7));
-        assert_eq!(loaded.tone("IMG_0001.DNG").exposure_ev, 0.42);
+        assert_eq!(loaded.tone("IMG_0001.DNG").exposure_ev, 0.40);
+    }
+
+    #[test]
+    fn manifest_stores_integer_ticks() {
+        // The on-disk manifest is exact integers, not f32: the whole point of
+        // the fixed-point storage.
+        let mut manifest = RollManifest::default();
+        manifest.set_exposure("a.DNG", 0.7);
+        manifest.set_curve("a.DNG", cpow(8), hpow(5), spow(-3));
+
+        let dir = temp_dir("integer-ticks");
+        std::fs::create_dir_all(&dir).unwrap();
+        save_roll_manifest(&dir, &manifest).unwrap();
+        let text = std::fs::read_to_string(manifest_path(&dir)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(text.contains("exposure_ticks = 14"), "{text}");
+        assert!(text.contains("curve_contrast_lift_ticks = 8"), "{text}");
+        assert!(text.contains("curve_highlights_ticks = 5"), "{text}");
+        assert!(text.contains("curve_shadows_ticks = -3"), "{text}");
+    }
+
+    #[test]
+    fn old_contrast_key_is_ignored_and_loads_identity() {
+        // The pre-lift key carried a raw-power tick count; the renamed key must
+        // not be read, so a stale sidecar loads the identity contrast.
+        let dir = temp_dir("old-contrast-key");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            manifest_path(&dir),
+            "version = 1\n\n[edits.\"a.DNG\"]\ncurve_contrast_ticks = 40\n",
+        )
+        .unwrap();
+
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.tone("a.DNG").curve_contrast, DEFAULT_CURVE_CONTRAST);
+    }
+
+    #[test]
+    fn tick_conversions_round_trip_exactly_on_the_grid() {
+        // The hardcoded identity ticks must track the f32 default constants.
+        assert_eq!(exposure_ticks(DEFAULT_EXPOSURE_EV), DEFAULT_EXPOSURE_TICKS);
+        assert_eq!(
+            contrast_lift_ticks(DEFAULT_CURVE_CONTRAST),
+            DEFAULT_CONTRAST_LIFT_TICKS
+        );
+        for ticks in [-60_i16, -7, 0, 14, 80] {
+            assert_eq!(exposure_ticks(exposure_ev(ticks)), ticks);
+        }
+        for ticks in [-60_i16, -8, 0, 8, 60] {
+            assert_eq!(contrast_lift_ticks(contrast_power(ticks)), ticks);
+        }
+        for ticks in [-40_i16, -3, 0, 4, 40] {
+            assert_eq!(highlight_lift_ticks(highlight_power(ticks)), ticks);
+            assert_eq!(shadow_lift_ticks(shadow_power(ticks)), ticks);
+        }
+    }
+
+    #[test]
+    fn off_grid_values_snap_to_the_nearest_tick_and_clamp() {
+        // 0.42 EV is 8.4 ticks → 8 (0.40 EV); a 1.4 highlights power is
+        // +0.485 stops → tick 10 (2^0.5); a 3.0 contrast power is +1.585 stops
+        // → tick 32.
+        assert_eq!(exposure_ticks(0.42), 8);
+        assert_eq!(highlight_lift_ticks(1.4), 10);
+        assert_eq!(contrast_lift_ticks(3.0), 32);
+        // Out-of-range powers clamp to the endpoints (contrast above 8.0 and
+        // below 0.125, shadows clamped to its 0.25 floor).
+        assert_eq!(exposure_ticks(99.0), 80);
+        assert_eq!(contrast_lift_ticks(99.0), 60);
+        assert_eq!(contrast_lift_ticks(0.0), -60);
+        assert_eq!(highlight_lift_ticks(99.0), 40);
+        assert_eq!(shadow_lift_ticks(0.0), 40);
     }
 }

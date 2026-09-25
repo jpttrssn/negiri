@@ -2319,9 +2319,15 @@ mod tests {
         // R16Float sampler would), and interpolating must stay within a small
         // tolerance of the exact expression everywhere.
         let (shadow, mid, white) = (0.15_f32, 0.45_f32, 0.92_f32);
-        for (contrast, highlights, shadows) in
-            [(1.0_f32, 1.0_f32, 1.0_f32), (1.25, 0.7, 1.3), (0.5, 2.0, 0.4), (1.8, 1.1, 2.5)]
-        {
+        for (contrast, highlights, shadows) in [
+            (1.0_f32, 1.0_f32, 1.0_f32),
+            (1.25, 0.7, 1.3),
+            (0.5, 2.0, 0.4),
+            (1.8, 1.1, 2.5),
+            // The widened contrast endpoints (±3 stops).
+            (8.0, 1.0, 1.0),
+            (0.125, 1.0, 1.0),
+        ] {
             let (ratio, exponent) = curve_remap(contrast, highlights, shadows, shadow, mid, white);
             let bytes = build_tone_lut(contrast, highlights, shadows, shadow, mid, white);
             let lut: Vec<f32> = bytes
