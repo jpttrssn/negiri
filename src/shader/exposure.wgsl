@@ -67,8 +67,16 @@ struct Uniforms {
     // the usable density range (positive white), `inv_gamma` the density-space
     // tone exponent.
     inv_base: f32,
+    // The EFFECTIVE usable density range: the stock's `d_max` scaled by the
+    // user Contrast (`d_max · 2^-contrast`), so the window can be tightened or
+    // widened in log-density.
     inv_d_max: f32,
     inv_gamma: f32,
+    // Density-domain region lifts (signed, normalized-positive units) for the
+    // film path: a toe mask weighted `(1-p)^2` and a shoulder mask `p^2`, each
+    // vanishing at the opposite end so the controls stay independent.
+    region_shadows: f32,
+    region_highlights: f32,
 };
 
 @group(0) @binding(0) var t_mono: texture_2d<f32>;
@@ -288,12 +296,19 @@ fn shade(uv: vec2<f32>) -> f32 {
         let density = -log(clamped / uniforms.inv_base) / log(10.0);
         let position = clamp(density / uniforms.inv_d_max, 0.0, 1.0);
         let positive = pow(position, uniforms.inv_gamma);
-        // Live tone curve re-shapes the positive via the CPU-built 2048×1 tone
-        // LUT (`t_tone`), sampled on the gamma domain `t = p^(1/G)` (G = 2.2)
-        // so the grid packs toward black where shadow-lift curves are steep.
-        // The LUT stores curve output × 512 (to survive half-float's low end
-        // before the later exposure gain), so the sample is divided by 512.
-        v = textureSample(t_tone, s_tone, vec2<f32>(pow(positive, 0.4545455), 0.5)).r / 512.0;
+        // Density-domain region shape (CPU twin: `film::region_shape`): a toe
+        // lift and a shoulder lift, each a region-local additive mask whose
+        // weight vanishes at the opposite end, so the two controls are
+        // independent. `K = 2` matches `film::REGION_MASK_K`.
+        let toe = pow(1.0 - positive, 2.0);
+        let shoulder = pow(positive, 2.0);
+        v = clamp(
+            positive
+                + uniforms.region_shadows * toe
+                + uniforms.region_highlights * shoulder,
+            0.0,
+            1.0,
+        );
     } else {
         // --- Already-positive scan (unchanged path) ---
         // Live tone curve re-shapes the baked positive's values via the same

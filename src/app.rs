@@ -3866,11 +3866,17 @@ impl AppModel {
         }
     }
 
-    /// Writes the open frame's tone-curve powers live: the RAM roll edit and
+    /// Writes the open frame's tone-curve controls live: the RAM roll edit and
     /// the GPU shader uniforms. The slider (`CurveChanged`) and a keyboard step
     /// (`EditAdjust::Contrast`/`Highlights`/`Shadows`) both route here;
     /// committing (persist + re-bake) stays separate like
     /// [`Self::set_exposure`].
+    ///
+    /// The three values are stored as powers (the positive-path curve domain),
+    /// but the film path re-reads them as STOP LIFTS via `log2`/`-log2` and
+    /// applies them in the density domain (Contrast scales the density window;
+    /// Highlights/Shadows are the toe/shoulder masks). See
+    /// `docs/tone-model-density.md`.
     fn set_curve(&mut self, contrast: f32, highlights: f32, shadows: f32) {
         self.curve_contrast = contrast;
         self.curve_highlights = highlights;
@@ -5266,13 +5272,16 @@ mod tests {
     #[test]
     fn flatten_bayer_scales_classes_to_a_common_base() {
         // Neutral film at transmission 0.5 seen through per-class sensor casts
-        // (RGGB layout: one R, two G, one B site).
+        // (RGGB layout: one R, two G, one B site). A single 2×2 cell collapses
+        // to one output: the post-gain mean, here exactly the common base.
         let cfa = rawloader::CFA::new("RGGB");
         let samples = [0.60, 0.50, 0.50, 0.40]; // R, G, G, B sites
 
-        let mono = flatten_bayer(&samples, 2, 2, &cfa);
+        let (mono, w, h) = flatten_bayer(&samples, 2, 2, &cfa);
 
-        assert!(mono.iter().all(|value| (value - 0.5).abs() < 1e-6));
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(mono.len(), 1);
+        assert!((mono[0] - 0.5).abs() < 1e-6, "collapsed to {}", mono[0]);
     }
 
     #[test]
@@ -5281,9 +5290,10 @@ mod tests {
         let cfa = rawloader::CFA::new("GBRG");
         let samples = [0.25, 0.20, 0.30, 0.25]; // G, B, R, G sites
 
-        let mono = flatten_bayer(&samples, 2, 2, &cfa);
+        let (mono, w, h) = flatten_bayer(&samples, 2, 2, &cfa);
 
-        assert!(mono.iter().all(|value| (value - 0.25).abs() < 1e-6));
+        assert_eq!((w, h), (1, 1));
+        assert!((mono[0] - 0.25).abs() < 1e-6, "collapsed to {}", mono[0]);
     }
 
     #[test]
@@ -5292,8 +5302,33 @@ mod tests {
         let cfa = rawloader::CFA::new("RGBE");
         let samples = [0.45, 0.50, 0.55, 0.50]; // R, G, B, E sites
 
-        let mono = flatten_bayer(&samples, 2, 2, &cfa);
+        let (mono, w, h) = flatten_bayer(&samples, 2, 2, &cfa);
 
+        assert_eq!((w, h), (1, 1));
+        assert!((mono[0] - 0.5).abs() < 1e-6, "collapsed to {}", mono[0]);
+    }
+
+    #[test]
+    fn flatten_bayer_averages_a_consistent_cell() {
+        // A uniform 2×2 cell (all classes carry the same transmission) must
+        // average to exactly that value, whatever the per-class gains.
+        let cfa = rawloader::CFA::new("RGGB");
+        let samples = [0.30, 0.30, 0.30, 0.30];
+        let (mono, w, h) = flatten_bayer(&samples, 2, 2, &cfa);
+        assert_eq!((w, h), (1, 1));
+        assert!((mono[0] - 0.30).abs() < 1e-6);
+    }
+
+    #[test]
+    fn flatten_bayer_halves_dims_and_replicates_odd_edges() {
+        // 3×3 input → 2×2 output; the final partial row/column is
+        // edge-replicated (no pixel dropped) and the result is the post-gain
+        // mean of each cell.
+        let cfa = rawloader::CFA::new("RGGB");
+        let samples = [0.5_f32; 9];
+        let (mono, w, h) = flatten_bayer(&samples, 3, 3, &cfa);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(mono.len(), 4);
         assert!(mono.iter().all(|value| (value - 0.5).abs() < 1e-6));
     }
 
@@ -6674,6 +6709,8 @@ mod tests {
         inv_base: f32,
         inv_d_max: f32,
         inv_gamma: f32,
+        region_shadows: f32,
+        region_highlights: f32,
         tone_lut: &[f32],
     ) -> f32 {
         let mono_linear = mono;
@@ -6683,7 +6720,13 @@ mod tests {
             let density = -(clamped / inv_base).ln() / 10.0_f32.ln();
             let position = (density / inv_d_max).clamp(0.0, 1.0);
             let positive = position.powf(inv_gamma);
-            shader::sample_tone_lut_f32(tone_lut, positive)
+            // Density-domain region shape (mirrors the WGSL film branch:
+            // `film::region_shape` with K = 2). The film path does NOT sample
+            // the tone LUT.
+            let toe = (1.0 - positive).powf(2.0);
+            let shoulder = positive.powf(2.0);
+            (positive + region_shadows * toe + region_highlights * shoulder)
+                .clamp(0.0, 1.0)
         } else {
             let remapped = shader::sample_tone_lut_f32(tone_lut, mono_linear);
             (remapped * exposure).clamp(0.0, 1.0)
@@ -6757,7 +6800,9 @@ mod tests {
 
             let (stock_and_base, pivots) = pivots_for(&mono, tone, preset, base_config);
             let (shadow, mid, white) = pivots;
-            // The GPU side delivers the same tone model through the LUT.
+            // The positive path delivers the curve through the LUT; the film
+            // path evaluates its density-domain shape inline (mirrored by
+            // `gpu_fragment`).
             let lut = half_lut_bytes_to_f32(&shader::build_tone_lut(
                 tone.curve_contrast,
                 tone.curve_highlights,
@@ -6766,26 +6811,45 @@ mod tests {
                 mid,
                 white,
             ));
-            let (exposure, inv, inv_base, inv_d_max, inv_gamma) = match stock_and_base {
-                Some((stock, base)) => (
-                    shader::sensor_gain(tone.exposure_ev, true),
-                    true,
-                    base,
-                    stock.d_max,
-                    stock.gamma,
-                ),
-                None => (
-                    shader::sensor_gain(tone.exposure_ev, false),
-                    false,
-                    1.0,
-                    1.0,
-                    1.0,
-                ),
-            };
+            // Stop lifts recovered from the decoded powers, matching the maps
+            // the app/pipeline use.
+            let contrast_stops = tone.curve_contrast.log2();
+            let shadows_stops = -tone.curve_shadows.log2();
+            let highlights_stops = tone.curve_highlights.log2();
+            let (exposure, inv, inv_base, inv_d_max, inv_gamma, region_shadows, region_highlights) =
+                match stock_and_base {
+                    Some((stock, base)) => (
+                        shader::sensor_gain(tone.exposure_ev, true),
+                        true,
+                        base,
+                        crate::film::effective_d_max(stock.d_max, contrast_stops),
+                        stock.gamma,
+                        crate::film::region_strength(shadows_stops),
+                        crate::film::region_strength(highlights_stops),
+                    ),
+                    None => (
+                        shader::sensor_gain(tone.exposure_ev, false),
+                        false,
+                        1.0,
+                        1.0,
+                        1.0,
+                        0.0,
+                        0.0,
+                    ),
+                };
 
             for (i, &sample) in mono.iter().enumerate() {
-                let reference =
-                    gpu_fragment(sample, exposure, inv, inv_base, inv_d_max, inv_gamma, &lut);
+                let reference = gpu_fragment(
+                    sample,
+                    exposure,
+                    inv,
+                    inv_base,
+                    inv_d_max,
+                    inv_gamma,
+                    region_shadows,
+                    region_highlights,
+                    &lut,
+                );
                 let baked_value = baked[i];
                 assert!(
                     (baked_value - reference).abs() <= 5e-4,

@@ -13,7 +13,7 @@ use cosmic::widget::image::Handle;
 use crate::edit_manifest::{CropMargins, ToneEdit};
 use crate::error::FrameError;
 use crate::film::{
-    ACTIVE_STOCK, BaseConfig, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, invert_gray, measure_base,
+    self, ACTIVE_STOCK, BaseConfig, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, measure_base,
 };
 use crate::shader;
 fn normalize_samples(image: &rawloader::RawImage) -> Vec<f32> {
@@ -71,14 +71,29 @@ pub(crate) fn crop_samples(
 /// clear-film bases in [`flatten_bayer`].
 pub(crate) const BASE_SAMPLE_TARGET: usize = 250_000;
 
-/// Reconstructs a full-resolution monochrome negative from bayer samples.
+/// Reconstructs a monochrome negative from bayer samples, one output pixel per
+/// 2×2 CFA cell.
 ///
 /// Monochrome film carries no color signal, so each CFA class is treated as an
 /// independent density measurement: every class's clear-film transmission is
 /// measured from a strided subsample and the classes are rescaled onto one
-/// common base. This reads the sensor at native resolution instead of
-/// averaging 2x2 blocks, keeping grain texture a demosaic would smear.
-pub(crate) fn flatten_bayer(samples: &[f32], width: usize, height: usize, cfa: &rawloader::CFA) -> Vec<f32> {
+/// common base (neutralizing the light-table/sensor cast). Because the four
+/// sites of a cell then measure the *same* luminance on one common scale, they
+/// are averaged — gain first, then mean — halving the read noise versus
+/// emitting a single photosite per pixel. The output is half-resolution in each
+/// axis (a final partial row/column for odd dimensions is edge-replicated).
+///
+/// This is a luminance reconstruction for a monochrome scene, not a color
+/// demosaic; color negatives will need a real demosaic pass later.
+///
+/// Returns the mono samples plus their (halved) dimensions.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub(crate) fn flatten_bayer(
+    samples: &[f32],
+    width: usize,
+    height: usize,
+    cfa: &rawloader::CFA,
+) -> (Vec<f32>, u32, u32) {
     let pixels = width * height;
     // An odd step cannot alias with the period-2 CFA grid.
     let step = usize::max(pixels / BASE_SAMPLE_TARGET, 1) | 1;
@@ -102,11 +117,35 @@ pub(crate) fn flatten_bayer(samples: &[f32], width: usize, height: usize, cfa: &
     let empty = std::array::from_fn(|class| class_samples[class].is_empty());
     let gains = class_gains(anchored, empty);
 
-    samples[..pixels]
-        .iter()
-        .enumerate()
-        .map(|(idx, value)| value * gains[cfa.color_at(idx / width, idx % width)])
-        .collect()
+    // Gain-normalize every site onto the common base BEFORE averaging, so the
+    // four classes of a cell are comparable measurements of one luminance.
+    let gain_at = |y: usize, x: usize| gains[cfa.color_at(y, x)];
+
+    let out_w = width.div_ceil(2);
+    let out_h = height.div_ceil(2);
+    let last_x = width.saturating_sub(1);
+    let last_y = height.saturating_sub(1);
+    let mut mono = Vec::with_capacity(out_w * out_h);
+    for oy in 0..out_h {
+        let y0 = oy * 2;
+        // Edge-replicate the final partial cell's row/column.
+        let y1 = usize::min(y0 + 1, last_y);
+        for ox in 0..out_w {
+            let x0 = ox * 2;
+            let x1 = usize::min(x0 + 1, last_x);
+            let mut sum = 0.0_f32;
+            let mut count = 0.0_f32;
+            for y in [y0, y1] {
+                for x in [x0, x1] {
+                    sum += samples[y * width + x] * gain_at(y, x);
+                    count += 1.0;
+                }
+            }
+            mono.push(sum / count);
+        }
+    }
+
+    (mono, out_w as u32, out_h as u32)
 }
 
 /// Gains that rescale the four CFA classes onto one common base.
@@ -714,20 +753,33 @@ fn render_tail(
     pivots: (f32, f32, f32),
 ) {
     if let Some((stock, base)) = stock_and_base {
+        // Film path: EV gain on the true sensor data, density inversion with a
+        // Contrast-scaled window, then the density-domain toe/shoulder shape —
+        // the exact ordering and math the WGSL film branch applies. Contrast
+        // and the region controls are read as STOP LIFTS (their film meaning),
+        // recovered from the decoded powers by the same maps the UI uses:
+        // contrast `+log2`, highlights `+log2`, shadows `-log2`.
         apply_exposure(mono, -tone.exposure_ev);
-        invert_gray(mono, &stock, base);
-    }
-    let (shadow, mid, white) = pivots;
-    shader::apply_curve(
-        mono,
-        tone.curve_contrast,
-        tone.curve_highlights,
-        tone.curve_shadows,
-        shadow,
-        mid,
-        white,
-    );
-    if stock_and_base.is_none() {
+        let d_max_eff = film::effective_d_max(stock.d_max, tone.curve_contrast.log2());
+        let shadows = film::region_strength(-tone.curve_shadows.log2());
+        let highlights = film::region_strength(tone.curve_highlights.log2());
+        for value in mono.iter_mut() {
+            let positive =
+                film::invert_value_graded(*value, base, d_max_eff, stock.gamma);
+            *value = film::region_shape(positive, shadows, highlights);
+        }
+    } else {
+        // Already-positive path keeps the pivoted-power tone curve.
+        let (shadow, mid, white) = pivots;
+        shader::apply_curve(
+            mono,
+            tone.curve_contrast,
+            tone.curve_highlights,
+            tone.curve_shadows,
+            shadow,
+            mid,
+            white,
+        );
         apply_exposure(mono, tone.exposure_ev);
     }
     for value in mono {
@@ -1033,7 +1085,10 @@ fn orient(
 ///
 /// The `src_long_edge` field is the sensor's true long edge AFTER cropping but
 /// BEFORE the downscale — i.e. the real native long edge the overview was
-/// scaled down from (< `max_edge` means the overview is already full-res).
+/// scaled down from (< `max_edge` means the overview is already full-res). For
+/// a bayer source the mono is first CFA-averaged to half resolution (see
+/// [`flatten_bayer`]), so the returned `width`/`height` are half the cropped
+/// sensor dims while `src_long_edge` stays in sensor pixels.
 /// `inversion` is `Some((stock, base))` when the preset marks a film negative,
 /// threading the clear-film anchor to the shader; the roll's `base_config`
 /// resolves that anchor preset-first (calibration, then the auto opt-in, then
@@ -1086,7 +1141,10 @@ pub(crate) async fn decode_raw_detail(
             }
 
             let cfa = image.cfa.shift(image.crops[3], image.crops[0]);
-            (flatten_bayer(&samples, width, height, &cfa), width, height)
+            // `flatten_bayer` averages each 2×2 CFA cell into one output pixel,
+            // so it returns its own (halved) dimensions.
+            let (mono, out_w, out_h) = flatten_bayer(&samples, width, height, &cfa);
+            (mono, out_w as usize, out_h as usize)
         };
 
         // True sensor-linear data for every preset: an already-positive scan
@@ -1136,7 +1194,14 @@ pub(crate) struct DetailDecode {
     pub(crate) mono: Vec<f32>,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    /// The sensor's true long edge AFTER cropping but BEFORE the downscale.
+    /// The sensor's true long edge AFTER cropping but BEFORE any downscale.
+    /// Kept in SENSOR pixels (not the CFA-averaged mono's) so the crop margins
+    /// — authored against the full-resolution display frame by the grid bake
+    /// and keyboard trims — stay in one reference frame across grid, detail,
+    /// and export. The detail texture is a downscale of `mono`, which for a
+    /// bayer source is already 2× CFA-averaged, so its true 1:1 is reached
+    /// earlier; the `src_long_edge`/texture aspect is preserved, so
+    /// [`shader::DetailProgram`] still recovers the correct source dims.
     pub(crate) src_long_edge: u32,
     /// `None` for an already-positive scan; `(stock, base)` for a film negative
     /// the shader must density-invert (`base` is the clear-film anchor).
