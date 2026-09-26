@@ -5272,13 +5272,16 @@ mod tests {
     #[test]
     fn flatten_bayer_scales_classes_to_a_common_base() {
         // Neutral film at transmission 0.5 seen through per-class sensor casts
-        // (RGGB layout: one R, two G, one B site).
+        // (RGGB layout: one R, two G, one B site). A single 2×2 cell collapses
+        // to one output: the post-gain mean, here exactly the common base.
         let cfa = rawloader::CFA::new("RGGB");
         let samples = [0.60, 0.50, 0.50, 0.40]; // R, G, G, B sites
 
-        let mono = flatten_bayer(&samples, 2, 2, &cfa);
+        let (mono, w, h) = flatten_bayer(&samples, 2, 2, &cfa);
 
-        assert!(mono.iter().all(|value| (value - 0.5).abs() < 1e-6));
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(mono.len(), 1);
+        assert!((mono[0] - 0.5).abs() < 1e-6, "collapsed to {}", mono[0]);
     }
 
     #[test]
@@ -5287,9 +5290,10 @@ mod tests {
         let cfa = rawloader::CFA::new("GBRG");
         let samples = [0.25, 0.20, 0.30, 0.25]; // G, B, R, G sites
 
-        let mono = flatten_bayer(&samples, 2, 2, &cfa);
+        let (mono, w, h) = flatten_bayer(&samples, 2, 2, &cfa);
 
-        assert!(mono.iter().all(|value| (value - 0.25).abs() < 1e-6));
+        assert_eq!((w, h), (1, 1));
+        assert!((mono[0] - 0.25).abs() < 1e-6, "collapsed to {}", mono[0]);
     }
 
     #[test]
@@ -5298,8 +5302,33 @@ mod tests {
         let cfa = rawloader::CFA::new("RGBE");
         let samples = [0.45, 0.50, 0.55, 0.50]; // R, G, B, E sites
 
-        let mono = flatten_bayer(&samples, 2, 2, &cfa);
+        let (mono, w, h) = flatten_bayer(&samples, 2, 2, &cfa);
 
+        assert_eq!((w, h), (1, 1));
+        assert!((mono[0] - 0.5).abs() < 1e-6, "collapsed to {}", mono[0]);
+    }
+
+    #[test]
+    fn flatten_bayer_averages_a_consistent_cell() {
+        // A uniform 2×2 cell (all classes carry the same transmission) must
+        // average to exactly that value, whatever the per-class gains.
+        let cfa = rawloader::CFA::new("RGGB");
+        let samples = [0.30, 0.30, 0.30, 0.30];
+        let (mono, w, h) = flatten_bayer(&samples, 2, 2, &cfa);
+        assert_eq!((w, h), (1, 1));
+        assert!((mono[0] - 0.30).abs() < 1e-6);
+    }
+
+    #[test]
+    fn flatten_bayer_halves_dims_and_replicates_odd_edges() {
+        // 3×3 input → 2×2 output; the final partial row/column is
+        // edge-replicated (no pixel dropped) and the result is the post-gain
+        // mean of each cell.
+        let cfa = rawloader::CFA::new("RGGB");
+        let samples = [0.5_f32; 9];
+        let (mono, w, h) = flatten_bayer(&samples, 3, 3, &cfa);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(mono.len(), 4);
         assert!(mono.iter().all(|value| (value - 0.5).abs() < 1e-6));
     }
 
