@@ -3866,11 +3866,17 @@ impl AppModel {
         }
     }
 
-    /// Writes the open frame's tone-curve powers live: the RAM roll edit and
+    /// Writes the open frame's tone-curve controls live: the RAM roll edit and
     /// the GPU shader uniforms. The slider (`CurveChanged`) and a keyboard step
     /// (`EditAdjust::Contrast`/`Highlights`/`Shadows`) both route here;
     /// committing (persist + re-bake) stays separate like
     /// [`Self::set_exposure`].
+    ///
+    /// The three values are stored as powers (the positive-path curve domain),
+    /// but the film path re-reads them as STOP LIFTS via `log2`/`-log2` and
+    /// applies them in the density domain (Contrast scales the density window;
+    /// Highlights/Shadows are the toe/shoulder masks). See
+    /// `docs/tone-model-density.md`.
     fn set_curve(&mut self, contrast: f32, highlights: f32, shadows: f32) {
         self.curve_contrast = contrast;
         self.curve_highlights = highlights;
@@ -6674,6 +6680,8 @@ mod tests {
         inv_base: f32,
         inv_d_max: f32,
         inv_gamma: f32,
+        region_shadows: f32,
+        region_highlights: f32,
         tone_lut: &[f32],
     ) -> f32 {
         let mono_linear = mono;
@@ -6683,7 +6691,13 @@ mod tests {
             let density = -(clamped / inv_base).ln() / 10.0_f32.ln();
             let position = (density / inv_d_max).clamp(0.0, 1.0);
             let positive = position.powf(inv_gamma);
-            shader::sample_tone_lut_f32(tone_lut, positive)
+            // Density-domain region shape (mirrors the WGSL film branch:
+            // `film::region_shape` with K = 2). The film path does NOT sample
+            // the tone LUT.
+            let toe = (1.0 - positive).powf(2.0);
+            let shoulder = positive.powf(2.0);
+            (positive + region_shadows * toe + region_highlights * shoulder)
+                .clamp(0.0, 1.0)
         } else {
             let remapped = shader::sample_tone_lut_f32(tone_lut, mono_linear);
             (remapped * exposure).clamp(0.0, 1.0)
@@ -6757,7 +6771,9 @@ mod tests {
 
             let (stock_and_base, pivots) = pivots_for(&mono, tone, preset, base_config);
             let (shadow, mid, white) = pivots;
-            // The GPU side delivers the same tone model through the LUT.
+            // The positive path delivers the curve through the LUT; the film
+            // path evaluates its density-domain shape inline (mirrored by
+            // `gpu_fragment`).
             let lut = half_lut_bytes_to_f32(&shader::build_tone_lut(
                 tone.curve_contrast,
                 tone.curve_highlights,
@@ -6766,26 +6782,45 @@ mod tests {
                 mid,
                 white,
             ));
-            let (exposure, inv, inv_base, inv_d_max, inv_gamma) = match stock_and_base {
-                Some((stock, base)) => (
-                    shader::sensor_gain(tone.exposure_ev, true),
-                    true,
-                    base,
-                    stock.d_max,
-                    stock.gamma,
-                ),
-                None => (
-                    shader::sensor_gain(tone.exposure_ev, false),
-                    false,
-                    1.0,
-                    1.0,
-                    1.0,
-                ),
-            };
+            // Stop lifts recovered from the decoded powers, matching the maps
+            // the app/pipeline use.
+            let contrast_stops = tone.curve_contrast.log2();
+            let shadows_stops = -tone.curve_shadows.log2();
+            let highlights_stops = tone.curve_highlights.log2();
+            let (exposure, inv, inv_base, inv_d_max, inv_gamma, region_shadows, region_highlights) =
+                match stock_and_base {
+                    Some((stock, base)) => (
+                        shader::sensor_gain(tone.exposure_ev, true),
+                        true,
+                        base,
+                        crate::film::effective_d_max(stock.d_max, contrast_stops),
+                        stock.gamma,
+                        crate::film::region_strength(shadows_stops),
+                        crate::film::region_strength(highlights_stops),
+                    ),
+                    None => (
+                        shader::sensor_gain(tone.exposure_ev, false),
+                        false,
+                        1.0,
+                        1.0,
+                        1.0,
+                        0.0,
+                        0.0,
+                    ),
+                };
 
             for (i, &sample) in mono.iter().enumerate() {
-                let reference =
-                    gpu_fragment(sample, exposure, inv, inv_base, inv_d_max, inv_gamma, &lut);
+                let reference = gpu_fragment(
+                    sample,
+                    exposure,
+                    inv,
+                    inv_base,
+                    inv_d_max,
+                    inv_gamma,
+                    region_shadows,
+                    region_highlights,
+                    &lut,
+                );
                 let baked_value = baked[i];
                 assert!(
                     (baked_value - reference).abs() <= 5e-4,

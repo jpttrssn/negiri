@@ -3,16 +3,20 @@
 //! GPU detail shader — renders mono image data with live EV adjustment.
 //!
 //! The mono `Vec<f32>` is uploaded to the GPU once as an `R16Float` texture.
-//! Exposure and the tone curve are applied as shader uniforms (`2^EV` gain and
-//! a pivoted `ratio * p^exp` remap) — zero CPU re-encoding, zero new `Handle`
-//! per frame.
+//! Exposure and the tone controls are applied per fragment from uniforms — zero
+//! CPU re-encoding, zero new `Handle` per frame. Two tone paths share the same
+//! controls: a **film negative** is density-inverted and then shaped in the
+//! density domain (Contrast scales the usable window; Highlights/Shadows are
+//! region-local toe/shoulder masks — see `docs/tone-model-density.md`), while
+//! an **already-positive scan** applies a pivoted `ratio * p^exp` curve through
+//! the CPU-built tone LUT.
 
 use cosmic::iced::core::{Length, Rectangle};
 use cosmic::iced::wgpu::util::DeviceExt;
 use cosmic::iced::widget::shader::{Pipeline, Primitive, Program, Shader, Viewport};
 
 use crate::edit_manifest::CropMargins;
-use crate::film::{MonoStock, invert_value};
+use crate::film::{self, MonoStock, invert_value};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -86,6 +90,18 @@ pub struct DetailProgram {
     /// margin is always visible; zooming in grows the image into it. `0.0`
     /// (normal mode) is the exact previous layout. Set via [`Self::set_pad`].
     pad: f32,
+    /// Film-path Contrast as a stop lift (identity `0`): scales the usable
+    /// density window (`d_max · 2^-contrast`). Only meaningful when `inverted`.
+    film_contrast: f32,
+    /// Film-path Shadows region lift as a stop value (identity `0`), driving
+    /// the density-domain toe mask. Only meaningful when `inverted`.
+    film_shadows: f32,
+    /// Film-path Highlights region lift as a stop value (identity `0`), driving
+    /// the density-domain shoulder mask. Only meaningful when `inverted`.
+    film_highlights: f32,
+    /// The stock's preset usable density range, kept so the effective window
+    /// can be recomputed from `film_contrast` without re-deriving the stock.
+    stock_d_max: f32,
     /// Whether the mono texture holds a true sensor-linear NEGATIVE that the
     /// shader must density-invert per fragment (a film preset), instead of an
     /// already-positive scan. When inverted, the exposure gain multiplies the
@@ -215,6 +231,10 @@ impl DetailProgram {
             inv_base,
             inv_d_max,
             inv_gamma,
+            film_contrast: 0.0,
+            film_shadows: 0.0,
+            film_highlights: 0.0,
+            stock_d_max: if inverted { inv_d_max } else { 1.0 },
             stock,
             anchor_fractiles,
             tone_lut: build_tone_lut(1.0, 1.0, 1.0, shadow, mid, white),
@@ -284,6 +304,13 @@ impl DetailProgram {
         self.contrast = contrast;
         self.highlights = highlights;
         self.shadows = shadows;
+        // The film path consumes the same controls as STOP LIFTS, recovered
+        // from the decoded powers by the same maps the UI uses (`contrast`/
+        // `highlights` `+log2`, `shadows` `-log2`). They are ignored by the
+        // positive path.
+        self.film_contrast = contrast.log2();
+        self.film_shadows = -shadows.log2();
+        self.film_highlights = highlights.log2();
         self.rebuild_tone_lut();
     }
 
@@ -405,6 +432,10 @@ impl Clone for DetailProgram {
             inv_base: self.inv_base,
             inv_d_max: self.inv_d_max,
             inv_gamma: self.inv_gamma,
+            film_contrast: self.film_contrast,
+            film_shadows: self.film_shadows,
+            film_highlights: self.film_highlights,
+            stock_d_max: self.stock_d_max,
             stock: self.stock,
             anchor_fractiles: self.anchor_fractiles,
             tone_lut: self.tone_lut.clone(),
@@ -438,6 +469,10 @@ impl std::fmt::Debug for DetailProgram {
             .field("inv_base", &self.inv_base)
             .field("inv_d_max", &self.inv_d_max)
             .field("inv_gamma", &self.inv_gamma)
+            .field("film_contrast", &self.film_contrast)
+            .field("film_shadows", &self.film_shadows)
+            .field("film_highlights", &self.film_highlights)
+            .field("stock_d_max", &self.stock_d_max)
             .field("stock", &self.stock)
             .field("anchor_fractiles", &self.anchor_fractiles)
             .field("tone_lut_len", &self.tone_lut.len())
@@ -477,8 +512,11 @@ impl<M> Program<M> for DetailProgram {
             src_h: self.src_h,
             inverted: self.inverted,
             inv_base: self.inv_base,
-            inv_d_max: self.inv_d_max,
             inv_gamma: self.inv_gamma,
+            film_contrast: self.film_contrast,
+            film_shadows: self.film_shadows,
+            film_highlights: self.film_highlights,
+            stock_d_max: self.stock_d_max,
             tone_lut: self.tone_lut.clone(),
             tone_version: self.tone_version,
             image_id: self.image_id,
@@ -867,10 +905,17 @@ pub struct DetailPrimitive {
     inverted: bool,
     /// Clear-film transmission anchor (inversion black point), shader uniform.
     inv_base: f32,
-    /// Usable density range above the base (stock `d_max`), shader uniform.
-    inv_d_max: f32,
     /// Density-space tone exponent (stock `gamma`), shader uniform.
     inv_gamma: f32,
+    /// Film-path Contrast stop lift (scales the density window). Identity `0`.
+    film_contrast: f32,
+    /// Film-path Shadows region lift in stops (density-domain toe mask).
+    film_shadows: f32,
+    /// Film-path Highlights region lift in stops (density-domain shoulder mask).
+    film_highlights: f32,
+    /// The stock's preset usable density range, so `prepare` can recompute the
+    /// effective window from `film_contrast`.
+    stock_d_max: f32,
     width: u32,
     height: u32,
     /// Full-resolution display-oriented source dims the crop margins are
@@ -1087,8 +1132,14 @@ impl Primitive for DetailPrimitive {
             // sensor-linear negative the WGSL must density-invert per fragment.
             inv: if self.inverted { 1.0 } else { 0.0 },
             inv_base: self.inv_base,
-            inv_d_max: self.inv_d_max,
+            // Film Contrast scales the usable density window in log-density
+            // (see `film::effective_d_max`); the effective value is what the
+            // WGSL divides the density by.
+            inv_d_max: film::effective_d_max(self.stock_d_max, self.film_contrast),
             inv_gamma: self.inv_gamma,
+            // Region lifts as signed normalized-positive strengths.
+            region_shadows: film::region_strength(self.film_shadows),
+            region_highlights: film::region_strength(self.film_highlights),
         };
         queue.write_buffer(&pipeline.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -1422,6 +1473,12 @@ struct Uniforms {
     /// Density-space tone exponent (stock `gamma`) applied to normalized
     /// density.
     inv_gamma: f32,
+    /// Shadows region-lift strength (signed, normalized-positive units) for the
+    /// film path's density-domain toe mask.
+    region_shadows: f32,
+    /// Highlights region-lift strength (signed, normalized-positive units) for
+    /// the film path's density-domain shoulder mask.
+    region_highlights: f32,
 }
 
 // SAFETY: Uniforms is repr(C) with all f32 fields.
@@ -2343,6 +2400,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn film_density_shape_mirrors_the_cpu_and_is_independent() {
+        // The WGSL film branch evaluates the density-domain region shape
+        // inline; `gpu_fragment` (in app.rs) mirrors it with the same
+        // `(1-p)^K`/`p^K` masks. Pin the isolation property the model relies
+        // on directly against the shared `film::region_shape`.
+        use crate::film::{region_shape, region_strength};
+        // Identity: no lifts -> unchanged.
+        for p in [0.0_f32, 0.1, 0.5, 0.9, 1.0] {
+            assert!((region_shape(p, 0.0, 0.0) - p).abs() < 1e-6);
+        }
+        // A shadow lift cannot move white; a highlight lift cannot move black.
+        let shadow_lift = region_strength(2.0); // +2 stops
+        let highlight_lift = region_strength(2.0);
+        assert!((region_shape(1.0, shadow_lift, 0.0) - 1.0).abs() < 1e-6);
+        assert!(region_shape(0.0, 0.0, highlight_lift).abs() < 1e-6);
     }
 
     #[test]

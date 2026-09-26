@@ -337,6 +337,10 @@ impl BaseMode {
 /// Samples at or below this transmission encode maximum density.
 const MIN_TRANSMISSION: f32 = 1e-6;
 
+/// Smallest usable density range accepted by [`invert_value_graded`], guarding
+/// the `density / d_max` division against a degenerate (near-zero) window.
+const MIN_D_MAX: f32 = 0.01;
+
 /// Measured channel bases below this are implausible — they indicate frames
 /// without any measurable clear film — and fall back to [`MonoStock::base`].
 pub const MIN_PLAUSIBLE_BASE: f32 = 0.1;
@@ -350,15 +354,32 @@ pub const MIN_PLAUSIBLE_BASE: f32 = 0.1;
 /// measurement); `value == base` prints black, the densest useful area prints
 /// white.
 pub fn invert_value(transmission: f32, base: f32, stock: &MonoStock) -> f32 {
+    invert_value_graded(transmission, base, stock.d_max, stock.gamma)
+}
+
+/// The grade-aware inversion: the same density-space mapping as
+/// [`invert_value`] but with an explicit usable density range and gamma, so a
+/// user Contrast (which scales `d_max` via [`effective_d_max`]) flows into the
+/// inversion without mutating the stock profile.
+///
+/// `value == base` prints black, `density == d_max_eff` prints white, and the
+/// normalized position is raised to `gamma`.
+#[must_use]
+pub fn invert_value_graded(
+    transmission: f32,
+    base: f32,
+    d_max_eff: f32,
+    gamma: f32,
+) -> f32 {
     let value = transmission.clamp(MIN_TRANSMISSION, base);
     // Density relative to the clear-film anchor.
     let density = f32::log10(base / value);
     // Position within the film's usable density range, mapped through a
     // contrast curve onto the full positive range: the clearest film
     // areas print black, the densest useful areas print white.
-    let position = (density / stock.d_max).clamp(0.0, 1.0);
+    let position = (density / d_max_eff.max(MIN_D_MAX)).clamp(0.0, 1.0);
 
-    position.powf(stock.gamma)
+    position.powf(gamma)
 }
 
 /// Inverts interleaved linear RGB scanned from a monochrome negative into a
@@ -385,6 +406,11 @@ pub fn invert_mono(rgb: &mut [f32], stock: &MonoStock, bases: [f32; 3]) {
 /// `base` is the scan's clear-film transmission and anchors the black point;
 /// collapsing the capture to luminance beforehand removes any cast between
 /// channels outright.
+///
+/// Kept as the simple (ungraded) entry point; the pipeline inlines the graded
+/// form (`invert_value_graded` + `region_shape`) so a user Contrast and the
+/// region lifts flow through. Used by the film unit tests.
+#[allow(dead_code)]
 pub fn invert_gray(samples: &mut [f32], stock: &MonoStock, base: f32) {
     for slot in samples {
         *slot = invert_value(*slot, base, stock);
@@ -497,6 +523,56 @@ pub fn measure_base_channels(rgb: &[f32]) -> Option<[f32; 3]> {
     }
 
     Some(bases)
+}
+
+/// The mask sharpness `K` for the density-domain toe/shoulder lifts. `K = 2`
+/// makes each region mask fall off quadratically from its end, so a shadow lift
+/// concentrates on the toe and a highlight lift on the shoulder while each
+/// reaches zero at the opposite end (the property that makes them independent).
+pub const REGION_MASK_K: f32 = 2.0;
+
+/// The largest magnitude accepted for a region lift (toe or shoulder), in
+/// normalized-positive units. Bounds the additive mask shift so the composed
+/// curve stays monotone; the UI slider's stop range maps into this window.
+pub const REGION_LIFT_MAX: f32 = 0.5;
+
+/// Normalized-positive strength per stop of region lift: a ±2-stop slider spans
+/// the full ±[`REGION_LIFT_MAX`] window.
+pub const REGION_LIFT_PER_STOP: f32 = 0.25;
+
+/// Maps a region lift in stops to its bounded normalized-positive strength.
+#[must_use]
+pub fn region_strength(lift_stops: f32) -> f32 {
+    (lift_stops * REGION_LIFT_PER_STOP).clamp(-REGION_LIFT_MAX, REGION_LIFT_MAX)
+}
+
+/// The density-window scale a user Contrast value (in stops, identity `0`)
+/// applies to the stock's usable range: `d_eff = d_max · 2^-contrast`. A
+/// positive contrast narrows the window (more log-density contrast), a negative
+/// one widens it. Clamped to a sane range so the window never collapses or
+/// explodes.
+#[must_use]
+pub fn effective_d_max(d_max: f32, contrast: f32) -> f32 {
+    (d_max * (-contrast).exp2()).clamp(0.01, 100.0)
+}
+
+/// The density-domain tone shape applied to the normalized positive `p ∈ [0,1]`
+/// (the film response after `position^gamma`): a shadow (toe) lift and a
+/// highlight (shoulder) lift, each a region-local additive mask.
+///
+/// `T(p) = clamp(p + shifts·W_toe(p) + highlights·W_shoulder(p), 0, 1)` with
+/// `W_toe(p) = (1-p)^K` (peaks at black, zero at white) and
+/// `W_shoulder(p) = p^K` (peaks at white, zero at black). The zeros at the
+/// opposite ends make the controls structurally independent: a shadow lift
+/// cannot move white, a highlight lift cannot move black.
+#[must_use]
+pub fn region_shape(p: f32, shadows: f32, highlights: f32) -> f32 {
+    let p = p.clamp(0.0, 1.0);
+    let shadows = shadows.clamp(-REGION_LIFT_MAX, REGION_LIFT_MAX);
+    let highlights = highlights.clamp(-REGION_LIFT_MAX, REGION_LIFT_MAX);
+    let toe = (1.0 - p).powf(REGION_MASK_K);
+    let shoulder = p.powf(REGION_MASK_K);
+    (p + shadows * toe + highlights * shoulder).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -788,5 +864,71 @@ mod tests {
         assert!(!BaseMode::Preset.is_auto());
         assert!(BaseMode::AutoPerFrame.is_auto());
         assert!(BaseMode::AutoSelectedFrame.is_auto());
+    }
+
+    #[test]
+    fn effective_d_max_scales_the_window_symmetrically() {
+        // Identity leaves the stock's range untouched.
+        assert!((effective_d_max(2.4, 0.0) - 2.4).abs() < 1e-6);
+        // +1 stop halves the window (more contrast); -1 doubles it.
+        assert!((effective_d_max(2.4, 1.0) - 1.2).abs() < 1e-6);
+        assert!((effective_d_max(2.4, -1.0) - 4.8).abs() < 1e-6);
+        // Clamped so the window can never collapse or explode.
+        assert!(effective_d_max(2.4, 99.0) >= 0.01);
+        assert!(effective_d_max(2.4, -99.0) <= 100.0);
+    }
+
+    #[test]
+    fn region_shape_is_independent_at_the_far_end() {
+        // A shadow lift leaves white untouched; a highlight lift leaves black
+        // untouched — the structural isolation the model relies on.
+        for p in [0.0_f32, 0.1, 0.4, 0.7, 1.0] {
+            let base = region_shape(p, 0.0, 0.0);
+            assert!((base - p).abs() < 1e-6, "identity moved p={p}");
+        }
+        for shadows in [-0.5_f32, -0.2, 0.2, 0.5] {
+            assert!(
+                (region_shape(1.0, shadows, 0.0) - 1.0).abs() < 1e-6,
+                "shadow lift moved white: {shadows}"
+            );
+        }
+        for highlights in [-0.5_f32, -0.2, 0.2, 0.5] {
+            assert!(
+                region_shape(0.0, 0.0, highlights).abs() < 1e-6,
+                "highlight lift moved black: {highlights}"
+            );
+        }
+    }
+
+    #[test]
+    fn region_shape_lifts_the_named_region() {
+        let dark = 0.15_f32;
+        let bright = 0.8_f32;
+        assert!(region_shape(dark, 0.3, 0.0) > dark, "shadow lift raised the toe");
+        assert!(region_shape(bright, 0.0, 0.3) > bright, "highlight lift raised the shoulder");
+        // And a lift on one region barely moves the other (mask falls off).
+        assert!((region_shape(bright, 0.3, 0.0) - bright).abs() < 0.02);
+        assert!((region_shape(dark, 0.0, 0.3) - dark).abs() < 0.02);
+    }
+
+    #[test]
+    fn region_shape_stays_monotone_at_the_extremes() {
+        // The bounded additive masks must not introduce a non-monotone wiggle
+        // anywhere across the full lift range.
+        for shadows in [-0.5_f32, -0.25, 0.0, 0.25, 0.5] {
+            for highlights in [-0.5_f32, -0.25, 0.0, 0.25, 0.5] {
+                let mut prev = region_shape(0.0, shadows, highlights);
+                let mut p = 0.0_f32;
+                while p < 1.0 {
+                    p = (p + 0.005).min(1.0);
+                    let v = region_shape(p, shadows, highlights);
+                    assert!(
+                        v >= prev - 1e-6,
+                        "not monotone at p={p}: {prev} -> {v} (shadows={shadows} highlights={highlights})"
+                    );
+                    prev = v;
+                }
+            }
+        }
     }
 }

@@ -213,17 +213,15 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         // A finished drag is an edit flush point.
         .on_release(Message::EditSave);
 
-    // Tone-editing controls: three pivoted powers re-shape the GPU texture
-    // via a uniform-only remap — contrast pivots at the image's measured
-    // mid-gray, shadows at the measured white point, highlights at the
-    // measured shadow anchor. Grid thumbnails are unaffected; every detail
-    // open starts from the stored edits. All three sliders expose their power
-    // as a stop-based "lift value" centered on the identity, so dragging right
-    // raises contrast / brightens the region — the direction other photo apps
-    // use, with the sweet spot in the middle of the track. Contrast spans ±3
-    // stops (power `0.125..8.0`) via `contrast_lift`; Highlights/Shadows span
-    // ±2 and use opposite power↔lift maps because their pivots sit at opposite
-    // ends.
+    // Tone-editing controls. For a film negative these act in the DENSITY
+    // domain (see `docs/tone-model-density.md`): Contrast scales the usable
+    // density window (`d_max · 2^-contrast`) and Highlights/Shadows are the
+    // toe/shoulder region lifts of the normalized positive. For an
+    // already-positive scan they fall back to the pivoted-power curve. Grid
+    // thumbnails are unaffected; every detail open starts from the stored
+    // edits. All three sliders expose their control as a stop-based value
+    // centered on the identity, so dragging right raises contrast / brightens
+    // the region. Contrast spans ±3 stops; Highlights/Shadows span ±2.
     let contrast_label = widget::text(fl!("contrast-label"));
     let contrast_slider = widget::slider(
         -3.0..=3.0,

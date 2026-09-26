@@ -13,7 +13,7 @@ use cosmic::widget::image::Handle;
 use crate::edit_manifest::{CropMargins, ToneEdit};
 use crate::error::FrameError;
 use crate::film::{
-    ACTIVE_STOCK, BaseConfig, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, invert_gray, measure_base,
+    self, ACTIVE_STOCK, BaseConfig, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, measure_base,
 };
 use crate::shader;
 fn normalize_samples(image: &rawloader::RawImage) -> Vec<f32> {
@@ -714,20 +714,33 @@ fn render_tail(
     pivots: (f32, f32, f32),
 ) {
     if let Some((stock, base)) = stock_and_base {
+        // Film path: EV gain on the true sensor data, density inversion with a
+        // Contrast-scaled window, then the density-domain toe/shoulder shape —
+        // the exact ordering and math the WGSL film branch applies. Contrast
+        // and the region controls are read as STOP LIFTS (their film meaning),
+        // recovered from the decoded powers by the same maps the UI uses:
+        // contrast `+log2`, highlights `+log2`, shadows `-log2`.
         apply_exposure(mono, -tone.exposure_ev);
-        invert_gray(mono, &stock, base);
-    }
-    let (shadow, mid, white) = pivots;
-    shader::apply_curve(
-        mono,
-        tone.curve_contrast,
-        tone.curve_highlights,
-        tone.curve_shadows,
-        shadow,
-        mid,
-        white,
-    );
-    if stock_and_base.is_none() {
+        let d_max_eff = film::effective_d_max(stock.d_max, tone.curve_contrast.log2());
+        let shadows = film::region_strength(-tone.curve_shadows.log2());
+        let highlights = film::region_strength(tone.curve_highlights.log2());
+        for value in mono.iter_mut() {
+            let positive =
+                film::invert_value_graded(*value, base, d_max_eff, stock.gamma);
+            *value = film::region_shape(positive, shadows, highlights);
+        }
+    } else {
+        // Already-positive path keeps the pivoted-power tone curve.
+        let (shadow, mid, white) = pivots;
+        shader::apply_curve(
+            mono,
+            tone.curve_contrast,
+            tone.curve_highlights,
+            tone.curve_shadows,
+            shadow,
+            mid,
+            white,
+        );
         apply_exposure(mono, tone.exposure_ev);
     }
     for value in mono {
