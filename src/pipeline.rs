@@ -1,21 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! The RAW-to-image pipeline: sensor decode, mono reconstruction, downscale,
-//! tone shaping, and geometry (crop/rotate/orient). Every CPU bake — grid
+//! develop, and geometry (crop/rotate/orient). Every CPU bake — grid
 //! thumbnails, roll covers, detail overviews, and exports — funnels through the
 //! functions here, so grid == detail == export hold structurally; the GPU
-//! detail shader shares the tone math via `shader::tone_model`.
+//! detail shader shares the pointwise density develop via [`film::Develop`].
 
 use std::path::PathBuf;
 
 use cosmic::widget::image::Handle;
 
-use crate::edit_manifest::{CropMargins, ToneEdit};
+use crate::edit_manifest::CropMargins;
 use crate::error::FrameError;
-use crate::film::{
-    self, ACTIVE_STOCK, BaseConfig, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, measure_base,
-};
-use crate::shader;
+use crate::film::{self, Develop, MIN_PLAUSIBLE_BASE, measure_base};
 fn normalize_samples(image: &rawloader::RawImage) -> Vec<f32> {
     let width = usize::max(image.width, 1);
 
@@ -104,7 +101,7 @@ pub(crate) fn flatten_bayer(
         class_samples[cfa.color_at(y, x)].push(samples[idx]);
     }
 
-    let mut anchored = [ACTIVE_STOCK.base; 4];
+    let mut anchored = [film::DEFAULT_FILM_BASE; 4];
     for (base, class) in anchored.iter_mut().zip(&class_samples) {
         if let Some(measured) =
             measure_base(class).filter(|measured| *measured >= MIN_PLAUSIBLE_BASE)
@@ -177,8 +174,10 @@ pub(crate) fn class_gains(anchored: [f32; 4], empty: [bool; 4]) -> [f32; 4] {
     std::array::from_fn(|class| reference / anchored[class])
 }
 
-/// Multiplies linear samples by `2^EV` in place, mirroring the detail
-/// shader's gain so CPU and GPU rendering stay bit-consistent.
+/// Multiplies linear samples by `2^EV` in place. Retained for the unit tests
+/// that pin the exposure encoder; the develop now folds the `2^-EV` gain into
+/// [`film::Develop::apply`].
+#[allow(dead_code)]
 pub(crate) fn apply_exposure(mono: &mut [f32], exposure_ev: f32) {
     let gain = f32::exp2(exposure_ev);
     for value in mono {
@@ -427,7 +426,7 @@ fn downsample_bayer(image: &rawloader::RawImage, out_w: usize, out_h: usize) -> 
         }
     }
 
-    let mut anchored = [ACTIVE_STOCK.base; 4];
+    let mut anchored = [film::DEFAULT_FILM_BASE; 4];
     for (base, class) in anchored.iter_mut().zip(&class_values) {
         if let Some(measured) =
             measure_base(class).filter(|measured| *measured >= MIN_PLAUSIBLE_BASE)
@@ -449,7 +448,7 @@ fn downsample_bayer(image: &rawloader::RawImage, out_w: usize, out_h: usize) -> 
             }
         }
         let level = if non_empty == 0 {
-            ACTIVE_STOCK.base
+            film::DEFAULT_FILM_BASE
         } else {
             sum / non_empty as f32
         };
@@ -701,138 +700,38 @@ fn crop_rgba16(
     (out, cw, rows)
 }
 
-/// Measures the tone pivots (shadow/mid-gray/white) a frame needs — WITHOUT
-/// mutating `mono` — plus, for a film negative, the resolved clear-film base and
-/// its stock (needed by the density inversion).
-///
-/// The inverted (film) path uses the shader's EV-exact mechanic: raw sensor
-/// fractiles measured on the intact pre-gain buffer, mapped through
-/// `invert_value(fractile · 2^-EV)` so the pivots describe the ACTUAL render at
-/// the current exposure. The positive path measures the regular anchors on the
-/// positive. Returning the pair separately lets the whole-frame parity test feed
-/// `render_tail` and the WGSL reference the identical inputs.
-pub(crate) fn pivots_for(
-    mono: &[f32],
-    tone: ToneEdit,
-    preset: FilmPreset,
-    base_config: BaseConfig,
-) -> (Option<(MonoStock, f32)>, (f32, f32, f32)) {
-    if let Some(stock) = preset.stock() {
-        // Measured BEFORE any gain so the ranks stay in the shader's upload
-        // domain (the gain would shift them).
-        let fractiles = shader::film_anchor_fractiles(mono);
-        let measured = if base_config.auto {
-            measure_base(mono)
-        } else {
-            None
-        };
-        let base = base_config.resolve(measured, &stock);
-        let pivots = shader::film_pivots_at_gain(
-            fractiles,
-            base,
-            shader::sensor_gain(tone.exposure_ev, true),
-            stock,
-        );
-        (Some((stock, base)), pivots)
-    } else {
-        (None, shader::tone_anchors(mono))
-    }
-}
-
-/// Applies the detail shader's exact per-pixel tone ordering to a mono buffer in
-/// place, then sRGB-encodes: for a film negative the EV gain hits the true
-/// sensor data first (`2^-EV`), then the density inversion, then the pivoted
-/// curve; for an already-positive scan the curve comes first, then the `2^EV`
-/// gain. `stock_and_base` is `Some((stock, base))` exactly when the buffer is a
-/// negative to invert. Shared by the grid thumbnail bake, the export bake, and
-/// the WGSL-parity tests.
-fn render_tail(
-    mono: &mut [f32],
-    tone: ToneEdit,
-    stock_and_base: Option<(MonoStock, f32)>,
-    pivots: (f32, f32, f32),
-) {
-    if let Some((stock, base)) = stock_and_base {
-        // Film path: EV gain on the true sensor data, density inversion with a
-        // Contrast-scaled window, then the density-domain toe/shoulder shape —
-        // the exact ordering and math the WGSL film branch applies. Contrast
-        // and the region controls are read as STOP LIFTS (their film meaning),
-        // recovered from the decoded powers by the same maps the UI uses:
-        // contrast `+log2`, highlights `+log2`, shadows `-log2`.
-        apply_exposure(mono, -tone.exposure_ev);
-        let d_max_eff = film::effective_d_max(stock.d_max, tone.curve_contrast.log2());
-        let shadows = film::region_strength(-tone.curve_shadows.log2());
-        let highlights = film::region_strength(tone.curve_highlights.log2());
-        for value in mono.iter_mut() {
-            let positive =
-                film::invert_value_graded(*value, base, d_max_eff, stock.gamma);
-            *value = film::region_shape(positive, shadows, highlights);
-        }
-    } else {
-        // Already-positive path keeps the pivoted-power tone curve.
-        let (shadow, mid, white) = pivots;
-        shader::apply_curve(
-            mono,
-            tone.curve_contrast,
-            tone.curve_highlights,
-            tone.curve_shadows,
-            shadow,
-            mid,
-            white,
-        );
-        apply_exposure(mono, tone.exposure_ev);
-    }
-    for value in mono {
-        *value = srgb_encode(*value);
-    }
-}
-
 /// The one shared tone tail for every CPU bake (grid thumbnails and exports):
-/// measure the pivots from `mono`, then apply the shader's exact ordering and
-/// sRGB-encode. Grid == detail == export hold structurally because this single
-/// body (plus its WGSL-parity tests) is the only place the tone math lives for
-/// the non-shader paths.
-pub(crate) fn bake_tone(
-    mono: &mut [f32],
-    tone: ToneEdit,
-    preset: FilmPreset,
-    base_config: BaseConfig,
-) {
-    let (stock_and_base, pivots) = pivots_for(mono, tone, preset, base_config);
-    render_tail(mono, tone, stock_and_base, pivots);
+/// apply the pointwise density develop ([`film::Develop::apply`], the exact
+/// twin of the WGSL `develop()`) and sRGB-encode. Grid == detail == export hold
+/// structurally because this single body is the only place the tone math lives
+/// for the non-shader paths.
+pub(crate) fn bake_develop(mono: &mut [f32], develop: Develop) {
+    for value in mono {
+        *value = srgb_encode(develop.apply(*value));
+    }
 }
 
 /// Converts a decoded RAW image into a small oriented RGBA image, scaled so no
-/// dimension exceeds `max_size`, baking the tone edit (`ToneEdit`: exposure,
-/// curve powers) and the display rotation into the pixels.
+/// dimension exceeds `max_size`, baking the resolved density develop and the
+/// display rotation into the pixels.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn convert_thumbnail(
     image: &rawloader::RawImage,
     max_size: f32,
-    tone: ToneEdit,
+    develop: Develop,
     crop: CropMargins,
     rotation: u8,
-    preset: FilmPreset,
-    base_config: BaseConfig,
 ) -> Result<Handle, crate::error::FrameError> {
     // One fused pass: normalize, discard masked borders, and phase-preserve
     // downscale straight from the sensor samples into a small TRUE sensor-linear
-    // mono (the same domain the detail decode produces, for every preset).
+    // mono (the same domain the detail decode produces).
     let (mut mono, width, height) =
         downsample_thumbnail(image, max_size as u32).ok_or(crate::error::FrameError::ShortSamples)?;
 
-    // Restore edge punch lost to the heavy downscale — in true sensor space for
-    // every preset, matching the detail decode's unsharp so a film negative
-    // carries its sharpening INTO the density inversion instead of leaving it
-    // on the positive.
-    unsharp_mask(&mut mono, width as usize, height as usize);
-
-    // The one shared tone tail: measure the EV-exact (film) or histogram
-    // (positive) pivots, apply the shader's exact ordering per preset (gain
-    // before the density inversion for a negative, curve then gain for a
-    // positive scan), then sRGB-encode — the same `bake_tone` every CPU bake
-    // uses, so grid == detail == export hold structurally.
-    bake_tone(&mut mono, tone, preset, base_config);
+    // The one shared tone tail: the pointwise density develop then sRGB — the
+    // same math the detail shader runs per fragment, so grid == detail ==
+    // export hold structurally.
+    bake_develop(&mut mono, develop);
 
     let mut rgba = Vec::with_capacity(mono.len() * 4);
     for &value in &mono {
@@ -950,47 +849,6 @@ fn range_len(start: usize, next_start: usize) -> usize {
     usize::max(next_start.saturating_sub(start), 1)
 }
 
-/// Strength of the post-downscale unsharp mask; 0 disables.
-pub(crate) const UNSHARP_AMOUNT: f32 = 0.4;
-
-/// Applies a gentle unsharp mask to a linear buffer, restoring edge punch lost
-/// to heavy downscaling. Runs before tone encoding so overshoot stays out of
-/// the perceptually amplified display range and shadow noise stays quiet.
-pub(crate) fn unsharp_mask(samples: &mut [f32], width: usize, height: usize) {
-    let blurred = blur_121(samples, width, height);
-    for (slot, blur) in samples.iter_mut().zip(blurred) {
-        *slot = (*slot + UNSHARP_AMOUNT * (*slot - blur)).clamp(0.0, 1.0);
-    }
-}
-
-/// Separable 3x3 binomial blur ([1, 2, 1] per axis), replicating edges.
-fn blur_121(samples: &[f32], width: usize, height: usize) -> Vec<f32> {
-    let mut horizontal = vec![0.0_f32; samples.len()];
-    for y in 0..height {
-        for x in 0..width {
-            let left = samples[y * width + x.saturating_sub(1)];
-            let center = samples[y * width + x];
-            let right = samples[y * width + usize::min(x + 1, width - 1)];
-
-            horizontal[y * width + x] = (left + 2.0 * center + right) / 4.0;
-        }
-    }
-
-    let mut blurred = vec![0.0_f32; samples.len()];
-    for y in 0..height {
-        let up = y.saturating_sub(1);
-        let down = usize::min(y + 1, height - 1);
-        for x in 0..width {
-            blurred[y * width + x] = (horizontal[up * width + x]
-                + 2.0 * horizontal[y * width + x]
-                + horizontal[down * width + x])
-                / 4.0;
-        }
-    }
-
-    blurred
-}
-
 /// Applies the RAW orientation metadata to a linear mono buffer.
 ///
 /// Mirror of [`orient`] for `Vec<f32>` data going to the GPU shader: same
@@ -1078,10 +936,9 @@ fn orient(
     (oriented, out_width, out_height)
 }
 /// Runs a RAW decode plus mono reconstruction on a blocking worker thread,
-/// returning TRUE sensor-linear `mono` (post-downscale, post-unsharp) oriented
-/// to display upright, for every preset — the shader applies the exposure gain
-/// and (for film) the density inversion per fragment. `max_edge` is the
-/// downscale target for the long edge before unsharp.
+/// returning TRUE sensor-linear `mono` (post-downscale) oriented to display
+/// upright — the shader applies the pointwise density develop per fragment.
+/// `max_edge` is the downscale target for the long edge.
 ///
 /// The `src_long_edge` field is the sensor's true long edge AFTER cropping but
 /// BEFORE the downscale — i.e. the real native long edge the overview was
@@ -1089,17 +946,11 @@ fn orient(
 /// a bayer source the mono is first CFA-averaged to half resolution (see
 /// [`flatten_bayer`]), so the returned `width`/`height` are half the cropped
 /// sensor dims while `src_long_edge` stays in sensor pixels.
-/// `inversion` is `Some((stock, base))` when the preset marks a film negative,
-/// threading the clear-film anchor to the shader; the roll's `base_config`
-/// resolves that anchor preset-first (calibration, then the auto opt-in, then
-/// the stock's preset base).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) async fn decode_raw_detail(
     dir: PathBuf,
     name: String,
     max_edge: u32,
-    preset: FilmPreset,
-    base_config: BaseConfig,
 ) -> Result<DetailDecode, FrameError> {
     let path = dir.join(name);
 
@@ -1147,27 +998,11 @@ pub(crate) async fn decode_raw_detail(
             (mono, out_w as usize, out_h as usize)
         };
 
-        // True sensor-linear data for every preset: an already-positive scan
-        // (None) and a film negative both stay linear `[0,1]` relative to the
-        // sensor white point — the exposure gain touches the RAW values, and
-        // the density inversion for a negative happens per fragment in the
-        // shader. The only film-side work here is resolving the frame's
-        // clear-film anchor (the inversion's black point) from the roll's base
-        // mode: calibration, then the per-frame auto opt-in (measured from the
-        // sensor data), then the stock's preset base.
-        let inversion = preset.stock().map(|stock| {
-            let measured = if base_config.auto {
-                measure_base(&mono)
-            } else {
-                None
-            };
-            (stock, base_config.resolve(measured, &stock))
-        });
-
+        // True sensor-linear data: the mono stays linear `[0,1]` relative to the
+        // sensor white point. The exposure gain and the density develop both
+        // happen downstream (GPU per fragment, or the CPU bake) from the
+        // frame's resolved [`film::Develop`].
         let (mono, width, height) = resize_area(&mono, width as u32, height as u32, max_edge, 1);
-
-        let mut mono = mono;
-        unsharp_mask(&mut mono, width as usize, height as usize);
 
         let (oriented, width, height) = orient_mono(&mono, width, height, image.orientation);
 
@@ -1176,19 +1011,17 @@ pub(crate) async fn decode_raw_detail(
             width,
             height,
             src_long_edge,
-            inversion,
         })
     })
     .await
     .unwrap_or(Err(FrameError::ThreadPanic))
 }
-/// A decoded true sensor-linear mono frame plus the data the detail and export
-/// paths need to shape it.
+/// A decoded TRUE sensor-linear mono frame plus the geometry the detail and
+/// export paths need.
 ///
-/// `mono` is linear `[0,1]` relative to the sensor white point for EVERY preset
-/// (an already-positive scan or a film negative) — the single source of truth;
-/// the exposure gain touches it, and per-fragment shaping (density inversion
-/// for film) happens downstream per preset.
+/// `mono` is linear `[0,1]` relative to the sensor white point — the single
+/// source of truth; the exposure gain and the density develop happen downstream
+/// from the frame's resolved [`film::Develop`].
 #[derive(Debug, Clone)]
 pub(crate) struct DetailDecode {
     pub(crate) mono: Vec<f32>,
@@ -1203,7 +1036,4 @@ pub(crate) struct DetailDecode {
     /// earlier; the `src_long_edge`/texture aspect is preserved, so
     /// [`shader::DetailProgram`] still recovers the correct source dims.
     pub(crate) src_long_edge: u32,
-    /// `None` for an already-positive scan; `(stock, base)` for a film negative
-    /// the shader must density-invert (`base` is the clear-film anchor).
-    pub(crate) inversion: Option<(MonoStock, f32)>,
 }

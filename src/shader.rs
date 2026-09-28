@@ -1,22 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! GPU detail shader — renders mono image data with live EV adjustment.
+//! GPU detail shader — renders mono image data with the live density develop.
 //!
 //! The mono `Vec<f32>` is uploaded to the GPU once as an `R16Float` texture.
-//! Exposure and the tone controls are applied per fragment from uniforms — zero
-//! CPU re-encoding, zero new `Handle` per frame. Two tone paths share the same
-//! controls: a **film negative** is density-inverted and then shaped in the
-//! density domain (Contrast scales the usable window; Highlights/Shadows are
-//! region-local toe/shoulder masks — see `docs/tone-model-density.md`), while
-//! an **already-positive scan** applies a pivoted `ratio * p^exp` curve through
-//! the CPU-built tone LUT.
+//! The pointwise density develop ([`film::Develop`]) is applied per fragment
+//! from uniforms — zero CPU re-encoding, zero new `Handle` per frame. The WGSL
+//! `develop()` mirrors the Rust twin exactly (parity-tested), so the detail
+//! preview, the grid bakes, and exports share one tone model. See
+//! `docs/raw-pipeline-rewrite.md`.
 
 use cosmic::iced::core::{Length, Rectangle};
 use cosmic::iced::wgpu::util::DeviceExt;
 use cosmic::iced::widget::shader::{Pipeline, Primitive, Program, Shader, Viewport};
 
 use crate::edit_manifest::CropMargins;
-use crate::film::{self, MonoStock, invert_value};
+use crate::film::Develop;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -36,37 +34,16 @@ pub struct DetailProgram {
     /// (texture == source) the scale collapses to 1 and the crop is exact.
     src_w: u32,
     src_h: u32,
-    /// Raw user-facing EV value in stops; converted to a linear-light gain once
-    /// on the GPU side per slider change — `2^EV` for an already-positive
-    /// scan, `2^-EV` for an inverted (film) negative so +EV always brightens
-    /// the final positive (see [`sensor_gain`]).
-    exposure: f32,
+    /// The live pointwise density develop applied per fragment: EV gain →
+    /// `log10(base/value)` density → black/white window → pivot-power contrast.
+    /// The shader's [`Uniforms.dev_*`] block mirrors this exactly.
+    develop: Develop,
     /// Detail-view zoom in `log2` units: 1.0 = contain fit, each +1 doubles
     /// the rendered scale (see [`DetailPrimitive::prepare`]).
     zoom: f32,
     /// Pan offset of the image center from the widget center, in logical
     /// points; converted to physical pixels on the GPU side.
     pan: cosmic::iced::Point,
-    /// Median of the uploaded positive: the mid-gray the contrast curve
-    /// pivots around. Measured once at construction from `mono`.
-    mid: f32,
-    /// 98th percentile of the uploaded positive: the white point the
-    /// shadows curve pivots around.
-    white: f32,
-    /// 10th percentile of the uploaded positive: the shadow anchor the
-    /// highlights curve pivots around. Measured once at construction from `mono`.
-    shadow: f32,
-    /// Contrast power `kc`: the live tone curve pivots at `mid`,
-    /// `C(p) = mid^(1-kc) * p^kc`. `1.0` = identity (no contrast change).
-    contrast: f32,
-    /// Highlights power `kh`: the live tone curve pivots at `shadow`,
-    /// `H(p) = shadow^(1-kh) * p^kh`. `1.0` = identity; raising it brightens the
-    /// upper tones (a highlight lift, pinning the shadow anchor).
-    highlights: f32,
-    /// Shadows power `ks`: the live tone curve pivots at `white`,
-    /// `S(p) = white^(1-ks) * p^ks`. `1.0` = identity; lowering it brightens the
-    /// lower tones (a shadow lift, pinning the white point).
-    shadows: f32,
     /// Live source-pixel crop margins removed from each edge of the
     /// full-resolution display-oriented frame. Applied as a uniform UV-remap
     /// (no texture re-upload): at render time [`crop_uv_geometry`] scales them
@@ -90,54 +67,6 @@ pub struct DetailProgram {
     /// margin is always visible; zooming in grows the image into it. `0.0`
     /// (normal mode) is the exact previous layout. Set via [`Self::set_pad`].
     pad: f32,
-    /// Film-path Contrast as a stop lift (identity `0`): scales the usable
-    /// density window (`d_max · 2^-contrast`). Only meaningful when `inverted`.
-    film_contrast: f32,
-    /// Film-path Shadows region lift as a stop value (identity `0`), driving
-    /// the density-domain toe mask. Only meaningful when `inverted`.
-    film_shadows: f32,
-    /// Film-path Highlights region lift as a stop value (identity `0`), driving
-    /// the density-domain shoulder mask. Only meaningful when `inverted`.
-    film_highlights: f32,
-    /// The stock's preset usable density range, kept so the effective window
-    /// can be recomputed from `film_contrast` without re-deriving the stock.
-    stock_d_max: f32,
-    /// Whether the mono texture holds a true sensor-linear NEGATIVE that the
-    /// shader must density-invert per fragment (a film preset), instead of an
-    /// already-positive scan. When inverted, the exposure gain multiplies the
-    /// sensor data BEFORE the inversion and the EV sign flips (see
-    /// [`sensor_gain`]), keeping the user-facing slider semantics identical
-    /// across presets.
-    inverted: bool,
-    /// The inversion's clear-film transmission anchor (black point): the stock's
-    /// calibrated `base` or a per-frame measurement from the sensor mono. Only
-    /// meaningful when `inverted`; shader-uniform value.
-    inv_base: f32,
-    /// The stock's usable density range above the base (`MonoStock::d_max`),
-    /// driving the inversion's white point. Shader-uniform value.
-    inv_d_max: f32,
-    /// The stock's density-space tone exponent (`MonoStock::gamma`). Only
-    /// meaningful when `inverted`; shader-uniform value.
-    inv_gamma: f32,
-    /// The film stock profile inverting this texture, when the preset is an
-    /// inverted film negative. Drives re-deriving the tone pivots analytically
-    /// for the live EV (see [`film_pivots_at_gain`]); `None` for a positive
-    /// scan.
-    stock: Option<MonoStock>,
-    /// Raw sensor-linear transmission fractiles (ranks {0.90, 0.50, 0.02}) the
-    /// inverted preset's tone pivots are derived from at each EV. Because the
-    /// density inversion is monotone-decreasing, the rendered positive's
-    /// percentile `q` hangs off the sensor rank `1-q`; keeping the RANK in
-    /// sensor space lets every frame's pivots be exact at the CURRENT exposure
-    /// instead of frozen EV-0 values. `None` for a positive scan, whose pivots
-    /// come straight from [`tone_anchors`] (EV-independent by construction).
-    anchor_fractiles: Option<(f32, f32, f32)>,
-    /// The GPU tone LUT as `R16Float` bytes, rebuilt whenever the pivots or curve
-    /// powers change (see [`Self::rebuild_tone_lut`]).
-    tone_lut: Vec<u8>,
-    /// Monotonic id bumped on every tone-LUT rebuild; the pipeline re-uploads
-    /// the texture when it changes.
-    tone_version: u64,
     /// Monotonic id bumped by the app model on each new detail decode. Used
     /// to detect image changes and rebuild the GPU texture/bind group.
     image_id: u64,
@@ -153,44 +82,23 @@ impl DetailProgram {
     /// sensor's true long edge AFTER masked-border cropping and BEFORE the
     /// downscale — it restores the full-resolution display-oriented source dims
     /// (`source_dimensions`) that the crop margins are authored against.
-    /// `exposure` is the raw user-facing EV value; the gain sent to the GPU is
-    /// `2^EV` for a non-inverted preset and `2^-EV` for an inverted one (see
-    /// [`sensor_gain`]), so +EV always brightens the final positive.
-    /// `crop` is the frame's stored source-pixel crop (all-zero for a fresh
-    /// frame). `rotation` is the cumulative counter-clockwise 90° quarter-turn
-    /// display rotation on top of the EXIF-upright texture (`0` = none). The
-    /// view starts at contain fit (zoom 1.0, no pan) with an identity tone
-    /// curve. `inversion` is `Some((stock, base))` when the texture is a film
-    /// negative the shader must density-invert per fragment (`base` is the
-    /// clear-film transmission anchor). An inverted preset's shadow/mid-gray/
-    /// white-point pivots derive from the raw sensor fractiles at the CURRENT
-    /// exposure (see [`film_pivots_at_gain`]); a positive scan's pivot from
-    /// [`tone_anchors`].
+    /// `develop` is the frame's resolved density develop (its `exposure_ev`
+    /// drives the per-fragment `2^-EV` sensor gain). `crop` is the frame's
+    /// stored source-pixel crop (all-zero for a fresh frame). `rotation` is the
+    /// cumulative counter-clockwise 90° quarter-turn display rotation on top of
+    /// the EXIF-upright texture (`0` = none). The view starts at contain fit
+    /// (zoom 1.0, no pan).
     #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
     pub fn new(
         mono: Vec<f32>,
         width: u32,
         height: u32,
-        exposure: f32,
+        develop: Develop,
         crop: CropMargins,
         rotation: u8,
         image_id: u64,
         src_long_edge: u32,
-        inversion: Option<(MonoStock, f32)>,
     ) -> Self {
-        let (shadow, mid, white, stock, anchor_fractiles) = if let Some((stock, base)) = inversion {
-            let fractiles = film_anchor_fractiles(&mono);
-            let (shadow, mid, white) =
-                film_pivots_at_gain(fractiles, base, sensor_gain(exposure, true), stock);
-            (shadow, mid, white, Some(stock), Some(fractiles))
-        } else {
-            let (shadow, mid, white) = tone_anchors(&mono);
-            (shadow, mid, white, None, None)
-        };
-        let (inverted, inv_base, inv_d_max, inv_gamma) = match inversion {
-            Some((stock, base)) => (true, base, stock.d_max, stock.gamma),
-            None => (false, 1.0, 1.0, 1.0),
-        };
         // The texture shares the display source's aspect (resize_area +
         // orientation preserve it within floor-rounding), so the two source
         // axes are recovered from the long edge: the long-edged axis equals
@@ -214,69 +122,21 @@ impl DetailProgram {
             height,
             src_w,
             src_h,
-            exposure,
+            develop,
             zoom: 1.0,
             pan: cosmic::iced::Point::default(),
-            mid,
-            white,
-            shadow,
-            contrast: 1.0,
-            highlights: 1.0,
-            shadows: 1.0,
             crop,
             rotation,
             show_mask: false,
             pad: 0.0,
-            inverted,
-            inv_base,
-            inv_d_max,
-            inv_gamma,
-            film_contrast: 0.0,
-            film_shadows: 0.0,
-            film_highlights: 0.0,
-            stock_d_max: if inverted { inv_d_max } else { 1.0 },
-            stock,
-            anchor_fractiles,
-            tone_lut: build_tone_lut(1.0, 1.0, 1.0, shadow, mid, white),
-            tone_version: 0,
             image_id,
         }
     }
 
-    /// Rebuild the GPU tone LUT from the current pivots + curve powers and bump
-    /// its version, so the pipeline re-uploads the texture. Called whenever a
-    /// slider moves (`set_exposure` re-derives film pivots, `set_curve` changes
-    /// the powers). ~2048 powf ≈ µs — negligible on a drag tick.
-    fn rebuild_tone_lut(&mut self) {
-        self.tone_lut = build_tone_lut(
-            self.contrast,
-            self.highlights,
-            self.shadows,
-            self.shadow,
-            self.mid,
-            self.white,
-        );
-        self.tone_version = self.tone_version.wrapping_add(1);
-    }
-
-    /// Update the exposure value (called on slider drag).
-    ///
-    /// An inverted (film) preset re-derives its tone pivots from the raw
-    /// sensor fractiles at the incoming EV, so the shadow/mid/white anchors
-    /// always describe the ACTUAL render instead of the EV at decode. A
-    /// positive scan's anchors are EV-independent (the gain never touches the
-    /// curve input) and stay as measured.
+    /// Update the exposure value (called on slider drag): the pointwise develop
+    /// reads it as the `2^-EV` sensor gain, so +EV brightens the positive.
     pub fn set_exposure(&mut self, ev: f32) {
-        self.exposure = ev;
-        if let (Some(stock), Some(fractiles)) = (self.stock, self.anchor_fractiles) {
-            (self.shadow, self.mid, self.white) = film_pivots_at_gain(
-                fractiles,
-                self.inv_base,
-                sensor_gain(ev, true),
-                stock,
-            );
-        }
-        self.rebuild_tone_lut();
+        self.develop.exposure_ev = ev;
     }
 
     /// Update the zoom/pan transform (called on detail-view wheel/drag).
@@ -288,30 +148,11 @@ impl DetailProgram {
         self.pan = pan;
     }
 
-    /// Update the contrast/highlights/shadows tone curve (called on editing
-    /// drawer sliders). Only the two remap uniforms change — the uploaded
-    /// texture stays the fixed render, re-curved per pixel in WGSL.
-    ///
-    /// `contrast` pivots at the image's measured mid-gray, `highlights` at the
-    /// measured 10th-percentile shadow anchor, `shadows` at the measured white
-    /// point (`1.0` = identity for each); all three compose into the single
-    /// `ratio * p^exp` remap the shader applies. The Highlights/Shadows slider
-    /// and keyboard layers present these powers through a stop-based "lift
-    /// value" (`app::highlight_lift`/`app::shadow_lift`, 0 = identity at the
-    /// track center, +n = n stops lifting) so increasing on screen brightens
-    /// the region; this method is the unconverted raw-power boundary.
-    pub fn set_curve(&mut self, contrast: f32, highlights: f32, shadows: f32) {
-        self.contrast = contrast;
-        self.highlights = highlights;
-        self.shadows = shadows;
-        // The film path consumes the same controls as STOP LIFTS, recovered
-        // from the decoded powers by the same maps the UI uses (`contrast`/
-        // `highlights` `+log2`, `shadows` `-log2`). They are ignored by the
-        // positive path.
-        self.film_contrast = contrast.log2();
-        self.film_shadows = -shadows.log2();
-        self.film_highlights = highlights.log2();
-        self.rebuild_tone_lut();
+    /// Replace the live density develop (called on editing-drawer sliders). The
+    /// uploaded texture is untouched — only the `dev_*` uniforms change and the
+    /// WGSL re-develops every fragment.
+    pub fn set_develop(&mut self, develop: Develop) {
+        self.develop = develop;
     }
 
     /// Update the live crop margins (called on each keyboard trim).
@@ -415,31 +256,13 @@ impl Clone for DetailProgram {
             height: self.height,
             src_w: self.src_w,
             src_h: self.src_h,
-            exposure: self.exposure,
+            develop: self.develop,
             zoom: self.zoom,
             pan: self.pan,
-            mid: self.mid,
-            white: self.white,
-            shadow: self.shadow,
-            contrast: self.contrast,
-            highlights: self.highlights,
-            shadows: self.shadows,
             crop: self.crop,
             rotation: self.rotation,
             show_mask: self.show_mask,
             pad: self.pad,
-            inverted: self.inverted,
-            inv_base: self.inv_base,
-            inv_d_max: self.inv_d_max,
-            inv_gamma: self.inv_gamma,
-            film_contrast: self.film_contrast,
-            film_shadows: self.film_shadows,
-            film_highlights: self.film_highlights,
-            stock_d_max: self.stock_d_max,
-            stock: self.stock,
-            anchor_fractiles: self.anchor_fractiles,
-            tone_lut: self.tone_lut.clone(),
-            tone_version: self.tone_version,
             image_id: self.image_id,
         }
     }
@@ -452,31 +275,13 @@ impl std::fmt::Debug for DetailProgram {
             .field("height", &self.height)
             .field("src_w", &self.src_w)
             .field("src_h", &self.src_h)
-            .field("exposure", &self.exposure)
+            .field("develop", &self.develop)
             .field("zoom", &self.zoom)
             .field("pan", &self.pan)
-            .field("mid", &self.mid)
-            .field("white", &self.white)
-            .field("shadow", &self.shadow)
-            .field("contrast", &self.contrast)
-            .field("highlights", &self.highlights)
-            .field("shadows", &self.shadows)
             .field("crop", &self.crop)
             .field("rotation", &self.rotation)
             .field("show_mask", &self.show_mask)
             .field("pad", &self.pad)
-            .field("inverted", &self.inverted)
-            .field("inv_base", &self.inv_base)
-            .field("inv_d_max", &self.inv_d_max)
-            .field("inv_gamma", &self.inv_gamma)
-            .field("film_contrast", &self.film_contrast)
-            .field("film_shadows", &self.film_shadows)
-            .field("film_highlights", &self.film_highlights)
-            .field("stock_d_max", &self.stock_d_max)
-            .field("stock", &self.stock)
-            .field("anchor_fractiles", &self.anchor_fractiles)
-            .field("tone_lut_len", &self.tone_lut.len())
-            .field("tone_version", &self.tone_version)
             .field("mono_len", &self.mono.len())
             .field("image_id", &self.image_id)
             .finish()
@@ -499,7 +304,7 @@ impl<M> Program<M> for DetailProgram {
     ) -> Self::Primitive {
         DetailPrimitive {
             mono: self.mono.clone(),
-            exposure: self.exposure,
+            develop: self.develop,
             zoom: self.zoom,
             pan: self.pan,
             crop: self.crop,
@@ -510,22 +315,13 @@ impl<M> Program<M> for DetailProgram {
             height: self.height,
             src_w: self.src_w,
             src_h: self.src_h,
-            inverted: self.inverted,
-            inv_base: self.inv_base,
-            inv_gamma: self.inv_gamma,
-            film_contrast: self.film_contrast,
-            film_shadows: self.film_shadows,
-            film_highlights: self.film_highlights,
-            stock_d_max: self.stock_d_max,
-            tone_lut: self.tone_lut.clone(),
-            tone_version: self.tone_version,
             image_id: self.image_id,
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Crop-geometry + tone-curve pure helpers
+// Crop-geometry pure helpers
 // ---------------------------------------------------------------------------
 
 /// The live-crop sub-rectangle in **texture space** as `(origin, size)`, both
@@ -557,320 +353,6 @@ fn crop_uv_geometry(
     )
 }
 
-/// Bins per axis for the anchor histogram. 4096 bins over [0,1] resolve the
-/// median and the 98th-percentile white point to ~2.4e-4 absolute — far finer
-/// than the f16 texture's ~2^-11 and more than any preview needs.
-const ANCHOR_BINS: usize = 4096;
-
-/// Subsample stride for [`film_anchor_fractiles`]: every Nth sensor sample
-/// lands in the fractile histogram. Percentile pivots are insensitive to the
-/// subsample, and the stride bounds the per-decode cost at native resolution
-/// (an 8K² buffer would otherwise histogram ~64M samples).
-const ANCHOR_INV_STRIDE: usize = 4;
-
-/// Smallest anchor accepted. Guards `pow(0, negative)` → NaN for degenerate
-/// all-black frames, where the 50th/98th percentile of noise can land at 0.
-pub(crate) const MIN_ANCHOR: f32 = 1e-3;
-
-/// The shadow pivot is floored at this share of the mid-gray pivot so the
-/// Shadows power stays usable when the frame's bottom decile is literal black
-/// (the clear-film plateau at EV ≤ 0): a pivot pinned to [`MIN_ANCHOR`] makes
-/// `s^(1-ks)` explode (`s≈0` lifts the whole positive to white), while a
-/// pivot at ~15% of the mid keeps the control acting on the darkest real
-/// detail. Tunable during visual calibration.
-const SHADOW_PIVOT_FLOOR: f32 = 0.15;
-
-/// The linear-light sensor gain for a user-facing EV value: for an
-/// already-positive preset the gain is `2^EV` (multiplies the final positive),
-/// for an INVERTED (film) preset the sign flips — `2^-EV` multiplies the true
-/// sensor-linear NEGATIVE before the density inversion, so +EV makes the film
-/// denser and the positive brighter. Identical slider semantics (+EV =
-/// brighter) across presets; the flip happens at the point EV meets the sensor
-/// data.
-///
-/// Kept pure + unit-tested so the GPU shader, the CPU thumbnail bake, and the
-/// export path cannot drift.
-#[must_use]
-pub fn sensor_gain(ev: f32, inverted: bool) -> f32 {
-    if inverted {
-        (-ev).exp2()
-    } else {
-        ev.exp2()
-    }
-}
-
-/// Measure the tone anchors a pivoted curve needs, from the uploaded positive
-/// (`p` in [0,1]): the 10th percentile (the shadow anchor, robust against a
-/// few pure-black pixels), the median (a stable mid-gray), and the 98th
-/// percentile (a robust white point, insensitive to a few hot specular
-/// pixels). Single pass over the mono, O(n) — no sort of a 2048² buffer.
-///
-/// `pub(crate)` so the CPU thumbnail bake reuses the same anchor machinery the
-/// detail shader does, keeping grid and detail measurements aligned.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-pub(crate) fn tone_anchors(mono: &[f32]) -> (f32, f32, f32) {
-    anchors_from(mono.iter().copied(), mono.len())
-}
-
-/// The raw sensor-linear fractiles a film inversion derives its tone pivots
-/// from: the transmission values at ranks {0.90, 0.50, 0.02}. Because the
-/// density inversion is monotone-decreasing, the rendered positive's
-/// percentile `q` hangs off the sensor rank `1−q` — the 10th-percentile shadow
-/// from the 90th, the mid-gray from the median, and the 98th-percentile white
-/// point from the 2nd (the densest real data, insensitive to a few saturated
-/// or dusty samples at the high end).
-///
-/// Keeping the RANK in raw sensor space (instead of density-inverting first)
-/// lets the EV-exact pivot for any exposure be derived analytically with
-/// `invert_value(fractile · gain)` — the exact transform the WGSL applies per
-/// fragment — instead of freezing the EV-0 anchors while the frame renders at
-/// +0.7 EV. Samples every [`ANCHOR_INV_STRIDE`]-th pixel to bound the cost on
-/// a native level-up decode.
-pub(crate) fn film_anchor_fractiles(mono: &[f32]) -> (f32, f32, f32) {
-    let count = mono.len().div_ceil(ANCHOR_INV_STRIDE);
-    let (bins, total) = histogram_from(mono.iter().step_by(ANCHOR_INV_STRIDE).copied(), count);
-    if total == 0 {
-        return (MIN_ANCHOR, MIN_ANCHOR, MIN_ANCHOR);
-    }
-    let white = percentile(&bins, total, 0.02);
-    let mid = percentile(&bins, total, 0.5);
-    let shadow = percentile(&bins, total, 0.90);
-    (shadow, mid, white)
-}
-
-/// Derive the tone pivots (shadow/mid-gray/white) for a film negative rendered
-/// at linear gain `g` from its raw sensor fractiles: the sensor value at rank
-/// `r` maps through `invert_value(fractile · g)` — the exact transform the
-/// WGSL applies per fragment. Each pivot is floored at [`MIN_ANCHOR`] like
-/// [`tone_anchors`] guards its degenerate all-black frames.
-///
-/// `pub(crate)` so the CPU bake tail (`app::bake_tone`) derives the same
-/// EV-exact pivots the detail shader does, keeping grid == detail == export.
-pub(crate) fn film_pivots_at_gain(
-    fractiles: (f32, f32, f32),
-    base: f32,
-    gain: f32,
-    stock: MonoStock,
-) -> (f32, f32, f32) {
-    let (fs, fm, fw) = fractiles;
-    (
-        invert_value(fs * gain, base, &stock).max(MIN_ANCHOR),
-        invert_value(fm * gain, base, &stock).max(MIN_ANCHOR),
-        invert_value(fw * gain, base, &stock).max(MIN_ANCHOR),
-    )
-}
-
-/// Bin values into the anchor histogram, returning `(bins, total)` where
-/// `total` is the sample count supplied by the caller (the percentile targets
-/// scale against it). The histogram-bin core shared by [`tone_anchors`] and
-/// [`film_anchor_fractiles`].
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-fn histogram_from(values: impl Iterator<Item = f32>, count: usize) -> (Vec<u64>, usize) {
-    // Heap-allocated (4096 × u64 ≈ 32 KB would trip `large_stack_arrays`).
-    let mut bins = vec![0_u64; ANCHOR_BINS];
-    for v in values {
-        let v = v.clamp(0.0, 1.0);
-        // `(v * (BINS-1))` maps 0..1 to bin 0..BINS-1; truncation is fine
-        // because binning is deliberately approximate.
-        let idx = (v * (ANCHOR_BINS - 1) as f32) as usize;
-        bins[idx.min(ANCHOR_BINS - 1)] += 1;
-    }
-    (bins, count)
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-fn anchors_from(values: impl Iterator<Item = f32>, count: usize) -> (f32, f32, f32) {
-    let (bins, total) = histogram_from(values, count);
-    if count == 0 {
-        return (MIN_ANCHOR, MIN_ANCHOR, MIN_ANCHOR);
-    }
-    let shadow = percentile(&bins, total, 0.10);
-    let mid = percentile(&bins, total, 0.5);
-    let white = percentile(&bins, total, 0.98);
-    (
-        shadow.max(MIN_ANCHOR),
-        mid.max(MIN_ANCHOR),
-        white.max(MIN_ANCHOR),
-    )
-}
-
-/// The value of the `q`-quantile (0..=1) of the bin counts, as a coordinate
-/// in [0,1]. Walks the cumulative distribution until it reaches the
-/// `q·total`-th element; for a non-trivial `total` this lands just past the
-/// low-population boundary bins that a strict `>` test would skip.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-fn percentile(bins: &[u64], total: usize, q: f32) -> f32 {
-    let target = (total as f32 * q) as u64;
-    let mut cumulative = 0_u64;
-    for (i, &count) in bins.iter().enumerate() {
-        cumulative += count;
-        if cumulative >= target {
-            return i as f32 / (ANCHOR_BINS - 1) as f32;
-        }
-    }
-    1.0
-}
-
-/// Precompute the per-frame tone remap `T(p) = clamp(ratio * p^exp, 0, 1)`.
-///
-/// Contrast, highlights, and shadows are power curves pivoted at the image's
-/// measured mid-gray (`mid`), shadow anchor (`shadow`), and white point
-/// (`white`):
-///
-/// `C(p) = mid^(1-kc) · p^kc`          (pivot at `mid`: `C(mid) = mid`)
-/// `H(p) = shadow^(1-kh) · p^kh`        (pivot at `shadow`: `H(shadow) =
-///                                                    shadow`)
-/// `S(p) = white^(1-ks) · p^ks`         (pivot at `white`: `S(white) = white`)
-///
-/// Three monotone powers compose exactly into one power, so all three fit a
-/// single `(ratio, exp)` pair the WGSL shader applies as `ratio·p^exp`:
-/// `H∘S∘C(p) = (shadow^(1-kh) · white^(kh(1-ks)) · mid^(kh·ks(1-kc))) · p^(kc·ks·kh)`.
-/// At `kc = kh = ks = 1` the remap is the identity (`ratio = 1`, `exp = 1`),
-/// so untouched renders stay byte-identical.
-///
-/// `pub(crate)` — the shared helper the CPU thumbnail bake reuses so grid and
-/// detail agree, alongside the GPU `prepare()` fold.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn curve_remap(
-    contrast: f32,
-    highlights: f32,
-    shadows: f32,
-    shadow: f32,
-    mid: f32,
-    white: f32,
-) -> (f32, f32) {
-    // A shadow pivot pinned to literal black (the clear-film plateau at EV ≤ 0)
-    // would make the highlights power explode: `s^(1-kh)` near `s ≈ 0` lifts the
-    // whole positive to white. Floor the pivot to a share of the mid so the
-    // control keeps acting on the darkest detail; at the identity defaults
-    // (`kh = 1`) every pivot power vanishes and the remap stays exactly 1.
-    let shadow = shadow.max(mid * SHADOW_PIVOT_FLOOR);
-    let ratio = shadow.powf(1.0 - highlights)
-        * white.powf(highlights * (1.0 - shadows))
-        * mid.powf(highlights * shadows * (1.0 - contrast));
-    let exponent = contrast * highlights * shadows;
-    (ratio, exponent)
-}
-
-/// Apply the composed tone remap `T(p) = clamp(ratio · p^exp, 0, 1)` to a mono
-/// positive in place.
-///
-/// The CPU twin of the tone model the GPU consumes through its tone LUT (see
-/// [`tone_model`] + [`build_tone_lut`]) — the shared math the grid thumbnail
-/// and export bakes apply exactly, so a baked tile and the detail shader
-/// produce identical tones within the tested LUT tolerance. Identity at the
-/// `(1.0, 1.0, 1.0)` defaults; `shadow`/`mid`/`white` are the same anchors
-/// [`tone_anchors`] measures. A separate op from exposure (which the shader
-/// applies after), so callers must apply this *before* the `2^EV` gain to
-/// mirror the shader.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_curve(
-    mono: &mut [f32],
-    contrast: f32,
-    highlights: f32,
-    shadows: f32,
-    shadow: f32,
-    mid: f32,
-    white: f32,
-) {
-    let (ratio, exponent) = curve_remap(contrast, highlights, shadows, shadow, mid, white);
-    for value in mono.iter_mut() {
-        *value = tone_model(*value, ratio, exponent);
-    }
-}
-
-/// The single per-pixel tone expression `clamp(ratio · p^exp, 0, 1)` — the
-/// only place the tone-remap math lives for the non-shader paths. The GPU
-/// texture-samples it from the tone LUT ([`build_tone_lut`]) instead of
-/// re-deriving the expression per fragment, so the tone model can change on
-/// the CPU without the WGSL ever changing.
-#[must_use]
-pub(crate) fn tone_model(p: f32, ratio: f32, exponent: f32) -> f32 {
-    (ratio * p.powf(exponent)).clamp(0.0, 1.0)
-}
-
-/// Number of entries in the GPU tone LUT. 2048 on a smooth monotone curve is
-/// far below a u8 level after half-float quantization, so the interpolation is
-/// visually lossless while keeping the LUT a ~4 KB texture.
-pub(crate) const TONE_LUT_ENTRIES: usize = 2048;
-
-/// The LUT's sampling domain exponent: the LUT is built over `t ∈ [0,1]` where
-/// the curve's input is `p = t^G`. Power tone curves with `exp < 1` (a shadow
-/// lift, e.g. `p^0.3`) have an infinite slope at `p = 0`, so a uniform grid in
-/// `p` badly undershoots the darkest entries. Sampling on `t = p^(1/G)` packs
-/// the grid toward black, where the curve becomes near-linear in `t` and the
-/// interpolation error collapses. Must match the WGSL's `pow(p, 1/G)`.
-pub(crate) const TONE_LUT_GAMMA: f32 = 2.2;
-
-/// Pre-scale factor applied to the LUT's stored values (the shader divides it
-/// back out after sampling). The LUT stores the PRE-exposure curve output,
-/// which for a darkening curve can sit far below the half-float normal floor
-/// (6.1e-5) and would flush to zero — while the CPU bake preserves it in f32
-/// and the later `2^EV` gain amplifies it. Scaling by 512 shifts the floor to
-/// ~1.2e-7, deep below anything the ±4 EV slider can recover. Scale commutes
-/// with linear interpolation, so the sampled value is exact after the divide.
-pub(crate) const TONE_LUT_SCALE: f32 = 512.0;
-
-/// Build the GPU tone LUT: [`TONE_LUT_ENTRIES`] samples of [`tone_model`] over
-/// `p = t^G ∈ [0,1]` (see [`TONE_LUT_GAMMA`]), scaled by [`TONE_LUT_SCALE`] and
-/// returned as `R16Float` (half) bytes ready for `write_texture`. The WGSL
-/// samples this with linear interpolation at `t = p^(1/G)` and divides out the
-/// scale; the CPU bakes call [`tone_model`] directly (exact), so the only
-/// approximation anywhere is the LUT itself — bounded and unit-tested.
-#[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-pub(crate) fn build_tone_lut(
-    contrast: f32,
-    highlights: f32,
-    shadows: f32,
-    shadow: f32,
-    mid: f32,
-    white: f32,
-) -> Vec<u8> {
-    let (ratio, exponent) = curve_remap(contrast, highlights, shadows, shadow, mid, white);
-    let mut lut = Vec::with_capacity(TONE_LUT_ENTRIES * 2);
-    for i in 0..TONE_LUT_ENTRIES {
-        let t = i as f32 / (TONE_LUT_ENTRIES - 1) as f32;
-        let p = t.powf(TONE_LUT_GAMMA);
-        lut.extend_from_slice(
-            &f32_to_half(tone_model(p, ratio, exponent) * TONE_LUT_SCALE).to_le_bytes(),
-        );
-    }
-    lut
-}
-
-/// Sample a decoded tone LUT with the same linear interpolation a GPU sampler
-/// applies, mapping the curve input through the gamma domain exactly as the
-/// WGSL does (`t = p^(1/G)`) and dividing out [`TONE_LUT_SCALE`]. Used by the
-/// parity tests to simulate the GPU fragment math from the uploaded half LUT.
-#[cfg(test)]
-#[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-pub(crate) fn sample_tone_lut_f32(lut: &[f32], p: f32) -> f32 {
-    let t = p.clamp(0.0, 1.0).powf(1.0 / TONE_LUT_GAMMA);
-    let pos = t * (TONE_LUT_ENTRIES - 1) as f32;
-    let lo = pos.floor() as usize;
-    let hi = (lo + 1).min(TONE_LUT_ENTRIES - 1);
-    let frac = pos - lo as f32;
-    (lut[lo] * (1.0 - frac) + lut[hi] * frac) / TONE_LUT_SCALE
-}
-
 // ---------------------------------------------------------------------------
 // iced::wgpu::primitive::Primitive implementation
 // ---------------------------------------------------------------------------
@@ -884,7 +366,8 @@ pub(crate) fn sample_tone_lut_f32(lut: &[f32], p: f32) -> f32 {
 #[derive(Debug, Clone)]
 pub struct DetailPrimitive {
     mono: Vec<f32>,
-    exposure: f32,
+    /// The live pointwise density develop (see [`DetailProgram::develop`]).
+    develop: Develop,
     /// Detail-view zoom in `log2` units; 1.0 = contain fit.
     zoom: f32,
     /// Pan offset of the image center from the widget center (logical points).
@@ -899,42 +382,21 @@ pub struct DetailPrimitive {
     show_mask: bool,
     /// Minimum padding (logical points) kept around the image in crop mode.
     pad: f32,
-    /// Whether the mono is a true sensor-linear NEGATIVE to density-invert per
-    /// fragment (film preset). Inverts the exposure gain sign (see
-    /// [`sensor_gain`]) and drives the WGSL inversion branch.
-    inverted: bool,
-    /// Clear-film transmission anchor (inversion black point), shader uniform.
-    inv_base: f32,
-    /// Density-space tone exponent (stock `gamma`), shader uniform.
-    inv_gamma: f32,
-    /// Film-path Contrast stop lift (scales the density window). Identity `0`.
-    film_contrast: f32,
-    /// Film-path Shadows region lift in stops (density-domain toe mask).
-    film_shadows: f32,
-    /// Film-path Highlights region lift in stops (density-domain shoulder mask).
-    film_highlights: f32,
-    /// The stock's preset usable density range, so `prepare` can recompute the
-    /// effective window from `film_contrast`.
-    stock_d_max: f32,
     width: u32,
     height: u32,
     /// Full-resolution display-oriented source dims the crop margins are
     /// authored against (see [`crop_uv_geometry`]).
     src_w: u32,
     src_h: u32,
-    /// The GPU tone LUT (`R16Float` bytes) and its version, so `prepare`
-    /// re-uploads the texture when the curve/pivots change.
-    tone_lut: Vec<u8>,
-    tone_version: u64,
     image_id: u64,
 }
 
 impl Primitive for DetailPrimitive {
     type Pipeline = DetailPipeline;
 
-    // Sequential wgpu uploads (texture, tone LUT, then uniforms) that must run
-    // in this exact order each frame; splitting them into helper methods would
-    // only scatter the pipeline state they all touch.
+    // Sequential wgpu uploads (texture, then uniforms) that must run in this
+    // exact order each frame; splitting them into helper methods would only
+    // scatter the pipeline state they all touch.
     #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     fn prepare(
         &self,
@@ -1023,57 +485,11 @@ impl Primitive for DetailPrimitive {
                             binding: 2,
                             resource: pipeline.uniform_buf.as_entire_binding(),
                         },
-                        cosmic::iced::wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: cosmic::iced::wgpu::BindingResource::TextureView(
-                                &pipeline.tone_lut_view,
-                            ),
-                        },
-                        cosmic::iced::wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: cosmic::iced::wgpu::BindingResource::Sampler(
-                                &pipeline.sampler,
-                            ),
-                        },
                     ],
                 },
             ));
             pipeline.current_image_id = Some(self.image_id);
             pipeline.initialized = true;
-        }
-
-        // --- Upload the tone LUT when the curve/pivots changed ---
-        // A fixed 2048×1 R16Float texture created once in `Pipeline::new`; a
-        // curve slider (`set_curve`) or EV drag on an inverted preset
-        // (`set_exposure` re-derives pivots) bumps `tone_version`, and this
-        // re-uploads the ~4 KB LUT. The WGSL texture-samples it per fragment.
-        // `tone_version` resets per program (each image install re-derives it),
-        // but the pipeline is cached across image selections — so also force a
-        // re-upload whenever a new image is installed, or the second frame on
-        // would keep sampling the previous frame's LUT until the user edits.
-        if needs_new_texture || pipeline.current_tone_version != Some(self.tone_version) {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-            let lut_w = TONE_LUT_ENTRIES as u32;
-            queue.write_texture(
-                cosmic::iced::wgpu::TexelCopyTextureInfo {
-                    texture: &pipeline.tone_lut_tex,
-                    mip_level: 0,
-                    origin: cosmic::iced::wgpu::Origin3d::ZERO,
-                    aspect: cosmic::iced::wgpu::TextureAspect::All,
-                },
-                &self.tone_lut,
-                cosmic::iced::wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(lut_w * 2),
-                    rows_per_image: Some(1),
-                },
-                cosmic::iced::wgpu::Extent3d {
-                    width: lut_w,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-            );
-            pipeline.current_tone_version = Some(self.tone_version);
         }
 
         // --- Per-frame: update uniform buffer ---
@@ -1097,13 +513,12 @@ impl Primitive for DetailPrimitive {
         // Display rotation as a float quarter-turn count for the WGSL remap.
         // `0.0` = identity; the WGSL keeps it in {0,1,2,3} by construction.
         let rot = f32::from(self.rotation & 3);
+        // The sensor gain is `2^-EV`: +EV lowers the transmission, raises the
+        // density, and brightens the positive. Computed once per frame from the
+        // develop's exposure; the WGSL reads it as a direct multiplier.
+        let exposure = (-self.develop.exposure_ev).exp2();
         let uniforms = Uniforms {
-            // Convert raw EV (slider value) to the linear-light sensor gain
-            // once per frame; for an inverted (film) preset the sign flips so
-            // the gain multiplies the sensor-linear NEGATIVE before the WGSL
-            // inversion (see `sensor_gain`). The WGSL shader reads this as a
-            // direct multiplier.
-            exposure: sensor_gain(self.exposure, self.inverted),
+            exposure,
             // Texture dimensions feed the WGSL's contained-fit math so the
             // shader mirrors `widget::image.content_fit(ContentFit::Contain)`.
             tex_w,
@@ -1128,18 +543,12 @@ impl Primitive for DetailPrimitive {
             // Crop-mode minimum padding, logical points → physical pixels like
             // the pan (see set_pad).
             pad: self.pad * sf,
-            // Film-negative inversion: on when the texture is a true
-            // sensor-linear negative the WGSL must density-invert per fragment.
-            inv: if self.inverted { 1.0 } else { 0.0 },
-            inv_base: self.inv_base,
-            // Film Contrast scales the usable density window in log-density
-            // (see `film::effective_d_max`); the effective value is what the
-            // WGSL divides the density by.
-            inv_d_max: film::effective_d_max(self.stock_d_max, self.film_contrast),
-            inv_gamma: self.inv_gamma,
-            // Region lifts as signed normalized-positive strengths.
-            region_shadows: film::region_strength(self.film_shadows),
-            region_highlights: film::region_strength(self.film_highlights),
+            // The density develop block (mirrors `film::Develop`).
+            dev_base: self.develop.base,
+            dev_black: self.develop.black,
+            dev_white: self.develop.white,
+            dev_contrast: self.develop.contrast,
+            dev_pivot: self.develop.pivot_offset,
         };
         queue.write_buffer(&pipeline.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -1207,13 +616,6 @@ pub struct DetailPipeline {
     bind_group_layout: cosmic::iced::wgpu::BindGroupLayout,
     bind_group: Option<cosmic::iced::wgpu::BindGroup>,
     render_pipeline: Option<cosmic::iced::wgpu::RenderPipeline>,
-    /// The fixed 2048×1 `R16Float` tone LUT texture (created once here) + its
-    /// view; `prepare()` re-uploads the bytes when `tone_version` changes.
-    tone_lut_tex: cosmic::iced::wgpu::Texture,
-    tone_lut_view: cosmic::iced::wgpu::TextureView,
-    /// Version of the tone LUT currently uploaded; compared against the
-    /// primitive's `tone_version` every frame to detect curve/pivot edits.
-    current_tone_version: Option<u64>,
     initialized: bool,
     /// Identity of the image currently installed in the GPU texture. Compared
     /// against the primitive's `image_id` on every `prepare()` call to detect
@@ -1255,34 +657,10 @@ impl Pipeline for DetailPipeline {
             // Trilinear minification: the detail texture carries a full mip
             // chain (see [`build_mip_chain`]), so zooming back out past the
             // native level-up minifies through pre-filtered levels instead of
-            // aliasing the full-res grain into a moiré pattern. A no-op for the
-            // single-level tone LUT, which shares this sampler.
+            // aliasing the full-res grain into a moiré pattern.
             mipmap_filter: cosmic::iced::wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
-
-        // The tone LUT texture lives for the pipeline's lifetime: a fixed
-        // 2048×1 R16Float strip re-uploaded by `prepare()` when the curve or
-        // pivots change (the mono texture + bind group are still created
-        // lazily below on the first frame, since they need the mono data).
-        let tone_lut_tex = device.create_texture(&cosmic::iced::wgpu::TextureDescriptor {
-            label: Some("exposure tone lut"),
-            size: cosmic::iced::wgpu::Extent3d {
-                #[allow(clippy::cast_possible_truncation)]
-                width: TONE_LUT_ENTRIES as u32,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: cosmic::iced::wgpu::TextureDimension::D2,
-            format: cosmic::iced::wgpu::TextureFormat::R16Float,
-            usage: cosmic::iced::wgpu::TextureUsages::TEXTURE_BINDING
-                | cosmic::iced::wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let tone_lut_view =
-            tone_lut_tex.create_view(&cosmic::iced::wgpu::TextureViewDescriptor::default());
 
         // Bind group and texture are created lazily in `prepare()` on the
         // first frame (they require the mono data to build the texture).
@@ -1294,9 +672,6 @@ impl Pipeline for DetailPipeline {
             bind_group_layout,
             bind_group: None,
             render_pipeline: Some(render_pipeline),
-            tone_lut_tex,
-            tone_lut_view,
-            current_tone_version: None,
             initialized: false,
             current_image_id: None,
         }
@@ -1350,25 +725,6 @@ fn build_bind_group_layout(
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
-                count: None,
-            },
-            // The 2048×1 R16Float tone LUT + its (shared) linear sampler.
-            cosmic::iced::wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: cosmic::iced::wgpu::ShaderStages::FRAGMENT,
-                ty: cosmic::iced::wgpu::BindingType::Texture {
-                    sample_type: cosmic::iced::wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: cosmic::iced::wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            cosmic::iced::wgpu::BindGroupLayoutEntry {
-                binding: 4,
-                visibility: cosmic::iced::wgpu::ShaderStages::FRAGMENT,
-                ty: cosmic::iced::wgpu::BindingType::Sampler(
-                    cosmic::iced::wgpu::SamplerBindingType::Filtering,
-                ),
                 count: None,
             },
         ],
@@ -1460,25 +816,17 @@ struct Uniforms {
     /// The WGSL contain-fit base shrinks by `pad` on every side so a white
     /// margin is always visible; zooming in grows the image into it.
     pad: f32,
-    /// Non-zero when the texture is a true sensor-linear NEGATIVE the shader
-    /// must density-invert per fragment (a film preset). Drives the WGSL
-    /// inversion branch in `shade()`.
-    inv: f32,
-    /// Clear-film transmission anchor (inversion black point): `film::positive`
-    /// maps `value == inv_base` to positive black.
-    inv_base: f32,
-    /// Usable density range above the base (stock `d_max`); `density == d_max`
-    /// maps to positive white.
-    inv_d_max: f32,
-    /// Density-space tone exponent (stock `gamma`) applied to normalized
-    /// density.
-    inv_gamma: f32,
-    /// Shadows region-lift strength (signed, normalized-positive units) for the
-    /// film path's density-domain toe mask.
-    region_shadows: f32,
-    /// Highlights region-lift strength (signed, normalized-positive units) for
-    /// the film path's density-domain shoulder mask.
-    region_highlights: f32,
+    /// Clear-film transmission anchor: `density = log10(dev_base / value)`.
+    dev_base: f32,
+    /// Density mapped to output black.
+    dev_black: f32,
+    /// Density mapped to output white.
+    dev_white: f32,
+    /// Contrast power about the pivot (1.0 = identity).
+    dev_contrast: f32,
+    /// Signed offset from the `[dev_black, dev_white]` midpoint the contrast
+    /// bends around.
+    dev_pivot: f32,
 }
 
 // SAFETY: Uniforms is repr(C) with all f32 fields.
@@ -1663,7 +1011,6 @@ fn downsample_half(mono: &[f32], width: u32, height: u32) -> (Vec<f32>, u32, u32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::film::ACTIVE_STOCK;
 
     #[test]
     fn crop_uv_geometry_zero_crop_is_identity() {
@@ -1730,13 +1077,11 @@ mod tests {
             vec![0.0; 2000 * 1000],
             2000,
             1000,
-            0.0,
+            crate::film::Develop::with_base(crate::film::DEFAULT_FILM_BASE),
             CropMargins::default(),
             0,
             1,
-            2000,
-            None,
-        );
+            2000);
         assert!((program.zoom_100(1000.0, 1000.0, 1.0) - 2.0).abs() < 1e-5);
 
         // An odd display rotation swaps which axis contains: in a 2000×1000
@@ -1746,13 +1091,11 @@ mod tests {
             vec![0.0; 2000 * 1000],
             2000,
             1000,
-            0.0,
+            crate::film::Develop::with_base(crate::film::DEFAULT_FILM_BASE),
             CropMargins::default(),
             1,
             1,
-            2000,
-            None,
-        );
+            2000);
         assert!((rotated.zoom_100(2000.0, 1000.0, 1.0) - 2.0).abs() < 1e-5);
         assert!((program.zoom_100(2000.0, 1000.0, 1.0) - 1.0).abs() < 1e-5);
 
@@ -1765,7 +1108,7 @@ mod tests {
             vec![0.0; 2000 * 1000],
             2000,
             1000,
-            0.0,
+            crate::film::Develop::with_base(crate::film::DEFAULT_FILM_BASE),
             CropMargins {
                 top: 0,
                 right: 1000,
@@ -1774,9 +1117,7 @@ mod tests {
             },
             0,
             1,
-            2000,
-            None,
-        );
+            2000);
         assert!((cropped.zoom_100(1000.0, 1000.0, 1.0) - 1.0).abs() < 1e-5);
 
         // A widget larger than the texture never drops the cap below contain.
@@ -1809,13 +1150,11 @@ mod tests {
             vec![0.0; 2000 * 1000],
             2000,
             1000,
-            0.0,
+            crate::film::Develop::with_base(crate::film::DEFAULT_FILM_BASE),
             CropMargins::default(),
             0,
             1,
-            2000,
-            None,
-        );
+            2000);
         assert!(
             (program.zoom_100_for(2000, 1000, 1000.0, 1000.0, 1.0) - 2.0).abs() < 1e-5
         );
@@ -1838,7 +1177,7 @@ mod tests {
             vec![0.0; 2000 * 1000],
             2000,
             1000,
-            0.0,
+            crate::film::Develop::with_base(crate::film::DEFAULT_FILM_BASE),
             CropMargins {
                 top: 0,
                 right: 1000,
@@ -1847,9 +1186,7 @@ mod tests {
             },
             0,
             1,
-            2000,
-            None,
-        );
+            2000);
         assert!((cropped.zoom_100_for(4000, 2000, 1000.0, 1000.0, 1.0) - 2.0).abs() < 1e-5);
 
         // The 1:1 projection is floored at contain fit like the real cap.
@@ -1864,13 +1201,11 @@ mod tests {
             vec![0.0; 600 * 400],
             600,
             400,
-            0.0,
+            crate::film::Develop::with_base(crate::film::DEFAULT_FILM_BASE),
             CropMargins::default(),
             0,
             1,
-            6000,
-            None,
-        );
+            6000);
         assert_eq!(program.source_dimensions(), (6000, 4000));
 
         // Portrait (rotated) source: texture 400x600 → long edge lands height.
@@ -1878,13 +1213,11 @@ mod tests {
             vec![0.0; 400 * 600],
             400,
             600,
-            0.0,
+            crate::film::Develop::with_base(crate::film::DEFAULT_FILM_BASE),
             CropMargins::default(),
             0,
             1,
-            6000,
-            None,
-        );
+            6000);
         assert_eq!(program.source_dimensions(), (4000, 6000));
 
         // Native decode (texture == source): the long edge restores exactly.
@@ -1892,13 +1225,11 @@ mod tests {
             vec![0.0; 400 * 600],
             400,
             600,
-            0.0,
+            crate::film::Develop::with_base(crate::film::DEFAULT_FILM_BASE),
             CropMargins::default(),
             0,
             1,
-            600,
-            None,
-        );
+            600);
         assert_eq!(program.source_dimensions(), (400, 600));
     }
 
@@ -2087,337 +1418,23 @@ mod tests {
     }
 
     #[test]
-    fn curve_remap_is_identity_at_defaults() {
-        let (ratio, exponent) = curve_remap(1.0, 1.0, 1.0, 0.2, 0.4, 0.92);
-        assert!((ratio - 1.0).abs() < 1e-6);
-        assert!((exponent - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn contrast_pivots_around_the_image_midgray() {
-        let (shadow, mid, white) = (0.15_f32, 0.4_f32, 0.92_f32);
-        for kc in [0.6_f32, 1.3] {
-            let (ratio, exponent) = curve_remap(kc, 1.0, 1.0, shadow, mid, white);
-            let t_mid = (ratio * mid.powf(exponent)).clamp(0.0, 1.0);
-            assert!(
-                (t_mid - mid).abs() < 1e-5,
-                "contrast {kc}: T(mid) = {t_mid}"
-            );
-        }
-    }
-
-    #[test]
-    fn highlights_pivots_around_the_image_shadow_anchor() {
-        let (shadow, mid, white) = (0.15_f32, 0.4_f32, 0.92_f32);
-        for kh in [0.6_f32, 1.3] {
-            let (ratio, exponent) = curve_remap(1.0, kh, 1.0, shadow, mid, white);
-            let t_shadow = (ratio * shadow.powf(exponent)).clamp(0.0, 1.0);
-            assert!(
-                (t_shadow - shadow).abs() < 1e-5,
-                "highlights {kh}: T(shadow) = {t_shadow}"
-            );
-        }
-    }
-
-    #[test]
-    fn shadows_pivots_around_the_image_white_point() {
-        let (shadow, mid, white) = (0.15_f32, 0.4_f32, 0.92_f32);
-        for ks in [0.6_f32, 1.3] {
-            let (ratio, exponent) = curve_remap(1.0, 1.0, ks, shadow, mid, white);
-            let t_white = (ratio * white.powf(exponent)).clamp(0.0, 1.0);
-            assert!(
-                (t_white - white).abs() < 1e-5,
-                "shadows {ks}: T(white) = {t_white}"
-            );
-        }
-    }
-
-    #[test]
-    fn highlights_and_shadows_lift_their_own_region() {
-        // The user-facing direction: raising a lift value presses `2^-L` (shadow
-        // power, pivot white) or `2^+L` (highlight power, pivot shadow). Each
-        // must brighten its named region while pinning the far anchor.
-        let (shadow, mid, white) = (0.15_f32, 0.4_f32, 0.92_f32);
-        let dark = 0.2_f32;
-        let bright = 0.7_f32;
-        let tone = |kh: f32, ks: f32, p: f32| {
-            let (ratio, exponent) = curve_remap(1.0, kh, ks, shadow, mid, white);
-            (ratio * p.powf(exponent)).clamp(0.0, 1.0)
-        };
-        // Highlight lift: power up, the bright patch rises, the deep shadow
-        // barely moves (pivoted at the shadow anchor).
-        let (hid, hlift) = (1.0_f32, 2.0_f32);
-        assert!(tone(hlift, 1.0, bright) > tone(hid, 1.0, bright));
-        // Shadow lift: power down, the dark patch rises, white stays pinned.
-        let (sid, slift) = (1.0_f32, 0.5_f32);
-        assert!(tone(1.0, slift, dark) > tone(1.0, sid, dark));
-        assert!((tone(1.0, slift, white) - white).abs() < 1e-5);
-        // Both directions are the identity at the centered lift value.
-        assert!((tone(1.0, 1.0, bright) - bright).abs() < 1e-5);
-    }
-
-    #[test]
-    fn curve_remap_composes_the_three_pivots_exactly() {
-        // Applying the highlights and shadows powers after the contrast power
-        // must equal the single (ratio, exp) the shader applies — the
-        // composition is exact for the underlying power functions. The shader
-        // applies one final clamp (never an intermediate one), so compare raw
-        // then both-clamped.
-        let (shadow, mid, white) = (0.15_f32, 0.4_f32, 0.92_f32);
-        let (kc, kh, ks) = (1.25_f32, 0.75_f32, 1.4_f32);
-        let (ratio, exponent) = curve_remap(kc, kh, ks, shadow, mid, white);
-        for p in [0.0_f32, 0.05, 0.15, 0.4, 0.6, 0.92, 1.0] {
-            let c = mid.powf(1.0 - kc) * p.powf(kc);
-            let s = white.powf(1.0 - ks) * c.powf(ks);
-            let sequential = shadow.powf(1.0 - kh) * s.powf(kh);
-            let composed = ratio * p.powf(exponent);
-            assert!(
-                (sequential - composed).abs() < 1e-4,
-                "p {p}: sequential {sequential} vs composed {composed}"
-            );
-            assert!(
-                (sequential.clamp(0.0, 1.0) - composed.clamp(0.0, 1.0)).abs() < 1e-4,
-                "p {p}: clamped sequential vs clamped composed"
-            );
-        }
-    }
-
-    #[test]
-    #[allow(clippy::cast_precision_loss)]
-    fn tone_anchors_find_shadow_mid_and_white_on_a_known_ramp() {
-        let mono: Vec<f32> = (0..=2000).map(|v| v as f32 / 2000.0).collect();
-        let (shadow, mid, white) = tone_anchors(&mono);
-        assert!((shadow - 0.1).abs() < 0.02, "shadow {shadow}");
-        assert!((mid - 0.5).abs() < 0.01, "median {mid}");
-        assert!((white - 0.98).abs() < 0.02, "white {white}");
-    }
-
-    #[test]
-    fn tone_anchors_guard_degenerate_black_frames() {
-        let (shadow, mid, white) = tone_anchors(&[0.0; 256]);
-        assert_eq!(shadow, MIN_ANCHOR);
-        assert_eq!(mid, MIN_ANCHOR);
-        assert_eq!(white, MIN_ANCHOR);
-    }
-
-    #[test]
-    fn sensor_gain_flips_sign_for_inverted_presets() {
-        // An already-positive preset multiplies the positive by 2^EV: +1 EV
-        // doubles it, EV 0 is the identity.
-        assert_eq!(sensor_gain(0.0, false), 1.0);
-        assert!((sensor_gain(1.0, false) - 2.0).abs() < 1e-6);
-        assert!((sensor_gain(-1.0, false) - 0.5).abs() < 1e-6);
-        // An INVERTED preset multiplies the sensor-negative by 2^-EV: +1 EV
-        // halves the transmission, densifying the film and brightening the
-        // positive — the same user-facing "brighter" direction as non-inverted.
-        assert!((sensor_gain(1.0, true) - 0.5).abs() < 1e-6);
-        assert!((sensor_gain(-1.0, true) - 2.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn film_anchor_fractiles_measure_sensor_ranks() {
-        // On a uniform transmission ramp the fractiles land at their nominal
-        // ranks: shadow from the 90th, mid from the median, white from the 2nd.
-        let mono: Vec<f32> = (0..=2000).map(|v| v as f32 / 2000.0).collect();
-        let (shadow, mid, white) = film_anchor_fractiles(&mono);
-        assert!((shadow - 0.90).abs() < 0.02, "shadow-rank {shadow}");
-        assert!((mid - 0.50).abs() < 0.01, "median {mid}");
-        assert!((white - 0.02).abs() < 0.02, "white-rank {white}");
-    }
-
-    #[test]
-    fn film_pivots_at_ev0_match_anchors_of_an_inverted_ramp() {
-        // At EV 0 the derived pivots must equal the regular anchors of a buffer
-        // that was density-inverted first — the CPU twin of what the WGSL
-        // renders. Fractiles in rank space + `invert_value` reproduce the
-        // old percentiles exactly (parity, so existing renders don't shift).
-        let mono: Vec<f32> = (0..=2000).map(|v| v as f32 / 2000.0).collect();
-        let stock = crate::film::ACTIVE_STOCK;
-        let fractiles = film_anchor_fractiles(&mono);
-        let (shadow, mid, white) = film_pivots_at_gain(fractiles, ACTIVE_STOCK.base, 1.0, stock);
-
-        let positive: Vec<f32> = mono
-            .iter()
-            .map(|&v| invert_value(v, ACTIVE_STOCK.base, &stock))
-            .collect();
-        let (shadow_direct, mid_direct, white_direct) = tone_anchors(&positive);
-
-        assert!((shadow - shadow_direct).abs() < 0.01, "{shadow} vs {shadow_direct}");
-        assert!((mid - mid_direct).abs() < 0.01, "{mid} vs {mid_direct}");
-        // The white anchor sits on the steepest part of this synthetic ramp
-        // (near-transmission samples map to near-black positive), so the
-        // `ANCHOR_INV_STRIDE` subsampling shifts the fractile separator sample
-        // slightly and the histograms quantize the steep transform — absorb
-        // that (real negatives don't sit exactly on the clear-film endpoint).
-        assert!((white - white_direct).abs() < 0.03, "{white} vs {white_direct}");
-
-        // The direction is inverted: a ramp of transmissions (clearer at the
-        // high end) maps to a descending positive, so the positive's mid-gray
-        // sits at the LOW end of the transmission ramp.
-        assert!(mid < 0.5, "inverted mid-anchor {mid} should sit below 0.5");
-    }
-
-    #[test]
-    fn film_pivots_track_the_current_ev() {
-        // The drift fix: pivots must anchor on the ACTUAL render at any EV, not
-        // the EV-0 the fractiles were captured at. Derive the pivots for +1 EV,
-        // then CPU-render the same frame at +1 EV and measure ITS percentiles —
-        // grid/detail/export must agree.
-        let mono: Vec<f32> = (0..=2000).map(|v| v as f32 / 2000.0).collect();
-        let stock = crate::film::ACTIVE_STOCK;
-        let base = ACTIVE_STOCK.base;
-        let gain = sensor_gain(1.0, true); // +1 EV on a film negative = × ½ sensor
-
-        let fractiles = film_anchor_fractiles(&mono);
-        let (shadow, mid, white) = film_pivots_at_gain(fractiles, base, gain, stock);
-
-        let rendered: Vec<f32> = mono
-            .iter()
-            .map(|&t| invert_value(t * gain, base, &stock))
-            .collect();
-        let (shadow_direct, mid_direct, white_direct) = tone_anchors(&rendered);
-
-        assert!((shadow - shadow_direct).abs() < 0.02, "{shadow} vs {shadow_direct}");
-        assert!((mid - mid_direct).abs() < 0.01, "{mid} vs {mid_direct}");
-        assert!((white - white_direct).abs() < 0.03, "{white} vs {white_direct}");
-
-        // And the derive drifts with EV: brightening the film lifts the white
-        // pivot above the frozen EV-0 value — the defect the fractiles fix.
-        let (_, _, white_ev0) = film_pivots_at_gain(fractiles, base, 1.0, stock);
-        assert!(white > white_ev0, "white pivot {white_ev0} must rise to {white}");
-    }
-
-    #[test]
-    fn set_exposure_rederives_inverted_pivots() {
-        let mono: Vec<f32> = (0..=2000).map(|v| v as f32 / 2000.0).collect();
+    fn set_develop_updates_the_live_controls() {
         let mut program = DetailProgram::new(
-            mono,
-            2001,
-            1,
-            0.0,
+            vec![0.0; 16],
+            4,
+            4,
+            Develop::with_base(crate::film::DEFAULT_FILM_BASE),
             CropMargins::default(),
             0,
             1,
-            2001,
-            Some((ACTIVE_STOCK, ACTIVE_STOCK.base)),
+            4,
         );
-        let (white_ev0, mid_ev0) = (program.white, program.mid);
-
-        // +1 EV on the negative densifies the film → the positive brightens and
-        // its pivots must re-anchor on the new render (the drift fix).
-        program.set_exposure(1.0);
-        assert!(
-            program.white > white_ev0,
-            "white pivot {white_ev0} → {}",
-            program.white
-        );
-        assert!(
-            program.mid > mid_ev0,
-            "mid pivot {mid_ev0} → {}",
-            program.mid
-        );
-    }
-
-    #[test]
-    fn shadow_pivot_floor_keeps_the_highlights_power_usable() {
-        // A frame whose bottom decile is literal black (the clear-film plateau
-        // at EV ≤ 0) yields a shadow pivot near MIN_ANCHOR. Without the floor,
-        // `s^(1-kh)` ≈ 31× at kh=1.5 would blow the whole positive to white.
-        let (shadow, mid, white) = (MIN_ANCHOR, 0.3_f32, 0.9_f32);
-        let (ratio, exp) = curve_remap(1.0, 1.5, 1.0, shadow, mid, white);
-        let lifted_mid = ratio * mid.powf(exp);
-        assert!(lifted_mid < 1.0, "highlights power blew out the mid-gray: {lifted_mid}");
-
-        // The identity still travels through the floored pivot untouched.
-        let (ratio_id, exp_id) = curve_remap(1.0, 1.0, 1.0, shadow, mid, white);
-        assert!((ratio_id - 1.0).abs() < 1e-6 && (exp_id - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn apply_curve_is_identity_at_defaults() {
-        // The grid thumbnail bake calls `apply_curve` with the identity curve,
-        // so untouched renders must be byte-identical (no phantom tone shift).
-        let mut values = vec![0.0_f32, 0.13, 0.5, 0.84, 1.0];
-        let original = values.clone();
-        apply_curve(&mut values, 1.0, 1.0, 1.0, 0.15, 0.45, 0.92);
-        assert!(
-            values
-                .iter()
-                .zip(&original)
-                .all(|(a, b)| (a - b).abs() < 1e-6),
-            "identity curve changed values: {values:?}"
-        );
-    }
-
-    #[test]
-    fn apply_curve_matches_tone_model() {
-        // `apply_curve` folds the pivoted powers with `curve_remap` then applies
-        // the per-pixel `tone_model` expression — the single source of the tone
-        // math (the WGSL now texture-samples a LUT of it instead of re-deriving
-        // the expression). Re-derive the expression independently and confirm
-        // they agree across the input range.
-        let (shadow, mid, white) = (0.18_f32, 0.42_f32, 0.93_f32);
-        let (contrast, highlights, shadows) = (1.25_f32, 0.7_f32, 1.3_f32);
-        let (ratio, exponent) = curve_remap(contrast, highlights, shadows, shadow, mid, white);
-
-        for p in [0.0_f32, 0.05, 0.18, 0.25, 0.42, 0.7, 0.93, 1.0, 3.0] {
-            let expected = (ratio * p.powf(exponent)).clamp(0.0, 1.0);
-            let mut v = [p];
-            apply_curve(&mut v, contrast, highlights, shadows, shadow, mid, white);
-            assert!((v[0] - expected).abs() < 1e-6, "p {p}: {v:?} vs {expected}");
-        }
-    }
-
-    #[test]
-    fn tone_lut_reproduces_tone_model_within_tolerance() {
-        // The GPU samples a 2048×1 half-float LUT of `tone_model` with linear
-        // interpolation; the CPU bakes call `tone_model` exactly. Bound that
-        // approximation: building the LUT, decoding it back to f32 (as the
-        // R16Float sampler would), and interpolating must stay within a small
-        // tolerance of the exact expression everywhere.
-        let (shadow, mid, white) = (0.15_f32, 0.45_f32, 0.92_f32);
-        for (contrast, highlights, shadows) in [
-            (1.0_f32, 1.0_f32, 1.0_f32),
-            (1.25, 0.7, 1.3),
-            (0.5, 2.0, 0.4),
-            (1.8, 1.1, 2.5),
-            // The widened contrast endpoints (±3 stops).
-            (8.0, 1.0, 1.0),
-            (0.125, 1.0, 1.0),
-        ] {
-            let (ratio, exponent) = curve_remap(contrast, highlights, shadows, shadow, mid, white);
-            let bytes = build_tone_lut(contrast, highlights, shadows, shadow, mid, white);
-            let lut: Vec<f32> = bytes
-                .chunks_exact(2)
-                .map(|c| half_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            for p in [0.0_f32, 0.01, 0.1, 0.5, 0.9, 0.999, 1.0] {
-                let exact = tone_model(p, ratio, exponent);
-                let sampled = sample_tone_lut_f32(&lut, p);
-                assert!(
-                    (sampled - exact).abs() <= 1e-3,
-                    "curve {contrast}/{highlights}/{shadows} p {p}: lut {sampled} vs exact {exact}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn film_density_shape_mirrors_the_cpu_and_is_independent() {
-        // The WGSL film branch evaluates the density-domain region shape
-        // inline; `gpu_fragment` (in app.rs) mirrors it with the same
-        // `(1-p)^K`/`p^K` masks. Pin the isolation property the model relies
-        // on directly against the shared `film::region_shape`.
-        use crate::film::{region_shape, region_strength};
-        // Identity: no lifts -> unchanged.
-        for p in [0.0_f32, 0.1, 0.5, 0.9, 1.0] {
-            assert!((region_shape(p, 0.0, 0.0) - p).abs() < 1e-6);
-        }
-        // A shadow lift cannot move white; a highlight lift cannot move black.
-        let shadow_lift = region_strength(2.0); // +2 stops
-        let highlight_lift = region_strength(2.0);
-        assert!((region_shape(1.0, shadow_lift, 0.0) - 1.0).abs() < 1e-6);
-        assert!(region_shape(0.0, 0.0, highlight_lift).abs() < 1e-6);
+        program.set_exposure(1.5);
+        assert!((program.develop.exposure_ev - 1.5).abs() < 1e-6);
+        let mut d = program.develop;
+        d.contrast = 2.0;
+        program.set_develop(d);
+        assert!((program.develop.contrast - 2.0).abs() < 1e-6);
     }
 
     #[test]

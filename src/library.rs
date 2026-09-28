@@ -9,50 +9,11 @@ use std::path::Path;
 
 use crate::app::{LibrarySelection, MoveDir, Roll};
 use crate::edit_manifest;
-use crate::film::{BaseMode, FilmPreset};
-
-/// Persists a roll's film preset to its edit manifest, the on-disk source of
-/// truth for decodes after a restart. Only a non-default preset is written:
-/// `Generic` or any stock preset records its choice key, while the `None`
-/// default is implicit in the key's absence — so a default raw scan keeps a
-/// clean manifest, and a write failure degrades to a stderr report instead of
-/// blocking the UI.
-pub(crate) fn record_roll_preset(dir: &Path, preset: FilmPreset) {
-    if preset == FilmPreset::default() {
-        return;
-    }
-    let mut manifest = edit_manifest::load_roll_manifest(dir);
-    manifest.set_preset(preset);
-    if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
-        log::error!(
-            "failed to write roll manifest {}: {err}",
-            edit_manifest::manifest_path(dir).display()
-        );
-    }
-}
-
-/// Persists a roll's base strategy to its edit manifest, the on-disk source of
-/// truth for decodes after a restart. Only a non-default mode is written: the
-/// `AutoPerFrame`/`AutoSelectedFrame` modes record their choice key, while the
-/// `Preset` default is implicit in the key's absence.
-pub(crate) fn record_roll_base_mode(dir: &Path, mode: BaseMode) {
-    if mode == BaseMode::default() {
-        return;
-    }
-    let mut manifest = edit_manifest::load_roll_manifest(dir);
-    manifest.set_base_mode(mode);
-    if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
-        log::error!(
-            "failed to write roll manifest {}: {err}",
-            edit_manifest::manifest_path(dir).display()
-        );
-    }
-}
 
 /// Persists a roll's start and optional end dates to its edit manifest, the
-/// on-disk source of truth across restarts. Unlike [`record_roll_preset`] a
-/// write always happens: a cleared field must be recorded as absent, so there
-/// is no implicit-default shortcut here.
+/// on-disk source of truth across restarts. A write always happens: a cleared
+/// field must be recorded as absent, so there is no implicit-default shortcut
+/// here.
 pub(crate) fn record_roll_dates(dir: &Path, start: Option<String>, end: Option<String>) {
     let mut manifest = edit_manifest::load_roll_manifest(dir);
     manifest.set_dates(start, end);
@@ -436,8 +397,6 @@ mod tests {
             name: name.to_string(),
             cover: None,
             frame_count: 0,
-            preset: FilmPreset::default(),
-            base_mode: BaseMode::default(),
             start_date: None,
             end_date: None,
             thumb: Thumb::Loading,

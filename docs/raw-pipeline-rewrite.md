@@ -1,8 +1,9 @@
 # RAW pipeline rewrite: film-only, density-domain, pointwise
 
-Status: in progress. Scope: `src/pipeline.rs`, `src/shader.rs`, `src/film.rs`
-(plus manifest/UI fields and a histogram widget). The app shell, library, crop,
-export, and keyboard model are retained.
+Status: steps 1–5 done (film-only path landed; histogram widget remains).
+Scope: `src/pipeline.rs`, `src/shader.rs`, `src/film.rs` (plus manifest/UI
+fields and a histogram widget). The app shell, library, crop, export, and
+keyboard model are retained.
 
 ## Goal
 
@@ -110,3 +111,28 @@ background batch and parallelizable. The GPU already evaluates a `log`+`pow`
 per fragment in the current film branch, so direct pointwise evaluation is the
 same performance class as what already ships. **Decision: no tone LUT** — evaluate
 `T` directly in WGSL and in Rust, deleting the LUT/tolerance/parity machinery.
+
+## Steps 3–5 result: the film-only density path
+
+- **`film::Develop`** (base-relative `density = log10(base / (transmission·2^-EV))`)
+  is the single pointwise `T`: `base`, `black`, `white`, `contrast`, `pivot_offset`,
+  `exposure_ev`. `Develop::apply` is mirrored exactly by the WGSL `develop()`
+  (`develop_matches_wgsl_transcription` parity test).
+- **`shader.rs`** carries a `Develop` (no more pivots/LUT/`tone_version`); the
+  bind group is texture + sampler + uniform, and the WGSL `dev_base/black/white/
+  contrast/pivot` uniforms drive the per-fragment develop.
+- **`pipeline.rs`** drops `unsharp_mask`/`blur_121`/`UNSHARP_AMOUNT`, the pivot
+  machinery, and the two-path `render_tail`; `bake_develop` is the one CPU tail.
+  `decode_raw_detail` returns only the true sensor-linear mono + geometry.
+- **`edit_manifest.rs`** stores `{exposure_ticks, contrast_lift_ticks, black_ticks,
+  white_ticks, pivot_ticks}` (schema v1, legacy keys re-edited, no migration) plus
+  the roll-level `base` + `calibration_frame`.
+- **UI**: the editing panel is Exposure / Contrast / Black / White / Midtone;
+  the roll-info drawer's film-preset and base-mode dropdowns are gone. A roll's
+  calibration frame defaults to its first frame and is measured on roll open;
+  Edit → "Calibrate from this frame" re-designates it.
+
+Deviations from the original R5 field list: `black` is stored per frame too
+(it is an independent density anchor, not derivable from `base`), and the
+per-frame `base` is resolved from the roll-level calibration (no per-frame base
+override yet). Film presets / `MonoStock` / `BaseMode` are removed outright.
