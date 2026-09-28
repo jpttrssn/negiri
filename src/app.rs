@@ -7,14 +7,11 @@ use crate::export::{
     ExportOptions, export_format_choice, export_fraction, export_frames, export_overwrite_choice,
     is_export_artifact, options_for_choice,
 };
-use crate::film::{
-    BaseConfig, BaseMode, FILM_CHOICES, FilmPreset, MIN_PLAUSIBLE_BASE, MonoStock, measure_base,
-};
+use crate::film::{MIN_PLAUSIBLE_BASE, measure_base};
 use crate::fl;
 use crate::library::{
-    LibraryCell, MonthAliases, library_cell_index, library_cells,
-    nav_target, paginate, record_roll_base_mode, record_roll_dates, record_roll_name,
-    record_roll_preset, roll_dates_valid, valid_iso_date,
+    LibraryCell, MonthAliases, library_cell_index, library_cells, nav_target, paginate,
+    record_roll_dates, record_roll_name, roll_dates_valid, valid_iso_date,
 };
 use crate::pipeline::{DetailDecode, convert_thumbnail, decode_raw_detail, resized_dims};
 use crate::shader;
@@ -292,21 +289,10 @@ pub(crate) struct AppModel {
     /// Most recent cursor position over the detail preview, widget-relative
     /// logical points; anchors wheel-zoom at the cursor.
     detail_cursor: Option<Point>,
-    /// Contrast power previewed in the detail view, pivoting the live tone
-    /// curve at the image's measured mid-gray. Non-persisted: resets to
-    /// `1.0` (identity) on every detail open. GPU-uniform only — the grid
-    /// thumbnails always render with the default curve.
-    pub(crate) curve_contrast: f32,
-    /// Highlights power previewed in the detail view, pivoting the live tone
-    /// curve at the image's measured 10th-percentile shadow anchor. Same
-    /// lifecycle and rules as [`Self::curve_contrast`].
-    pub(crate) curve_highlights: f32,
-    /// Shadows power previewed in the detail view, pivoting the live tone
-    /// curve at the image's measured white point. Same lifecycle and rules as
-    /// [`Self::curve_contrast`].
-    pub(crate) curve_shadows: f32,
-    /// Exposure compensation in EV (−3.00 to +3.00).
-    pub(crate) exposure_ev: f32,
+    /// The live density develop previewed in the detail view: exposure plus the
+    /// four shape controls (contrast, black, white, midtone pivot). Loaded from
+    /// the stored manifest on open and applied to the GPU shader as uniforms.
+    pub(crate) tone: edit_manifest::ToneEdit,
     /// Live keyboard crop margins for the detail view; loaded from the stored
     /// manifest per open and applied to the GPU shader as a uniform UV-remap.
     pub(crate) crop: edit_manifest::CropMargins,
@@ -337,10 +323,7 @@ pub(crate) struct AppModel {
     /// Edit values as they were when the detail panel was opened — the stored
     /// manifest values for the selected file. `ResetAll` restores these, not
     /// the identity, so reset reverts the panel to its opened state.
-    reset_exposure_ev: f32,
-    reset_curve_contrast: f32,
-    reset_curve_highlights: f32,
-    reset_curve_shadows: f32,
+    reset_tone: edit_manifest::ToneEdit,
     /// Crop as it was when the detail panel was opened; `ResetAll` restores it.
     reset_crop: edit_manifest::CropMargins,
     /// Rotation as it was when the detail panel was opened; `ResetAll`
@@ -358,7 +341,7 @@ pub(crate) struct AppModel {
     /// returning to a recently-viewed frame doesn't re-decode the RAW. Survives
     /// roll switches and detail close; eviction is global (see
     /// [`DETAIL_CACHE_CAPACITY`]). Only overview (2048px) buffers are stored.
-    detail_cache: LruCache<(PathBuf, FilmPreset, String), DetailMono>,
+    detail_cache: LruCache<(PathBuf, String), DetailMono>,
     /// (roll dir, file name) handed to the bounded neighbor preload decodes,
     /// so a frame already being preloaded (or already cached) is never spawned
     /// twice. Independent of the single critical detail slot.
@@ -456,14 +439,6 @@ pub(crate) struct Roll {
     /// Number of regular non-dot files in the roll directory, surfaced in the
     /// roll-info metadata drawer.
     pub frame_count: usize,
-    /// The film-inversion preset this roll's frames render with. The single
-    /// in-memory source of truth for decodes; persisted to the roll's edit
-    /// manifest (see [`edit_manifest::RollManifest::preset`]).
-    pub preset: FilmPreset,
-    /// How this roll's black point is resolved (preset base / auto per frame /
-    /// auto selected frame). Orthogonal to the film choice; persisted to the
-    /// roll's edit manifest (see [`edit_manifest::RollManifest::base_mode`]).
-    pub base_mode: BaseMode,
     /// The roll's start date (ISO `YYYY-MM-DD`), if already set. Mirrors the
     /// edit manifest; display-only (no decode impact).
     pub start_date: Option<String>,
@@ -490,8 +465,7 @@ pub(crate) struct Tile {
 /// A decoded detail-view overview: the linear pre-sRGB mono buffer plus its
 /// geometry, as delivered by [`decode_raw_detail`]. Exactly what an
 /// [`shader::DetailProgram`] needs to (re)build without re-decoding
-/// the RAW. Cached by the detail LRU keyed on (roll dir, film preset, file
-/// name), so a preset change never serves a stale inversion.
+/// the RAW. Cached by the detail LRU keyed on (roll dir, file name).
 #[derive(Debug, Clone)]
 struct DetailMono {
     mono: Vec<f32>,
@@ -500,16 +474,9 @@ struct DetailMono {
     /// The sensor's true long edge AFTER cropping but BEFORE the downscale, so
     /// a served cache entry can decide whether the overview was already native.
     src_long_edge: u32,
-    /// Film-negative inversion carried through the cache: `Some((stock, base))`
-    /// when the frame is a negative the shader density-inverts per fragment
-    /// (`base` is the per-frame clear-film transmission measured from the
-    /// sensor mono), `None` for an already-positive scan. Rebuilds an identical
-    /// shader from a cache hit without re-decoding the RAW.
-    inversion: Option<(MonoStock, f32)>,
 }
 
-/// A fixed-capacity least-recently-used map keyed by (roll dir, film preset,
-/// file name).
+/// A fixed-capacity least-recently-used map keyed by (roll dir, file name).
 ///
 /// Backed by a `HashMap` for O(1) lookup plus a `VecDeque` of keys as the
 /// recency index: `get` moves the key to the back, `insert` pops the front
@@ -624,40 +591,27 @@ pub(crate) enum Message {
     /// Close the detail view, returning to the grid.
     DetailClosed,
     /// A hi-res decode for the detail view finished, returning the true
-    /// sensor-linear mono buffer for the GPU shader. Carries the preset the
-    /// decode ran under so the LRU is keyed consistently with the buffer
-    /// contents.
-    DetailReady(String, FilmPreset, Result<DetailDecode, FrameError>),
+    /// sensor-linear mono buffer for the GPU shader.
+    DetailReady(String, Result<DetailDecode, FrameError>),
     /// A neighbor preload decode finished. Unlike [`Message::DetailReady`] this
     /// only lands into the detail LRU cache; it never becomes the active shader.
-    DetailPreloaded(PathBuf, String, FilmPreset, Result<DetailDecode, FrameError>),
+    DetailPreloaded(PathBuf, String, Result<DetailDecode, FrameError>),
     /// The startup roll scan finished.
     RollsLoaded(Vec<Roll>),
     /// A single roll was scanned after being added; push it into the library.
     RollInfoLoaded(Roll),
     /// A roll cover decode finished.
     CoverReady(PathBuf, Result<Handle, FrameError>),
-    /// The folder picker returned a roll directory to add, along with the
-    /// film preset chosen for it in the dialog. The base strategy is not part
-    /// of the dialog (the open dialog carries a single choice), so a new roll
-    /// starts on the preset base and the user sets auto in the roll-info drawer.
-    RollAdded(PathBuf, FilmPreset),
-    /// The selected roll's film preset (which film inverts it) was changed from
-    /// the roll-info drawer.
-    RollPresetChanged(PathBuf, FilmPreset),
-    /// The selected roll's base strategy (preset base / auto per frame / auto
-    /// selected frame) was changed from the roll-info drawer.
-    RollBaseModeChanged(PathBuf, BaseMode),
+    /// The folder picker returned a roll directory to add.
+    RollAdded(PathBuf),
     /// The user asked to make the currently viewed frame the roll's
-    /// auto-calibration frame: its clear-film plateau is measured once and
-    /// recorded in the roll manifest as the black point every frame inverts
-    /// against. Only meaningful while the roll's base mode is
-    /// [`BaseMode::AutoSelectedFrame`].
+    /// calibration frame: its clear-film plateau is measured once and recorded
+    /// in the roll manifest as the base every frame's develop anchors against.
     CalibrateBaseFromFrame,
-    /// A background measurement of the roll's auto-calibration frame landed:
-    /// `name` is the designated frame and `Option<f32>` its measured (and
+    /// A background measurement of the roll's calibration frame landed: `name`
+    /// is the designated frame and `Option<f32>` its measured (and
     /// plausibility-filtered) clear-film transmission. Applied only while the
-    /// roll still uses the `AutoSelectedFrame` base mode with that same frame.
+    /// roll still has that same calibration frame.
     CalibrationBaseMeasured(PathBuf, String, Option<f32>),
     /// The user pressed the Add roll button.
     AddRoll,
@@ -752,9 +706,9 @@ pub(crate) enum Message {
     DetailPanMove(Point),
     /// The mouse was released or left the preview — grab-pan ends.
     DetailPanRelease,
-    /// The live tone curve changed: new contrast, highlights, and shadows
-    /// powers. Applies to the shader as a uniform-only remap.
-    CurveChanged(f32, f32, f32),
+    /// The live density develop shape changed: new contrast, black, white, and
+    /// midtone pivot. Applies to the shader as uniform-only updates.
+    DevelopChanged(f32, f32, f32, f32),
     /// Reset every first-class edit (exposure + tone curve) to their
     /// identities in one action, and persist the reset like any other edit.
     ResetAll,
@@ -853,8 +807,9 @@ pub(crate) enum MoveDir {
 pub enum EditAdjust {
     Exposure(f32),
     Contrast(f32),
-    Highlights(f32),
-    Shadows(f32),
+    Black(f32),
+    White(f32),
+    Pivot(f32),
     /// Rotate the display one quarter-turn counter-clockwise (a discrete step,
     /// no delta payload; unlike the numeric adjusts it doesn't hold-repeat a
     /// magnitude, but the edit-key machinery still commits on release).
@@ -1021,10 +976,7 @@ impl cosmic::Application for AppModel {
             detail_pan: Point::default(),
             detail_panning: false,
             detail_cursor: None,
-            curve_contrast: 1.0,
-            curve_highlights: 1.0,
-            curve_shadows: 1.0,
-            exposure_ev: edit_manifest::DEFAULT_EXPOSURE_EV,
+            tone: edit_manifest::ToneEdit::default(),
             crop: edit_manifest::CropMargins::default(),
             roll_date_drafts: RollDateDrafts {
                 key: None,
@@ -1035,10 +987,7 @@ impl cosmic::Application for AppModel {
             rotation: 0,
             crop_mode: false,
             help_visible: false,
-            reset_exposure_ev: edit_manifest::DEFAULT_EXPOSURE_EV,
-            reset_curve_contrast: 1.0,
-            reset_curve_highlights: 1.0,
-            reset_curve_shadows: 1.0,
+            reset_tone: edit_manifest::ToneEdit::default(),
             reset_crop: edit_manifest::CropMargins::default(),
             reset_rotation: 0,
             clipboard: None,
@@ -1148,12 +1097,10 @@ impl cosmic::Application for AppModel {
             menu::Item::ButtonDisabled(fl!("menu-paste-edits"), None, MenuAction::PasteEdits)
         };
 
-// "Calibrate from this frame" designates the current frame as the
-        // roll's auto-calibration frame — only meaningful under the
-        // Auto-selected-frame base mode of an open roll. The handler no-ops
-        // without an eligible frame, so the menu only gates on the base mode.
-        let calibrate_enabled = self.active.is_some()
-            && self.roll.base_mode() == BaseMode::AutoSelectedFrame;
+        // "Calibrate from this frame" designates the current frame as the
+        // roll's calibration frame; meaningful with an eligible frame open.
+        // The handler no-ops without one, so the menu gates on its presence.
+        let calibrate_enabled = self.active.is_some() && self.selected.is_some();
         let calibrate_items = if calibrate_enabled {
             vec![
                 menu::Item::Divider,
@@ -1621,8 +1568,8 @@ impl cosmic::Application for AppModel {
                     | Message::ThumbReady(_, _)
                     | Message::RollOpened(_, _)
                     | Message::CoverReady(_, _)
-                    | Message::DetailReady(_, _, _)
-                    | Message::DetailPreloaded(_, _, _, _)
+                    | Message::DetailReady(_, _)
+                    | Message::DetailPreloaded(_, _, _)
                     | Message::FrameInfoReady(_, _)
                     | Message::RollInfoLoaded(_)
                     | Message::RollsLoaded(_)
@@ -1691,12 +1638,10 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
-            Message::DetailReady(name, preset, result) => {
-                self.handle_detail_ready(&name, preset, result)
-            }
+            Message::DetailReady(name, result) => self.handle_detail_ready(&name, result),
 
-            Message::DetailPreloaded(dir, name, preset, result) => {
-                self.handle_detail_preloaded(&dir, &name, preset, result)
+            Message::DetailPreloaded(dir, name, result) => {
+                self.handle_detail_preloaded(&dir, &name, result)
             }
 
             Message::ThumbnailActivated(name) => self.open_frame(&name),
@@ -1830,11 +1775,11 @@ impl cosmic::Application for AppModel {
                 Task::none()
             }
 
-            Message::CurveChanged(contrast, highlights, shadows) => {
+            Message::DevelopChanged(contrast, black, white, pivot) => {
                 // RAM-only until an edit flush point (slider `on_release`,
                 // `DetailClosed`, window close) — same lifecycle as exposure.
-                // Shared with the keyboard `AdjustEdit` path via `set_curve`.
-                self.set_curve(contrast, highlights, shadows);
+                // Shared with the keyboard `AdjustEdit` path via `set_develop`.
+                self.set_develop_shape(contrast, black, white, pivot);
                 Task::none()
             }
 
@@ -1846,30 +1791,18 @@ impl cosmic::Application for AppModel {
                 // button is one unconscious click away from a slider, so
                 // mirror the sliders' choice of only-mutate-RAM: the same
                 // `EditSave` points persist it).
-                self.exposure_ev = self.reset_exposure_ev;
-                self.curve_contrast = self.reset_curve_contrast;
-                self.curve_highlights = self.reset_curve_highlights;
-                self.curve_shadows = self.reset_curve_shadows;
+                self.tone = self.reset_tone;
                 self.crop = self.reset_crop;
                 self.rotation = self.reset_rotation;
                 if let Some(selected) = &self.selected {
-                    self.roll.set_exposure(selected, self.reset_exposure_ev);
-                    self.roll.set_curve(
-                        selected,
-                        self.reset_curve_contrast,
-                        self.reset_curve_highlights,
-                        self.reset_curve_shadows,
-                    );
+                    self.roll.set_exposure(selected, self.reset_tone.exposure_ev);
+                    self.roll.set_develop(selected, self.reset_tone);
                     self.roll.set_crop(selected, self.reset_crop);
                     self.roll.set_rotation(selected, self.reset_rotation);
                 }
                 if let Some(shader) = &mut self.detail_shader {
-                    shader.set_exposure(self.reset_exposure_ev);
-                    shader.set_curve(
-                        self.reset_curve_contrast,
-                        self.reset_curve_highlights,
-                        self.reset_curve_shadows,
-                    );
+                    shader.set_exposure(self.reset_tone.exposure_ev);
+                    shader.set_develop(self.reset_tone.to_develop(self.roll.base_or_default()));
                     shader.set_crop(self.reset_crop);
                     shader.set_rotation(self.reset_rotation);
                 }
@@ -2064,21 +1997,14 @@ impl cosmic::Application for AppModel {
 
             Message::AddRoll => open_roll_picker(),
 
-            Message::RollAdded(dir, preset) => {
+            Message::RollAdded(dir) => {
                 // The library list is app-wide: persist the new roll no matter
                 // where the folder picker was invoked from.
                 if !self.rolls.iter().any(|roll| roll.dir == dir) {
                     self.config.rolls.push(dir.to_string_lossy().into_owned());
                     self.persist_config();
                 }
-                // Record the chosen preset. The manifest is the persistence
-                // layer and the in-memory roll (on a re-add) the decode source:
-                // writing first means the just-spawned scan reads it back. The
-                // base strategy starts at the default (Preset), settable from
-                // the roll-info drawer.
-                record_roll_preset(&dir, preset);
                 if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
-                    roll.preset = preset;
                     roll.thumb = Thumb::Loading;
                 }
                 // Mark the new roll selected (the selection survives roll exit,
@@ -2093,83 +2019,6 @@ impl cosmic::Application for AppModel {
                 // the app was when the roller was chosen.
                 let open = self.open_roll(dir);
                 Task::batch([card, open, self.decode_covers()])
-            }
-
-            Message::RollPresetChanged(dir, preset) => {
-                record_roll_preset(&dir, preset);
-                if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
-                    roll.preset = preset;
-                    roll.thumb = Thumb::Loading;
-                }
-                let mut tasks = vec![self.decode_covers()];
-                // The drawer is library-only today, so the active branch is a
-                // defensive re-bake (kept so a film change can never render a
-                // stale inversion for an open roll). A film change leaves the
-                // base strategy (and any calibration) untouched.
-                if self.active.as_deref() == Some(dir.as_path()) {
-                    self.roll.set_preset(preset);
-                    tasks.extend(self.reflow_roll_after_change(&dir));
-                }
-                Task::batch(tasks)
-            }
-
-            Message::RollBaseModeChanged(dir, mode) => {
-                record_roll_base_mode(&dir, mode);
-                if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
-                    roll.base_mode = mode;
-                    roll.thumb = Thumb::Loading;
-                }
-                let mut tasks = vec![self.decode_covers()];
-                if mode == BaseMode::AutoSelectedFrame {
-                    // The auto-selected-frame base mode designates ONE frame
-                    // whose clear-film plateau becomes the roll's black point.
-                    // Default it to the roll's first sorted frame (mirroring
-                    // the cover selection) and measure its base so the mode
-                    // works out of the box; `apply_calibration_measurement`
-                    // stores the value.
-                    if let Some(first) = self.roll_first_frame(&dir) {
-                        let mut manifest = edit_manifest::load_roll_manifest(&dir);
-                        if manifest.calibration_frame().is_none() {
-                            manifest.set_calibration_frame(&first);
-                            if let Err(err) = edit_manifest::save_roll_manifest(&dir, &manifest) {
-                                log::error!(
-                                    "failed to write roll manifest {}: {err}",
-                                    edit_manifest::manifest_path(&dir).display()
-                                );
-                            }
-                        }
-                        if self.active.as_deref() == Some(dir.as_path())
-                            && self.roll.calibration_frame().is_none()
-                        {
-                            self.roll.set_calibration_frame(&first);
-                        }
-                        tasks.push(Self::measure_calibration_frame(dir.clone()));
-                    }
-                } else {
-                    // Leaving the auto-selected-frame base mode drops the
-                    // calibration reference: a stale frame/base must not
-                    // linger for the other modes.
-                    let mut manifest = edit_manifest::load_roll_manifest(&dir);
-                    if manifest.calibration_frame().is_some()
-                        || manifest.calibrated_base().is_some()
-                    {
-                        manifest.clear_calibration();
-                        if let Err(err) = edit_manifest::save_roll_manifest(&dir, &manifest) {
-                            log::error!(
-                                "failed to write roll manifest {}: {err}",
-                                edit_manifest::manifest_path(&dir).display()
-                            );
-                        }
-                    }
-                    if self.active.as_deref() == Some(dir.as_path()) {
-                        self.roll.clear_calibration();
-                    }
-                }
-                if self.active.as_deref() == Some(dir.as_path()) {
-                    self.roll.set_base_mode(mode);
-                    tasks.extend(self.reflow_roll_after_change(&dir));
-                }
-                Task::batch(tasks)
             }
 
             Message::CalibrateBaseFromFrame => self.calibrate_base_from_frame(),
@@ -2377,14 +2226,11 @@ impl cosmic::Application for AppModel {
                 // frame is highlighted (the pre-select above), so re-apply it
                 // here — navigation never closes the drawer.
                 self.restore_drawer_for(DrawerView::Grid);
-                // A roll opened under the auto-selected-frame base mode with no
-                // designated frame yet (e.g. a freshly added roll whose base
-                // mode was picked in the Add Roll dialog) defaults it to the
-                // first frame and measures its base.
+                // A roll with no designated calibration frame yet defaults it
+                // to the first frame and measures its base, so every frame has
+                // a black anchor out of the box.
                 let mut tasks = vec![];
-                if self.roll.base_mode() == BaseMode::AutoSelectedFrame
-                    && self.roll.calibration_frame().is_none()
-                {
+                if self.roll.calibration_frame().is_none() {
                     let first = self.tiles.first().map(|tile| tile.name.clone());
                     if let Some(first) = first {
                         self.roll.set_calibration_frame(&first);
@@ -2769,7 +2615,7 @@ impl AppModel {
             // Persist unsaved tweaks to the outgoing file first.
             self.persist_roll();
             // Read the stored edits BEFORE the decode builds the shader, which
-            // consumes `self.exposure_ev` and the tone (via `set_curve` in
+            // consumes the live tone (via `set_develop` in
             // `handle_detail_ready`).
             let stored_tone = self.roll.tone(name);
             self.selected = Some(name.to_owned());
@@ -2786,10 +2632,7 @@ impl AppModel {
             }
             self.selection_anchor = Some(name.to_owned());
             self.clear_detail();
-            self.exposure_ev = stored_tone.exposure_ev;
-            self.curve_contrast = stored_tone.curve_contrast;
-            self.curve_highlights = stored_tone.curve_highlights;
-            self.curve_shadows = stored_tone.curve_shadows;
+            self.tone = stored_tone;
             self.crop = self.roll.crop(name);
             self.rotation = self.roll.rotation(name) & 3;
             // Entering the detail view: the drawer (if the detail's memory says
@@ -2797,10 +2640,7 @@ impl AppModel {
             self.restore_drawer_for(DrawerView::Detail);
             // Anchor the reset snapshot to the opened state (the stored
             // manifest values), so Reset reverts here rather than to identity.
-            self.reset_exposure_ev = stored_tone.exposure_ev;
-            self.reset_curve_contrast = stored_tone.curve_contrast;
-            self.reset_curve_highlights = stored_tone.curve_highlights;
-            self.reset_curve_shadows = stored_tone.curve_shadows;
+            self.reset_tone = stored_tone;
             self.reset_crop = self.crop;
             self.reset_rotation = self.rotation;
         }
@@ -2873,16 +2713,11 @@ impl AppModel {
         // for a stable synthetic capture timestamp, and the roll's start date
         // (when set) travels along to stamp DateTimeOriginal on the output.
         let start_date = self.roll.start_date().map(str::to_owned);
-        let frames: Vec<(
-            String,
-            edit_manifest::ToneEdit,
-            edit_manifest::CropMargins,
-            u8,
-            usize,
-        )> = names
+        let base = self.roll.base_or_default();
+        let frames: Vec<(String, crate::film::Develop, edit_manifest::CropMargins, u8, usize)> = names
             .into_iter()
             .map(|name| {
-                let tone = self.roll.tone(&name);
+                let develop = self.roll.tone(&name).to_develop(base);
                 let crop = self.roll.crop(&name);
                 let rotation = self.roll.rotation(&name) & 3;
                 let index = self
@@ -2890,13 +2725,11 @@ impl AppModel {
                     .iter()
                     .position(|tile| tile.name == name)
                     .unwrap_or(0);
-                (name, tone, crop, rotation, index)
+                (name, develop, crop, rotation, index)
             })
             .collect();
         let total = frames.len();
         self.export_progress = Some((0, total));
-        let preset = self.roll.preset();
-        let base_config = self.roll.base_config();
 
         // Stream from an async channel so the UI sees per-frame ticks. After
         // each frame the sender pushes an `ExportProgress` message (dropping
@@ -2907,16 +2740,8 @@ impl AppModel {
             let mut tick = |done: usize, _total: usize| {
                 let _ = sender.try_send(Message::ExportProgress { done, total });
             };
-            let (ok, skipped, failed) = export_frames(
-                dir,
-                dest.clone(),
-                frames,
-                options,
-                preset,
-                base_config,
-                start_date.clone(),
-                &mut tick,
-            )
+            let (ok, skipped, failed) =
+                export_frames(dir, dest.clone(), frames, options, start_date.clone(), &mut tick)
             .await;
             let _ = sender
                 .send(Message::ExportDone {
@@ -3032,22 +2857,18 @@ impl AppModel {
             return Task::none();
         }
 
-        let pending: Vec<(
-            String,
-            edit_manifest::ToneEdit,
-            edit_manifest::CropMargins,
-            u8,
-        )> = self
+        let base = self.roll.base_or_default();
+        let pending: Vec<(String, crate::film::Develop, edit_manifest::CropMargins, u8)> = self
             .tiles
             .iter()
             .filter(|tile| matches!(tile.thumb, Thumb::Loading))
             .filter(|tile| !self.thumb_inflight.iter().any(|name| name == &tile.name))
             .take(capacity)
             .map(|tile| {
-                let tone = self.roll.tone(&tile.name);
+                let develop = self.roll.tone(&tile.name).to_develop(base);
                 let crop = self.roll.crop(&tile.name);
                 let rotation = self.roll.rotation(&tile.name) & 3;
-                (tile.name.clone(), tone, crop, rotation)
+                (tile.name.clone(), develop, crop, rotation)
             })
             .collect();
 
@@ -3065,28 +2886,19 @@ impl AppModel {
             pending.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>()
         ));
 
-        // The in-memory manifest is loaded synchronously in `RollOpened`
-        // before the tile pump runs, so it carries the preset even while the
-        // library card scan (`RollInfoLoaded`) is still in flight for a
-        // freshly-added roll — `self.rolls` can be a step behind on that path.
-        let preset = self.roll.preset();
-        let base_config = self.roll.base_config();
-
         self.thumb_inflight
             .extend(pending.iter().map(|(name, ..)| name.clone()));
 
         Task::batch(
             pending
                 .into_iter()
-                .map(move |(name, tone, crop, rotation)| {
+                .map(move |(name, develop, crop, rotation)| {
                     cosmic::task::future(decode_thumbnail(
                         dir.clone(),
                         name,
-                        tone,
+                        develop,
                         crop,
                         rotation,
-                        preset,
-                        base_config,
                     ))
                 }),
         )
@@ -3100,16 +2912,12 @@ impl AppModel {
             return Task::none();
         }
 
-        let pending: Vec<(PathBuf, String, FilmPreset)> = self
+        let pending: Vec<(PathBuf, String)> = self
             .rolls
             .iter()
             .filter(|roll| matches!(roll.thumb, Thumb::Loading))
             .filter(|roll| !self.cover_inflight.iter().any(|dir| dir == &roll.dir))
-            .filter_map(|roll| {
-                roll.cover
-                    .clone()
-                    .map(|name| (roll.dir.clone(), name, roll.preset))
-            })
+            .filter_map(|roll| roll.cover.clone().map(|name| (roll.dir.clone(), name)))
             .take(capacity)
             .collect();
 
@@ -3118,12 +2926,12 @@ impl AppModel {
         }
 
         self.cover_inflight
-            .extend(pending.iter().map(|(dir, _, _)| dir.clone()));
+            .extend(pending.iter().map(|(dir, _)| dir.clone()));
 
         Task::batch(
             pending
                 .into_iter()
-                .map(|(dir, name, preset)| cosmic::task::future(decode_cover(dir, name, preset))),
+                .map(|(dir, name)| cosmic::task::future(decode_cover(dir, name))),
         )
     }
 
@@ -3191,22 +2999,16 @@ impl AppModel {
         else {
             return Task::none();
         };
-        let preset = self.roll.preset();
-        // Only the auto-selected-frame base mode designates a calibration
-        // frame; elsewhere the base strategy is not a per-frame designation.
-        if self.roll.base_mode() != BaseMode::AutoSelectedFrame {
-            return Task::none();
-        }
         // The viewed frame's overview is usually cached; measure straight from
         // it (the exact mono the user is looking at). A cold frame falls back
         // to a one-shot decode that lands in `CalibrationBaseMeasured`.
-        let Some(cached) = self.detail_cache.get(&(dir.clone(), preset, name.clone())) else {
+        let Some(cached) = self.detail_cache.get(&(dir.clone(), name.clone())) else {
             // Designate the frame in RAM AND on disk before the decode returns,
             // since `apply_calibration_measurement` reads the manifest back
             // from disk and would otherwise drop the result as stale.
             self.roll.set_calibration_frame(&name);
             self.persist_roll();
-            return cosmic::task::future(measure_frame_base(dir, name, preset));
+            return cosmic::task::future(measure_frame_base(dir, name));
         };
         let base = measure_base(&cached.mono).filter(|base| *base >= MIN_PLAUSIBLE_BASE);
         self.roll.set_calibration_frame(&name);
@@ -3221,14 +3023,13 @@ impl AppModel {
     /// frame, posting its measured clear-film transmission back as
     /// [`Message::CalibrationBaseMeasured`].
     fn measure_calibration_frame(dir: PathBuf) -> Task<cosmic::Action<Message>> {
-        // The designated frame (and the film preset the decode runs under) live
-        // on disk — the drawer is library-only and the RAM manifest may be for
-        // another roll or stale, so read both fresh.
+        // The designated frame lives on disk — the drawer is library-only and
+        // the RAM manifest may be for another roll or stale, so read it fresh.
         let manifest = edit_manifest::load_roll_manifest(&dir);
         let Some(name) = manifest.calibration_frame().map(str::to_owned) else {
             return Task::none();
         };
-        cosmic::task::future(measure_frame_base(dir, name, manifest.preset()))
+        cosmic::task::future(measure_frame_base(dir, name))
     }
 
     /// Applies a landed calibration-frame measurement to the roll's manifest:
@@ -3243,8 +3044,7 @@ impl AppModel {
         base: Option<f32>,
     ) -> Task<cosmic::Action<Message>> {
         let mut manifest = edit_manifest::load_roll_manifest(dir);
-        let stale = manifest.base_mode() != BaseMode::AutoSelectedFrame
-            || manifest.calibration_frame() != Some(name);
+        let stale = manifest.calibration_frame() != Some(name);
         if stale {
             return Task::none();
         }
@@ -3275,49 +3075,6 @@ impl AppModel {
             }
             self.decode_covers()
         }
-    }
-
-    /// The roll's first sorted frame name: the `AutoSelectedFrame` default
-    /// calibration frame. Mirrors the cover selection (the first sorted
-    /// non-dot file) so the defaulted calibration frame matches what the user
-    /// sees first in the grid.
-    fn roll_first_frame(&self, dir: &Path) -> Option<String> {
-        if self.active.as_deref() == Some(dir) {
-            self.tiles.first().map(|tile| tile.name.clone())
-        } else {
-            self.rolls
-                .iter()
-                .find(|roll| roll.dir == dir)
-                .and_then(|roll| roll.cover.clone())
-        }
-    }
-
-    /// Re-bakes every rendering of the OPEN roll after a film-preset or
-    /// base-mode change: re-bakes the grid tiles and drops every detail buffer
-    /// decoded under the old profile (the live shader, the roll's LRU entries,
-    /// and any in-flight native level-up), then re-pumps so the next frames
-    /// come up under the new profile. Exposure/curve/crop edits survive (they
-    /// are applied in-shader). The caller has already recorded the new choice
-    /// on `self.roll` and pushed `decode_covers` into its task batch.
-    fn reflow_roll_after_change(&mut self, dir: &Path) -> Vec<Task<cosmic::Action<Message>>> {
-        for tile in &mut self.tiles {
-            tile.thumb = Thumb::Loading;
-        }
-        self.thumb_inflight.clear();
-        self.detail_shader = None;
-        self.detail_native_queued = false;
-        self.detail_logged_failure = None;
-        self.detail_inflight = None;
-        self.detail_preload_inflight.clear();
-        self.detail_thumb = None;
-        self.detail_last_frame = None;
-        let _ = self.detail_cache.retain(|(cached_dir, _, _)| cached_dir != dir);
-        let current = self.selected.clone().unwrap_or_default();
-        vec![
-            self.decode_next(),
-            self.decode_detail_next(),
-            self.preload_detail_neighbors(&current),
-        ]
     }
 
     /// Rebuilds every rendering after a base-calibration change: the live
@@ -3376,12 +3133,6 @@ impl AppModel {
             return Task::none();
         }
 
-        // The active roll's in-memory manifest is the decode source of truth
-        // (loaded synchronously in `RollOpened`, kept in sync on preset
-        // changes), so this is correct even while the library card scan for a
-        // freshly added roll is still in flight.
-        let preset = self.roll.preset();
-
         // Level 1 is native unless the sensor's long edge exceeds the wgpu
         // texture ceiling; `resize_area` treats a cap ≥ the source edge as
         // identity, so ≤8K scans decode at true full resolution.
@@ -3410,24 +3161,15 @@ impl AppModel {
         // fraction of the cost of a full RAW decode.)
         if cap == HI_RES_SIZE
             && let Some(dir) = self.active.clone()
-            && let Some(cached) = self
-                .detail_cache
-                .get(&(dir, preset, name.clone()))
-                .map(|c| {
-                    (
-                        c.mono.clone(),
-                        c.width,
-                        c.height,
-                        c.src_long_edge,
-                        c.inversion,
-                    )
-                })
+            && let Some(cached) = self.detail_cache.get(&(dir, name.clone())).map(|c| {
+                (c.mono.clone(), c.width, c.height, c.src_long_edge)
+            })
         {
-            let (mono, width, height, src_long_edge, inversion) = cached;
+            let (mono, width, height, src_long_edge) = cached;
             detail_trace(format_args!(
                 "cache hit: {name} {width}x{height} (src {src_long_edge})"
             ));
-            self.install_detail_shader(mono, width, height, src_long_edge, inversion);
+            self.install_detail_shader(mono, width, height, src_long_edge);
             return Task::none();
         }
 
@@ -3443,9 +3185,7 @@ impl AppModel {
             return Task::none();
         };
 
-        let base_config = self.roll.base_config();
-
-        cosmic::task::future(decode_detail(dir, name, cap, preset, base_config))
+        cosmic::task::future(decode_detail(dir, name, cap))
     }
 
     /// Builds and installs the detail shader from a decoded mono buffer,
@@ -3459,7 +3199,6 @@ impl AppModel {
         width: u32,
         height: u32,
         src_long_edge: u32,
-        inversion: Option<(MonoStock, f32)>,
     ) {
         let image_id = self.next_image_id;
         self.next_image_id = self.next_image_id.wrapping_add(1);
@@ -3467,16 +3206,14 @@ impl AppModel {
             mono,
             width,
             height,
-            self.exposure_ev,
+            self.tone.to_develop(self.roll.base_or_default()),
             self.crop,
             self.rotation,
             image_id,
             src_long_edge,
-            inversion,
         ));
         if let Some(shader) = &mut self.detail_shader {
             shader.set_view(self.detail_zoom.0, self.detail_pan);
-            shader.set_curve(self.curve_contrast, self.curve_highlights, self.curve_shadows);
             shader.set_crop(self.crop);
             shader.set_rotation(self.rotation);
             // A fresh program starts with the mask off; re-assert the current
@@ -3507,7 +3244,6 @@ impl AppModel {
         &mut self,
         dir: &PathBuf,
         name: &str,
-        preset: FilmPreset,
         result: Result<DetailDecode, FrameError>,
     ) -> Task<cosmic::Action<Message>> {
         self.detail_preload_inflight
@@ -3518,17 +3254,15 @@ impl AppModel {
             width,
             height,
             src_long_edge,
-            inversion,
         }) = result
         {
             let _evicted = self.detail_cache.insert(
-                (dir.clone(), preset, name.to_string()),
+                (dir.clone(), name.to_string()),
                 DetailMono {
                     mono,
                     width,
                     height,
                     src_long_edge,
-                    inversion,
                 },
             );
         }
@@ -3566,12 +3300,10 @@ impl AppModel {
             return Task::none();
         }
 
-        let preset = self.roll.preset();
-
         let pending: Vec<String> = neighbors
             .into_iter()
             .filter(|n| {
-                let key = (dir.clone(), preset, n.clone());
+                let key = (dir.clone(), n.clone());
                 !self.detail_cache.contains(&key)
                     && !self
                         .detail_preload_inflight
@@ -3588,12 +3320,10 @@ impl AppModel {
         self.detail_preload_inflight
             .extend(pending.iter().map(|n| (dir.clone(), n.clone())));
 
-        let base_config = self.roll.base_config();
-
         Task::batch(
             pending
                 .into_iter()
-                .map(|n| cosmic::task::future(preload_detail(dir.clone(), n, preset, base_config))),
+                .map(|n| cosmic::task::future(preload_detail(dir.clone(), n))),
         )
     }
 
@@ -3621,19 +3351,13 @@ impl AppModel {
         // context) goes away; a late `EditKeyReleased` will find it clear and
         // no-op rather than committing a stale selection.
         self.editing_key_held = false;
-        self.curve_contrast = 1.0;
-        self.curve_highlights = 1.0;
-        self.curve_shadows = 1.0;
-        self.exposure_ev = edit_manifest::DEFAULT_EXPOSURE_EV;
+        self.tone = edit_manifest::ToneEdit::default();
         self.crop = edit_manifest::CropMargins::default();
         self.rotation = 0;
         self.crop_mode = false;
         // The reset snapshot mirrors the live edit values' lifecycle: reset
         // to identity on close; the next `ThumbnailActivated` re-syncs it.
-        self.reset_exposure_ev = edit_manifest::DEFAULT_EXPOSURE_EV;
-        self.reset_curve_contrast = 1.0;
-        self.reset_curve_highlights = 1.0;
-        self.reset_curve_shadows = 1.0;
+        self.reset_tone = edit_manifest::ToneEdit::default();
         self.reset_crop = edit_manifest::CropMargins::default();
         self.reset_rotation = 0;
     }
@@ -3857,7 +3581,7 @@ impl AppModel {
     /// stays separate so the sliders can stream drags without re-decoding
     /// thumbnails on every move.
     fn set_exposure(&mut self, ev: f32) {
-        self.exposure_ev = ev;
+        self.tone.exposure_ev = ev;
         if let Some(selected) = &self.selected {
             self.roll.set_exposure(selected, ev);
         }
@@ -3866,26 +3590,25 @@ impl AppModel {
         }
     }
 
-    /// Writes the open frame's tone-curve controls live: the RAM roll edit and
-    /// the GPU shader uniforms. The slider (`CurveChanged`) and a keyboard step
-    /// (`EditAdjust::Contrast`/`Highlights`/`Shadows`) both route here;
-    /// committing (persist + re-bake) stays separate like
+    /// Writes the open frame's density develop shape live: the RAM roll edit
+    /// and the GPU shader uniforms. The slider (`DevelopChanged`) and a
+    /// keyboard step (`EditAdjust::Contrast`/`Black`/`White`/`Pivot`) both
+    /// route here; committing (persist + re-bake) stays separate like
     /// [`Self::set_exposure`].
     ///
-    /// The three values are stored as powers (the positive-path curve domain),
-    /// but the film path re-reads them as STOP LIFTS via `log2`/`-log2` and
-    /// applies them in the density domain (Contrast scales the density window;
-    /// Highlights/Shadows are the toe/shoulder masks). See
-    /// `docs/tone-model-density.md`.
-    fn set_curve(&mut self, contrast: f32, highlights: f32, shadows: f32) {
-        self.curve_contrast = contrast;
-        self.curve_highlights = highlights;
-        self.curve_shadows = shadows;
+    /// The values map straight onto [`film::Develop`]'s shape controls:
+    /// contrast is a power about the midtone pivot, black/white are density
+    /// anchors, and the pivot is a signed offset from the window midpoint.
+    fn set_develop_shape(&mut self, contrast: f32, black: f32, white: f32, pivot: f32) {
+        self.tone.contrast = contrast;
+        self.tone.black = black;
+        self.tone.white = white;
+        self.tone.pivot_offset = pivot;
         if let Some(selected) = &self.selected {
-            self.roll.set_curve(selected, contrast, highlights, shadows);
+            self.roll.set_develop(selected, self.tone);
         }
         if let Some(shader) = &mut self.detail_shader {
-            shader.set_curve(contrast, highlights, shadows);
+            shader.set_develop(self.tone.to_develop(self.roll.base_or_default()));
         }
     }
 
@@ -3904,34 +3627,44 @@ impl AppModel {
 
         match adjust {
             EditAdjust::Exposure(delta) => {
-                let ev = clamp_ev(self.exposure_ev + delta);
+                let ev = clamp_ev(self.tone.exposure_ev + delta);
                 self.set_exposure(ev);
             }
-            // Each tone arm only changes one power; the others keep their
-            // current values so the composed curve stays fully defined.
-            // Contrast steps its stop lift (like the other two), so the
-            // "increase" keys `]` raise the mid-pivoted power.
+            // Each develop arm only changes one control; the others keep their
+            // current values. Contrast steps its stop lift, so the "increase"
+            // keys raise the power — matching the slider's rightward drag.
             EditAdjust::Contrast(delta) => {
-                let contrast =
-                    contrast_power_for_lift(contrast_lift(self.curve_contrast) + delta);
-                self.set_curve(contrast, self.curve_highlights, self.curve_shadows);
+                let contrast = contrast_power_for_lift(contrast_lift(self.tone.contrast) + delta);
+                self.set_develop_shape(
+                    contrast,
+                    self.tone.black,
+                    self.tone.white,
+                    self.tone.pivot_offset,
+                );
             }
-            // Highlights and Shadows step their user-facing LIFT value in
-            // stops, so the "increase" keys `'`/`.` lift/brighten the region
-            // exactly like dragging their slider right — keeping keyboard and
-            // slider directions in lockstep. The two arms use opposite
-            // power↔lift maps because their pivots sit at opposite ends: a
-            // highlight lift raises the shadow-pivoted power, a shadow lift
-            // lowers the white-pivoted power.
-            EditAdjust::Highlights(delta) => {
-                let highlights =
-                    highlight_power_for_lift(highlight_lift(self.curve_highlights) + delta);
-                self.set_curve(self.curve_contrast, highlights, self.curve_shadows);
+            EditAdjust::Black(delta) => {
+                self.set_develop_shape(
+                    self.tone.contrast,
+                    clamp_density(self.tone.black + delta),
+                    self.tone.white,
+                    self.tone.pivot_offset,
+                );
             }
-            EditAdjust::Shadows(delta) => {
-                let shadows =
-                    shadow_power_for_lift(shadow_lift(self.curve_shadows) + delta);
-                self.set_curve(self.curve_contrast, self.curve_highlights, shadows);
+            EditAdjust::White(delta) => {
+                self.set_develop_shape(
+                    self.tone.contrast,
+                    self.tone.black,
+                    clamp_density(self.tone.white + delta),
+                    self.tone.pivot_offset,
+                );
+            }
+            EditAdjust::Pivot(delta) => {
+                self.set_develop_shape(
+                    self.tone.contrast,
+                    self.tone.black,
+                    self.tone.white,
+                    clamp_pivot(self.tone.pivot_offset + delta),
+                );
             }
             // A display rotation steps one quarter-turn counter-clockwise
             // (authoring the composite of the crop + the EXIF-upright frame;
@@ -4053,13 +3786,10 @@ impl AppModel {
         if let Some(open) = self.selected.as_deref()
             && targets.iter().any(|name| name == open)
         {
-            self.exposure_ev = tone.exposure_ev;
-            self.curve_contrast = tone.curve_contrast;
-            self.curve_highlights = tone.curve_highlights;
-            self.curve_shadows = tone.curve_shadows;
+            self.tone = tone;
             if let Some(shader) = &mut self.detail_shader {
                 shader.set_exposure(tone.exposure_ev);
-                shader.set_curve(tone.curve_contrast, tone.curve_highlights, tone.curve_shadows);
+                shader.set_develop(tone.to_develop(self.roll.base_or_default()));
             }
         }
 
@@ -4137,7 +3867,6 @@ impl AppModel {
     fn handle_detail_ready(
         &mut self,
         name: &str,
-        preset: FilmPreset,
         result: Result<DetailDecode, FrameError>,
     ) -> Task<cosmic::Action<Message>> {
         if detail_result_is_current(
@@ -4156,7 +3885,6 @@ impl AppModel {
                     width,
                     height,
                     src_long_edge,
-                    inversion,
                 }) => {
                     landed = true;
                     detail_trace(format_args!(
@@ -4174,13 +3902,12 @@ impl AppModel {
                         // freeing its memory eagerly; the value is otherwise
                         // unused.
                         let _evicted = self.detail_cache.insert(
-                            (dir.clone(), preset, name.to_string()),
+                            (dir.clone(), name.to_string()),
                             DetailMono {
                                 mono: mono.clone(),
                                 width,
                                 height,
                                 src_long_edge,
-                                inversion,
                             },
                         );
                     }
@@ -4204,22 +3931,16 @@ impl AppModel {
                         mono,
                         width,
                         height,
-                        self.exposure_ev,
+                        self.tone.to_develop(self.roll.base_or_default()),
                         self.crop,
                         self.rotation,
                         image_id,
                         src_long_edge,
-                        inversion,
                     ));
                     // Carry over any zoom/pan the user applied while the decode
                     // was in flight (the program starts at contain fit).
                     if let Some(shader) = &mut self.detail_shader {
                         shader.set_view(self.detail_zoom.0, self.detail_pan);
-                        shader.set_curve(
-                            self.curve_contrast,
-                            self.curve_highlights,
-                            self.curve_shadows,
-                        );
                         shader.set_crop(self.crop);
                         shader.set_rotation(self.rotation);
                         // A fresh program starts with the mask off; re-assert
@@ -4315,8 +4036,7 @@ fn rebake_trace(args: std::fmt::Arguments<'_>) {
 
 /// Loads one roll's metadata: display name (manifest label, falling back to
 /// the directory leaf), cover file (first sorted non-dot file), the count of
-/// frame files, and the film preset recorded in the roll's edit manifest
-/// (defaulting to the non-inverted `None`) — with nothing decoded yet.
+/// frame files, and the recorded dates — with nothing decoded yet.
 async fn load_roll(dir: PathBuf) -> Roll {
     let leaf = dir
         .file_name()
@@ -4332,8 +4052,6 @@ async fn load_roll(dir: PathBuf) -> Roll {
         name,
         cover,
         frame_count,
-        preset: manifest.preset(),
-        base_mode: manifest.base_mode(),
         start_date,
         end_date,
         thumb: Thumb::Loading,
@@ -4416,55 +4134,18 @@ async fn load_files_in(dir: PathBuf) -> Vec<String> {
 
 
 
-/// The add-roll dialog's "film preset" choice: whether the chosen folder holds
-/// already-positive scans (regular RAWs, the non-inverted default), the generic
-/// B&W profile, or a specific film stock. Mirrors the roll-info drawer's film
-/// dropdown ordering ([`FILM_CHOICES`]). The response returns the selected key,
-/// which the picker resolves back into a [`FilmPreset`]. (The base strategy is
-/// not part of the dialog — the cosmic open dialog carries a single choice — so
-/// a new roll starts on the preset base and the user sets auto in the roll-info
-/// drawer.)
-#[must_use]
-fn roll_preset_choice() -> cosmic::dialog::file_chooser::Choice {
-    let mut choice =
-        cosmic::dialog::file_chooser::Choice::new("preset", &fl!("preset-label"), "none");
-    for preset in FILM_CHOICES {
-        match preset.stock() {
-            // `None` (no inversion) uses its fluent label; stock profiles show
-            // their display name.
-            Some(stock) => choice = choice.insert(preset.choice_key(), stock.name),
-            None => choice = choice.insert(preset.choice_key(), &fl!("preset-none")),
-        }
-    }
-    choice
-}
-
 /// Opens the system folder picker, and on success emits [`Message::RollAdded`]
-/// for the chosen directory (a cancel or portal failure is a no-op). The dialog
-/// carries the film-preset choice, which lands in the [`Message::RollAdded`]
-/// payload alongside the directory. Shared by the double-click handler and
-/// Enter on a selected Add Roll tile.
+/// for the chosen directory (a cancel or portal failure is a no-op). Shared by
+/// the double-click handler and Enter on a selected Add Roll tile.
 fn open_roll_picker() -> Task<cosmic::Action<Message>> {
     cosmic::task::future(async {
-        let dialog = cosmic::dialog::file_chooser::open::Dialog::new()
-            .choice(roll_preset_choice())
-            .open_folder();
+        let dialog = cosmic::dialog::file_chooser::open::Dialog::new().open_folder();
         match dialog.await {
             Ok(response) => {
                 let Ok(dir) = response.url().to_file_path() else {
                     return Message::Ignore;
                 };
-                // The response lists the selected (id, value) pairs; the
-                // "preset" choice carries the preset key. A backend that
-                // dropped the choice falls back to the default (None).
-                let preset = response
-                    .choices()
-                    .iter()
-                    .find(|(id, _)| id == "preset")
-                    .map_or(FilmPreset::default(), |(_, value)| {
-                        FilmPreset::from_key(value.as_str())
-                    });
-                Message::RollAdded(dir, preset)
+                Message::RollAdded(dir)
             }
             // Cancelled (or a portal failure) is a no-op.
             Err(_) => Message::Ignore,
@@ -4665,12 +4346,16 @@ fn clamp_contrast_power(power: f32) -> f32 {
     power.clamp(0.125, 8.0)
 }
 
-/// Clamps a Highlights/Shadows region power to the slider's range
-/// `0.25..=4.0`. A symmetric reciprocal pair around `1.0`, spanning ±2 stops
-/// like [`clamp_contrast_power`] but narrower, since the region controls act on
-/// one end of the tone range.
-fn clamp_tone_lift_power(power: f32) -> f32 {
-    power.clamp(0.25, 4.0)
+/// Clamps a density anchor (black or white) to the slider's range `0.0..=5.0`.
+fn clamp_density(density: f32) -> f32 {
+    density.clamp(0.0, 5.0)
+}
+
+/// Clamps the midtone pivot offset to the `−0.5..=0.5` window-fraction range
+/// (the develop clamps internally too, but keeping the stored value in range
+/// avoids an unrepresentable edit).
+fn clamp_pivot(pivot: f32) -> f32 {
+    pivot.clamp(-0.5, 0.5)
 }
 
 /// The Contrast slider's user-facing "lift value" in stops: `+log2(power)`, so
@@ -4686,43 +4371,6 @@ pub(crate) fn contrast_lift(power: f32) -> f32 {
 /// range (round-trip `lift ↔ power` is exact within the range).
 pub(crate) fn contrast_power_for_lift(value: f32) -> f32 {
     clamp_contrast_power(value.exp2())
-}
-
-/// The Shadows slider's user-facing "lift value" in stops: `-log2(power)`, so
-/// INCREASING it lifts/brightens the lower tones. The shadows power pivots at
-/// the white point, so a lift drives the power BELOW 1.0 (a lower-tones lift
-/// with white pinned). Identity at `0.0` (power 1.0 ⇔ 0 stops), at the CENTER
-/// of the symmetric `−2..=2` track; power 0.5 is +1 stop of lift, power 2.0 is
-/// −1 stop (crush).
-pub(crate) fn shadow_lift(power: f32) -> f32 {
-    -(power.log2())
-}
-
-/// The stored shadows power for a lift value (in stops) picked by a slider or
-/// keyboard step. Bound-sensitive inverse of [`shadow_lift`] across the power
-/// range, so a value that exits `−2..=2` clamps to the same endpoints
-/// `clamp_tone_lift_power` produces (round-trip `lift ↔ power` is exact within
-/// the range).
-pub(crate) fn shadow_power_for_lift(value: f32) -> f32 {
-    clamp_tone_lift_power((-value).exp2())
-}
-
-/// The Highlights slider's user-facing "lift value" in stops: `+log2(power)`,
-/// so INCREASING it lifts/brightens the upper tones. The highlights power
-/// pivots at the shadow anchor, so a lift drives the power ABOVE 1.0 (an
-/// upper-tones lift with the shadow anchor pinned) — the opposite power
-/// direction from [`shadow_lift`], which is exactly what makes both sliders
-/// brighten their named region on a rightward drag. Identity at `0.0`, centered
-/// on the symmetric `−2..=2` track like the shadows arm.
-pub(crate) fn highlight_lift(power: f32) -> f32 {
-    power.log2()
-}
-
-/// The stored highlights power for a lift value (in stops) picked by a slider
-/// or keyboard step. Bound-sensitive inverse of [`highlight_lift`] across the
-/// power range (round-trip `lift ↔ power` is exact within the range).
-pub(crate) fn highlight_power_for_lift(value: f32) -> f32 {
-    clamp_tone_lift_power(value.exp2())
 }
 
 /// Translates the crop window by `delta_px` in `direction`, keeping the window
@@ -4860,14 +4508,12 @@ fn resize_crop_box(
 /// Maps a keyboard shortcut character to an [`EditAdjust`], or `None` when the
 /// key is not bound. `alt` and `shift` are the event's modifier state.
 ///
-/// The four control pairs are laid out on a US keyboard left-to-right to match
-/// the editing panel's control order (Exposure → Contrast → Highlights →
-/// Shadows): `-`/`=` exposure, `[`/`]` contrast, `;`/`'` highlights, `,`/`.`
-/// shadows. A bare key uses the coarse step; holding `Shift` selects the fine
-/// nudge step. The "increase" key of each pair (`=`/`]`/`'`/`.`) applies a
-/// POSITIVE step — for the highlights/shadows arms this steps the user-facing
-/// lift value (see [`shadow_lift`]/[`highlight_lift`]), so `'`/`.` brighten the
-/// region's highlights or shadows.
+/// The five control pairs are laid out on a US keyboard left-to-right to match
+/// the editing panel's control order (Exposure → Contrast → Black → White →
+/// Pivot): `-`/`=` exposure, `[`/`]` contrast, `;`/`'` black, `,`/`.` white,
+/// `u`/`i` midtone pivot. A bare key uses the coarse step; holding `Shift`
+/// selects the fine nudge step. The "increase" key of each pair
+/// (`=`/`]`/`'`/`.`/`i`) applies a POSITIVE step.
 /// `-`/`=` stay the exposure pair here; the crop-mode handler reinterprets them
 /// as the window resize. `r` rotates the display one quarter-turn
 /// counter-clockwise (cumulative; modifiers ignored). The VIM movement keys
@@ -4892,10 +4538,12 @@ fn edit_adjust_for(key: &str, _alt: bool, shift: bool) -> Option<EditAdjust> {
         "=" => Some(EditAdjust::Exposure(ev)),
         "[" => Some(EditAdjust::Contrast(-curve)),
         "]" => Some(EditAdjust::Contrast(curve)),
-        ";" => Some(EditAdjust::Highlights(-curve)),
-        "'" => Some(EditAdjust::Highlights(curve)),
-        "," => Some(EditAdjust::Shadows(-curve)),
-        "." => Some(EditAdjust::Shadows(curve)),
+        ";" => Some(EditAdjust::Black(-curve)),
+        "'" => Some(EditAdjust::Black(curve)),
+        "," => Some(EditAdjust::White(-curve)),
+        "." => Some(EditAdjust::White(curve)),
+        "u" => Some(EditAdjust::Pivot(-curve)),
+        "i" => Some(EditAdjust::Pivot(curve)),
         // Rotate the display one quarter-turn counter-clockwise. A bare `r`
         // fires on press and the edit-key release commits the persist + re-bake
         // (the release arm matches through this same function, so `r` is
@@ -4911,14 +4559,12 @@ fn edit_adjust_for(key: &str, _alt: bool, shift: bool) -> Option<EditAdjust> {
 async fn decode_thumbnail(
     dir: PathBuf,
     name: String,
-    tone: edit_manifest::ToneEdit,
+    develop: crate::film::Develop,
     crop: edit_manifest::CropMargins,
     rotation: u8,
-    preset: FilmPreset,
-    base_config: BaseConfig,
 ) -> Message {
     let result = decode_raw(dir, name.clone(), move |image| {
-        convert_thumbnail(image, THUMB_SIZE, tone, crop, rotation, preset, base_config)
+        convert_thumbnail(image, THUMB_SIZE, develop, crop, rotation)
     })
     .await;
 
@@ -4929,17 +4575,16 @@ async fn decode_thumbnail(
 /// file's stored exposure, tone curve and display rotation from the roll's
 /// manifest so the roll tile preview parallels the edited frame (grid == detail
 /// for covers too). A roll with no manifest (or an unedited cover) falls back
-/// to identity. The cover's own on-disk manifest also supplies the roll's base
-/// mode, so a library-page cover reflects a calibration recorded from the open
-/// roll without extra plumbing.
-async fn decode_cover(dir: PathBuf, name: String, preset: FilmPreset) -> Message {
+/// to identity. The cover's own on-disk manifest also supplies the roll's base,
+/// so a library-page cover reflects a calibration recorded from the open roll
+/// without extra plumbing.
+async fn decode_cover(dir: PathBuf, name: String) -> Message {
     let manifest = edit_manifest::load_roll_manifest(&dir);
-    let tone = manifest.tone(&name);
+    let develop = manifest.tone(&name).to_develop(manifest.base_or_default());
     let crop = manifest.crop(&name);
     let rotation = manifest.rotation(&name) & 3;
-    let base_config = manifest.base_config();
     let result = decode_raw(dir.clone(), name, move |image| {
-        convert_thumbnail(image, THUMB_SIZE, tone, crop, rotation, preset, base_config)
+        convert_thumbnail(image, THUMB_SIZE, develop, crop, rotation)
     })
     .await;
 
@@ -4951,48 +4596,29 @@ async fn decode_cover(dir: PathBuf, name: String, preset: FilmPreset) -> Message
 /// shader uploads and applies exposure to.  `max_edge` caps the long edge in
 /// pixels; the overview level uses [`HI_RES_SIZE`], the native level-up
 /// [`MAX_TEXTURE_EDGE`].
-async fn decode_detail(
-    dir: PathBuf,
-    name: String,
-    max_edge: u32,
-    preset: FilmPreset,
-    base_config: BaseConfig,
-) -> Message {
-    let result = decode_raw_detail(dir, name.clone(), max_edge, preset, base_config).await;
-    Message::DetailReady(name, preset, result)
+async fn decode_detail(dir: PathBuf, name: String, max_edge: u32) -> Message {
+    let result = decode_raw_detail(dir, name.clone(), max_edge).await;
+    Message::DetailReady(name, result)
 }
 
 /// Decodes a neighbor frame's overview for the preload cache. Unlike
 /// [`decode_detail`] this only populates the LRU — it never becomes the active
 /// detail shader — so it always decodes at the fixed overview cap.
-async fn preload_detail(
-    dir: PathBuf,
-    name: String,
-    preset: FilmPreset,
-    base_config: BaseConfig,
-) -> Message {
-    let result =
-        decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE, preset, base_config).await;
-    Message::DetailPreloaded(dir, name, preset, result)
+async fn preload_detail(dir: PathBuf, name: String) -> Message {
+    let result = decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE).await;
+    Message::DetailPreloaded(dir, name, result)
 }
 
 /// Measures ONE frame's clear-film transmission at the overview scale, posting
-/// it back as [`Message::CalibrationBaseMeasured`]. The `AutoSelectedFrame`
-/// preset's one-shot calibration path: designate a frame, decode it once,
-/// and pin the whole roll's black point to its measured plateau. Implausible
-/// or missing measurements arrive as `None` (the caller keeps the stock
-/// fallback rather than recording a bad base).
-async fn measure_frame_base(dir: PathBuf, name: String, preset: FilmPreset) -> Message {
-    let base = decode_raw_detail(
-        dir.clone(),
-        name.clone(),
-        HI_RES_SIZE,
-        preset,
-        BaseConfig::default(),
-    )
-    .await
-    .ok()
-    .and_then(|decoded| measure_base(&decoded.mono).filter(|base| *base >= MIN_PLAUSIBLE_BASE));
+/// it back as [`Message::CalibrationBaseMeasured`]. The calibration path:
+/// designate a frame, decode it once, and pin the whole roll's black point to
+/// its measured plateau. Implausible or missing measurements arrive as `None`
+/// (the caller keeps the default fallback rather than recording a bad base).
+async fn measure_frame_base(dir: PathBuf, name: String) -> Message {
+    let base = decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE)
+        .await
+        .ok()
+        .and_then(|decoded| measure_base(&decoded.mono).filter(|base| *base >= MIN_PLAUSIBLE_BASE));
     Message::CalibrationBaseMeasured(dir, name, base)
 }
 
@@ -5140,9 +4766,9 @@ impl menu::action::MenuAction for MenuAction {
 mod tests {
     use super::*;
     use crate::pipeline::{
-        apply_exposure, bake_tone, class_gains, convert_thumbnail, crop_rgba, crop_samples,
-        display_source_dims, downsample_thumbnail, flatten_bayer, luma, pivots_for, resized_dims,
-        resize_area, rotate_quarters, scale_crop, srgb_encode, unsharp_mask,
+        apply_exposure, bake_develop, class_gains, convert_thumbnail, crop_rgba, crop_samples,
+        display_source_dims, downsample_thumbnail, flatten_bayer, luma, resized_dims, resize_area,
+        rotate_quarters, scale_crop, srgb_encode,
     };
 
     fn tile(name: &str) -> Tile {
@@ -5330,38 +4956,6 @@ mod tests {
         assert_eq!((w, h), (2, 2));
         assert_eq!(mono.len(), 4);
         assert!(mono.iter().all(|value| (value - 0.5).abs() < 1e-6));
-    }
-
-    #[test]
-    fn unsharp_mask_leaves_flat_buffers_unchanged() {
-        let mut flat = vec![0.42_f32; 16];
-
-        unsharp_mask(&mut flat, 4, 4);
-
-        assert!(flat.iter().all(|value| (value - 0.42).abs() < 1e-6));
-    }
-
-    #[test]
-    fn unsharp_mask_increases_local_contrast() {
-        // Horizontal mid-gray step edge across a single row.
-        let mut edge = vec![0.2_f32, 0.2, 0.2, 0.8, 0.8, 0.8];
-
-        unsharp_mask(&mut edge, 6, 1);
-
-        assert!(edge[2] < 0.2); // dark side dips further
-        assert!(edge[3] > 0.8); // bright side overshoots
-    }
-
-    #[test]
-    fn unsharp_mask_clamps_to_unit_range() {
-        // A lone bright spike would overshoot past white without clamping.
-        let mut spike = vec![0.0_f32; 9];
-        spike[4] = 1.0;
-
-        unsharp_mask(&mut spike, 3, 3);
-
-        assert!(spike.iter().all(|value| (0.0..=1.0).contains(value)));
-        assert_eq!(spike[4], 1.0);
     }
 
     #[test]
@@ -5692,102 +5286,10 @@ mod tests {
     }
 
     #[test]
-    fn none_preset_does_not_rescale_midtones_or_clamp_highlights() {
-        // Regression: the `None` preset (already-positive RAW) previously ran
-        // `normalize_positive`, which divided the whole frame by its own 95th
-        // percentile and clamped everything above it to pure white. That baked
-        // an auto-expose into the data before the EV slider and permanently
-        // destroyed highlight detail. With the auto-expose removed, a frame
-        // whose midtones sit at 0.5 relative to the sensor white point must
-        // render those midtones as a real mid-gray — not scaled up to white —
-        // and speculars above the 95th percentile must survive at the peak.
-        //
-        // 10x10 RGB Integer RAW, white = 1000: 97 sites at 0.5 (raw 500) and
-        // 3 speculars at 1.0 (raw 1000), so the 95th percentile ≈ 0.5. Under
-        // the old `normalize_positive` that anchor scaled the 0.5 midtones to
-        // 1.0 and clamped the speculars — a uniform white frame. Today the
-        // midtones must stay a mid-gray (~sRGB(0.5) ≈ 188).
-        let mut values = Vec::with_capacity(10 * 10 * 3);
-        for y in 0..10 {
-            for x in 0..10 {
-                let site = if (x == 0 && y == 0) || (x == 9 && y == 0) || (x == 4 && y == 9) {
-                    1000
-                } else {
-                    500
-                };
-                values.extend_from_slice(&[site, site, site]);
-            }
-        }
-        let image = rawloader::RawImage {
-            make: String::new(),
-            model: String::new(),
-            clean_make: String::new(),
-            clean_model: String::new(),
-            width: 10,
-            height: 10,
-            cpp: 3,
-            wb_coeffs: [1.0; 4],
-            whitelevels: [1000; 4],
-            blacklevels: [0; 4],
-            xyz_to_cam: [[0.0; 3]; 4],
-            cfa: rawloader::CFA::new("RGGB"),
-            crops: [0, 0, 0, 0],
-            blackareas: Vec::new(),
-            orientation: rawloader::Orientation::Normal,
-            data: rawloader::RawImageData::Integer(values),
-        };
-
-        // Identity curve + EV 0 so the sampled mono value is preserved exactly
-        // through sRGB with no user gain.
-        let tone = edit_manifest::ToneEdit {
-            exposure_ev: 0.0,
-            ..edit_manifest::ToneEdit::default()
-        };
-        let handle = convert_thumbnail(
-            &image,
-            10.0,
-            tone,
-            Default::default(),
-            0,
-            FilmPreset::None,
-            BaseConfig::default(),
-        )
-        .expect("decode succeeds");
-        let (width, height, pixels) = match &handle {
-            cosmic::widget::image::Handle::Rgba {
-                width,
-                height,
-                pixels,
-                ..
-            } => (*width, *height, pixels.as_ref()),
-            _ => panic!("expected an RGBA handle"),
-        };
-        assert_eq!((width, height), (10, 10));
-        // A midtone site far from any specular must render as a genuine
-        // mid-gray, NOT a scaled-to-white 255 that `normalize_positive`
-        // produced. Site (5,5) sits in the 0.5 bulk.
-        let midtone = pixels[(5 * 10 + 5) * 4];
-        assert!(midtone < 200, "midtone crushed too bright: {midtone}");
-        assert!(midtone > 100, "midtone too dark: {midtone}");
-        // The specular sites stay at the sensor peak (much brighter than the
-        // bulk), proving highlight detail is preserved rather than crushed.
-        let specular = pixels[(0 * 10 + 0) * 4];
-        assert!(specular as i32 > midtone as i32 + 40, "specular crushed");
-    }
-
-    #[test]
-    fn inverted_preset_brightens_on_positive_ev() {
-        // User-facing EV means "brightness" for BOTH presets: +EV brightens a
-        // film negative's positive exactly as it brightens an already-positive
-        // scan. Since the rework moved the exposure gain onto the TRUE sensor
-        // data (multiplied by 2^-EV there) and then per-fragment density-
-        // inverts it, +EV must raise the density and therefore brighten the
-        // positive — NOT darken it.
-        //
-        // A uniform frame equal to its own measured clear-film base prints all
-        // black at EV 0 (every site sits at the measured black point). Raising
-        // EV to +1 halves the transmission (2^-1), lifting the density to
-        // log10(2), which must brighten the frame measurably.
+    fn develop_exposure_brightens_a_film_frame() {
+        // User-facing EV brightens: a uniform frame below the base prints dark
+        // at EV 0; +1 EV halves the transmission, raises the density, and
+        // brightens the positive.
         let values: Vec<u16> = vec![900; 10 * 10 * 3];
         let image = rawloader::RawImage {
             make: String::new(),
@@ -5807,42 +5309,24 @@ mod tests {
             orientation: rawloader::Orientation::Normal,
             data: rawloader::RawImageData::Integer(values),
         };
-
-        let bake = |ev: f32| {
-            let tone = edit_manifest::ToneEdit {
-                exposure_ev: ev,
-                ..edit_manifest::ToneEdit::default()
-            };
-            let handle = convert_thumbnail(
-                &image,
-                10.0,
-                tone,
-                Default::default(),
-                0,
-                FilmPreset::Hp5Plus,
-                BaseConfig::default(),
-            )
-            .expect("decode succeeds");
-            let (width, height, pixels) = match &handle {
-                cosmic::widget::image::Handle::Rgba {
-                    width,
-                    height,
-                    pixels,
-                    ..
-                } => (*width, *height, pixels.as_ref()),
+        let bake = |develop: crate::film::Develop| {
+            let handle = convert_thumbnail(&image, 10.0, develop, Default::default(), 0)
+                .expect("decode succeeds");
+            let pixels = match &handle {
+                cosmic::widget::image::Handle::Rgba { pixels, .. } => pixels.as_ref(),
                 _ => panic!("expected an RGBA handle"),
             };
-            assert_eq!((width, height), (10, 10));
-            let count = pixels.len() / 4;
-            let sum: u32 = pixels.chunks_exact(4).map(|p| u32::from(p[0])).sum::<u32>();
-            sum as f32 / count as f32
+            let sum: u32 = pixels.chunks_exact(4).map(|p| u32::from(p[0])).sum();
+            sum as f32 / (pixels.len() / 4) as f32
         };
-
-        let ev0 = bake(0.0);
-        let ev1 = bake(1.0);
+        let base = crate::film::Develop::with_base(0.8);
+        let brighter = crate::film::Develop {
+            exposure_ev: 1.0,
+            ..base
+        };
         assert!(
-            ev1 > ev0 + 20.0,
-            "+1EV must brighten an inverted preset: {ev0} → {ev1}"
+            bake(brighter) > bake(base) + 20.0,
+            "+1EV must brighten the positive"
         );
     }
 
@@ -6017,64 +5501,39 @@ mod tests {
     }
 
     #[test]
-    fn lru_cache_preset_keyed_entries_do_not_collide() {
-        // Two presets for the same roll+frame are distinct cache entries, so a
-        // preset change can never serve a stale inversion.
-        let mut cache = LruCache::new(8);
-        let dir = PathBuf::from("/rolls/a");
-        let key_alpha = (dir.clone(), FilmPreset::Hp5Plus, "frame.DNG".to_string());
-        let key_neutral = (dir, FilmPreset::None, "frame.DNG".to_string());
-        assert!(cache.insert(key_alpha.clone(), 1).is_none());
-        assert!(cache.insert(key_neutral.clone(), 2).is_none());
-        assert_eq!(cache.get(&key_alpha), Some(&1));
-        assert_eq!(cache.get(&key_neutral), Some(&2));
-        assert_eq!(cache.len(), 2);
-    }
-
-    #[test]
     fn lru_cache_retain_drops_only_matching_dir_and_preserves_recency() {
         let mut cache = LruCache::new(8);
         let roll_a = PathBuf::from("/rolls/a");
         let roll_b = PathBuf::from("/rolls/b");
-        let key_a_none = (roll_a.clone(), FilmPreset::None, "1.DNG".to_string());
-        let key_a_hp5 = (roll_a.clone(), FilmPreset::Hp5Plus, "2.DNG".to_string());
-        let key_b = (roll_b.clone(), FilmPreset::None, "3.DNG".to_string());
-        cache.insert(key_a_none.clone(), 1);
-        cache.insert(key_a_hp5.clone(), 2);
+        let key_a1 = (roll_a.clone(), "1.DNG".to_string());
+        let key_a2 = (roll_a.clone(), "2.DNG".to_string());
+        let key_b = (roll_b.clone(), "3.DNG".to_string());
+        cache.insert(key_a1.clone(), 1);
+        cache.insert(key_a2.clone(), 2);
         cache.insert(key_b.clone(), 3);
         // Touch the other roll so its recency stays intact through the retain.
         assert_eq!(cache.get(&key_b), Some(&3));
 
-        // Dropping every entry for roll `a` (any preset) leaves roll `b` alone.
-        let dropped = cache.retain(|(dir, _, _)| dir != &roll_a);
+        let dropped = cache.retain(|(dir, _)| dir != &roll_a);
         assert_eq!(dropped.len(), 2);
 
-        assert!(!cache.contains(&key_a_none));
-        assert!(!cache.contains(&key_a_hp5));
+        assert!(!cache.contains(&key_a1));
+        assert!(!cache.contains(&key_a2));
         assert!(cache.contains(&key_b));
         assert_eq!(cache.get(&key_b), Some(&3));
         assert_eq!(cache.len(), 1);
     }
 
     #[test]
-    fn clamp_ev_bounds_to_the_slider_range() {
+    fn clamps_bound_the_develop_controls() {
         assert_eq!(clamp_ev(-99.0), -3.0);
         assert_eq!(clamp_ev(99.0), 4.0);
-        assert_eq!(clamp_ev(0.5), 0.5);
-    }
-
-    #[test]
-    fn clamp_contrast_power_bounds_to_the_slider_range() {
         assert_eq!(clamp_contrast_power(0.0), 0.125);
         assert_eq!(clamp_contrast_power(99.0), 8.0);
-        assert_eq!(clamp_contrast_power(1.0), 1.0);
-    }
-
-    #[test]
-    fn clamp_tone_lift_power_bounds_to_the_slider_range() {
-        assert_eq!(clamp_tone_lift_power(0.0), 0.25);
-        assert_eq!(clamp_tone_lift_power(99.0), 4.0);
-        assert_eq!(clamp_tone_lift_power(1.0), 1.0);
+        assert_eq!(clamp_density(-1.0), 0.0);
+        assert_eq!(clamp_density(99.0), 5.0);
+        assert_eq!(clamp_pivot(-9.0), -0.5);
+        assert_eq!(clamp_pivot(9.0), 0.5);
     }
 
     #[test]
@@ -6083,72 +5542,23 @@ mod tests {
         assert!((contrast_lift(1.0) - 0.0).abs() < 1e-6);
         assert!((contrast_lift(2.0) - 1.0).abs() < 1e-6);
         assert!((contrast_lift(0.5) - (-1.0)).abs() < 1e-6);
-        // Monotone increasing in the power, like the highlights arm.
+        // Monotone increasing in the power.
         let (a, b) = (contrast_lift(0.6), contrast_lift(1.4));
         assert!(a < b);
     }
 
     #[test]
-    fn shadow_lift_value_inverts_the_power_direction() {
-        // Identity sits at the center 0.0 for the stop-based lift value.
-        assert!((shadow_lift(1.0) - 0.0).abs() < 1e-6);
-        // The log flips direction: a shadows power below 1.0 (a lower-tones
-        // lift, white-pivoted) reads as a POSITIVE lift value, so dragging the
-        // slider right brightens the shadows.
-        assert!((shadow_lift(0.5) - 1.0).abs() < 1e-6);
-        assert!((shadow_lift(2.0) - (-1.0)).abs() < 1e-6);
-        // The lift value is monotone decreasing in the power, which is the point.
-        let (a, b) = (shadow_lift(0.6), shadow_lift(1.4));
-        assert!(a > b);
-    }
-
-    #[test]
-    fn highlight_lift_value_follows_the_power_direction() {
-        // Identity sits at the center 0.0.
-        assert!((highlight_lift(1.0) - 0.0).abs() < 1e-6);
-        // The highlights power pivots at the shadow anchor, so a lift drives
-        // the power ABOVE 1.0: a positive lift value must map to power > 1 so
-        // dragging the highlights slider right brightens the upper tones.
-        assert!((highlight_lift(2.0) - 1.0).abs() < 1e-6);
-        assert!((highlight_lift(0.5) - (-1.0)).abs() < 1e-6);
-        // Monotone increasing in the power — the opposite of the shadows arm.
-        let (a, b) = (highlight_lift(0.6), highlight_lift(1.4));
-        assert!(a < b);
-    }
-
-    #[test]
-    fn lift_maps_round_trip_across_the_power_range() {
-        for power in [0.25_f32, 0.5, 1.0, 1.7, 4.0] {
-            let shadow_back = shadow_power_for_lift(shadow_lift(power));
-            assert!(
-                (shadow_back - power).abs() < 1e-5,
-                "shadows power {power} round-tripped to {shadow_back}"
-            );
-            let highlight_back = highlight_power_for_lift(highlight_lift(power));
-            assert!(
-                (highlight_back - power).abs() < 1e-5,
-                "highlights power {power} round-tripped to {highlight_back}"
-            );
-        }
+    fn contrast_lift_map_round_trips_across_the_power_range() {
         for power in [0.125_f32, 0.25, 1.0, 2.0, 4.0, 8.0] {
-            let contrast_back = contrast_power_for_lift(contrast_lift(power));
+            let back = contrast_power_for_lift(contrast_lift(power));
             assert!(
-                (contrast_back - power).abs() < 1e-5,
-                "contrast power {power} round-tripped to {contrast_back}"
+                (back - power).abs() < 1e-5,
+                "contrast power {power} round-tripped to {back}"
             );
         }
-        // Values leaving the symmetric windows clamp to the power endpoints, so
-        // an exited lift track and the clamps agree on bounds. Contrast spans
-        // ±3 stops; Highlights/Shadows ±2.
-        assert_eq!(shadow_power_for_lift(3.0), 0.25);
-        assert_eq!(shadow_power_for_lift(-3.0), 4.0);
-        assert_eq!(highlight_power_for_lift(3.0), 4.0);
-        assert_eq!(highlight_power_for_lift(-3.0), 0.25);
+        // Values leaving the symmetric window clamp to the power endpoints.
         assert_eq!(contrast_power_for_lift(3.0), 8.0);
         assert_eq!(contrast_power_for_lift(-3.0), 0.125);
-        // The identity lift value maps to the identity power on every arm.
-        assert!((shadow_power_for_lift(0.0) - 1.0).abs() < 1e-6);
-        assert!((highlight_power_for_lift(0.0) - 1.0).abs() < 1e-6);
         assert!((contrast_power_for_lift(0.0) - 1.0).abs() < 1e-6);
     }
 
@@ -6188,39 +5598,48 @@ mod tests {
             edit_adjust_for("]", false, true),
             Some(EditAdjust::Contrast(EDIT_NUDGE_CURVE))
         );
-        // Highlights pair: `;`/`'` coarse, Shift nudge.
+        // Black pair: `;`/`'` coarse, Shift nudge.
         assert_eq!(
             edit_adjust_for(";", false, false),
-            Some(EditAdjust::Highlights(-EDIT_STEP_CURVE))
+            Some(EditAdjust::Black(-EDIT_STEP_CURVE))
         );
         assert_eq!(
             edit_adjust_for("'", false, false),
-            Some(EditAdjust::Highlights(EDIT_STEP_CURVE))
+            Some(EditAdjust::Black(EDIT_STEP_CURVE))
         );
         assert_eq!(
             edit_adjust_for(";", false, true),
-            Some(EditAdjust::Highlights(-EDIT_NUDGE_CURVE))
+            Some(EditAdjust::Black(-EDIT_NUDGE_CURVE))
         );
         assert_eq!(
             edit_adjust_for("'", false, true),
-            Some(EditAdjust::Highlights(EDIT_NUDGE_CURVE))
+            Some(EditAdjust::Black(EDIT_NUDGE_CURVE))
         );
-        // Shadows pair: `,`/`.` coarse, Shift nudge.
+        // White pair: `,`/`.` coarse, Shift nudge.
         assert_eq!(
             edit_adjust_for(",", false, false),
-            Some(EditAdjust::Shadows(-EDIT_STEP_CURVE))
+            Some(EditAdjust::White(-EDIT_STEP_CURVE))
         );
         assert_eq!(
             edit_adjust_for(".", false, false),
-            Some(EditAdjust::Shadows(EDIT_STEP_CURVE))
+            Some(EditAdjust::White(EDIT_STEP_CURVE))
         );
         assert_eq!(
             edit_adjust_for(",", false, true),
-            Some(EditAdjust::Shadows(-EDIT_NUDGE_CURVE))
+            Some(EditAdjust::White(-EDIT_NUDGE_CURVE))
         );
         assert_eq!(
             edit_adjust_for(".", false, true),
-            Some(EditAdjust::Shadows(EDIT_NUDGE_CURVE))
+            Some(EditAdjust::White(EDIT_NUDGE_CURVE))
+        );
+        // Pivot pair: `u`/`i` coarse, Shift nudge.
+        assert_eq!(
+            edit_adjust_for("u", false, false),
+            Some(EditAdjust::Pivot(-EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            edit_adjust_for("i", false, false),
+            Some(EditAdjust::Pivot(EDIT_STEP_CURVE))
         );
         // The VIM movement keys are NOT edit adjusts — `h`/`j`/`k`/`l` route to
         // `Message::Nav` in the subscription (mirroring the arrows), so they map
@@ -6694,168 +6113,29 @@ mod tests {
         assert_eq!(&out[0..4], &[4, 4, 4, 255], "crop center pixel survives");
     }
 
-
-    /// The GPU side of the bake-parity tests: a Rust simulation of `exposure.wgsl`
-    /// `shade()` where the tone remap comes from the same 2048×1 R16Float tone
-    /// LUT the shader texture-samples (decoded to f32 + linear interpolation,
-    /// via [`shader::sample_tone_lut_f32`]). The CPU bakes call [`tone_model`]
-    /// exactly; the only approximation anywhere is the LUT itself, so this
-    /// diffing bounds that approximation rather than a duplicated expression.
-    #[allow(clippy::too_many_arguments)]
-    fn gpu_fragment(
-        mono: f32,
-        exposure: f32,
-        inv: bool,
-        inv_base: f32,
-        inv_d_max: f32,
-        inv_gamma: f32,
-        region_shadows: f32,
-        region_highlights: f32,
-        tone_lut: &[f32],
-    ) -> f32 {
-        let mono_linear = mono;
-        let v = if inv {
-            let transmission = mono_linear * exposure;
-            let clamped = transmission.clamp(1e-6, inv_base);
-            let density = -(clamped / inv_base).ln() / 10.0_f32.ln();
-            let position = (density / inv_d_max).clamp(0.0, 1.0);
-            let positive = position.powf(inv_gamma);
-            // Density-domain region shape (mirrors the WGSL film branch:
-            // `film::region_shape` with K = 2). The film path does NOT sample
-            // the tone LUT.
-            let toe = (1.0 - positive).powf(2.0);
-            let shoulder = positive.powf(2.0);
-            (positive + region_shadows * toe + region_highlights * shoulder)
-                .clamp(0.0, 1.0)
-        } else {
-            let remapped = shader::sample_tone_lut_f32(tone_lut, mono_linear);
-            (remapped * exposure).clamp(0.0, 1.0)
-        };
-        srgb_encode(v)
-    }
-
-    /// Decode a `build_tone_lut` half-float byte buffer back to f32, matching
-    /// what the GPU's R16Float sampler would hand back (modulo the sampler's
-    /// own linear interpolation).
-    fn half_lut_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-        bytes
-            .chunks_exact(2)
-            .map(|c| shader::half_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect()
-    }
-
-    /// Deterministic LCG so the differential tests are reproducible run-to-run.
-    #[allow(clippy::cast_possible_truncation)]
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> f32 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            // Top 23 mantissa bits of [1.0, 2.0), mapped to [0.0, 1.0).
-            let bits = ((self.0 >> 40) as u32 & 0x007F_FFFF) | 0x3F80_0000;
-            f32::from_bits(bits) - 1.0
-        }
-    }
-
     #[test]
-    fn cpu_bake_matches_gpu_lut_simulation_on_random_frames() {
-        // Randomize every input (frame values, EV, curve powers, preset, base
-        // mode) and assert `bake_tone` (grid/export, exact `tone_model`) == the
-        // GPU detail path (the same tone model delivered through a half-float
-        // LUT + linear interpolation, simulated via `gpu_fragment`) — the
-        // structural guarantee that the three render paths cannot drift beyond
-        // the accepted LUT approximation. `pivots_for` is called on the
-        // untouched frame on both sides, so they share identical pivots.
-        let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);
-        for case in 0..64 {
-            let ev = rng.next() * 7.0 - 3.0;
-            let tone = edit_manifest::ToneEdit {
-                exposure_ev: ev,
-                // Contrast spans its full ±3-stop power range (0.125..8.0);
-                // Highlights/Shadows their ±2-stop range (0.25..4.0).
-                curve_contrast: (rng.next() * 6.0 - 3.0).exp2(),
-                curve_highlights: (rng.next() * 4.0 - 2.0).exp2(),
-                curve_shadows: (rng.next() * 4.0 - 2.0).exp2(),
-            };
-            let preset = if rng.next() < 0.5 {
-                FilmPreset::None
-            } else {
-                FilmPreset::Hp5Plus
-            };
-            let base_config = BaseConfig {
-                calibrated: (rng.next() < 0.4).then(|| rng.next() * 0.5 + 0.3),
-                auto: rng.next() < 0.3,
-            };
-            let mut mono: Vec<f32> = (0..256).map(|_| rng.next()).collect();
-            // Stress the clamps with hard extremes.
-            mono[0] = 0.0;
-            mono[1] = 1.0;
-            mono[64] = 1e-6;
-
-            let mut baked = mono.clone();
-            bake_tone(&mut baked, tone, preset, base_config);
-
-            let (stock_and_base, pivots) = pivots_for(&mono, tone, preset, base_config);
-            let (shadow, mid, white) = pivots;
-            // The positive path delivers the curve through the LUT; the film
-            // path evaluates its density-domain shape inline (mirrored by
-            // `gpu_fragment`).
-            let lut = half_lut_bytes_to_f32(&shader::build_tone_lut(
-                tone.curve_contrast,
-                tone.curve_highlights,
-                tone.curve_shadows,
-                shadow,
-                mid,
-                white,
-            ));
-            // Stop lifts recovered from the decoded powers, matching the maps
-            // the app/pipeline use.
-            let contrast_stops = tone.curve_contrast.log2();
-            let shadows_stops = -tone.curve_shadows.log2();
-            let highlights_stops = tone.curve_highlights.log2();
-            let (exposure, inv, inv_base, inv_d_max, inv_gamma, region_shadows, region_highlights) =
-                match stock_and_base {
-                    Some((stock, base)) => (
-                        shader::sensor_gain(tone.exposure_ev, true),
-                        true,
-                        base,
-                        crate::film::effective_d_max(stock.d_max, contrast_stops),
-                        stock.gamma,
-                        crate::film::region_strength(shadows_stops),
-                        crate::film::region_strength(highlights_stops),
-                    ),
-                    None => (
-                        shader::sensor_gain(tone.exposure_ev, false),
-                        false,
-                        1.0,
-                        1.0,
-                        1.0,
-                        0.0,
-                        0.0,
-                    ),
-                };
-
-            for (i, &sample) in mono.iter().enumerate() {
-                let reference = gpu_fragment(
-                    sample,
-                    exposure,
-                    inv,
-                    inv_base,
-                    inv_d_max,
-                    inv_gamma,
-                    region_shadows,
-                    region_highlights,
-                    &lut,
-                );
-                let baked_value = baked[i];
-                assert!(
-                    (baked_value - reference).abs() <= 5e-4,
-                    "case {case} pixel {i} ({sample}): bake {baked_value} vs gpu {reference}"
-                );
-            }
+    fn bake_develop_matches_the_develop_function() {
+        // The CPU bake (`bake_develop`) must be exactly sRGB(develop.apply) —
+        // the shared pointwise math the GPU evaluates per fragment.
+        let mut mono: Vec<f32> = (0..256).map(|i| i as f32 / 255.0).collect();
+        mono[0] = 0.0;
+        let develop = crate::film::Develop {
+            exposure_ev: 0.4,
+            base: 0.82,
+            black: 0.1,
+            white: 2.4,
+            contrast: 1.5,
+            pivot_offset: -0.2,
+        };
+        let mut baked = mono.clone();
+        bake_develop(&mut baked, develop);
+        for (i, &sample) in mono.iter().enumerate() {
+            let expected = srgb_encode(crate::film::Develop::apply(&develop, sample));
+            assert!(
+                (baked[i] - expected).abs() < 1e-6,
+                "pixel {i}: {} vs {expected}",
+                baked[i]
+            );
         }
     }
 }

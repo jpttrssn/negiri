@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 use crate::edit_manifest;
 use crate::error::FrameError;
 use crate::exif_writer;
-use crate::film::{BaseConfig, FilmPreset};
+use crate::film::Develop;
 use crate::fl;
 use crate::pipeline::{
-    DetailDecode, bake_geometry, bake_geometry16, bake_tone, decode_raw_detail, scale_crop,
+    DetailDecode, bake_develop, bake_geometry, bake_geometry16, decode_raw_detail, scale_crop,
 };
 
 /// A curated export preset: the default combination of format, bit depth, and
@@ -280,16 +280,8 @@ pub(crate) fn export_fraction(done: usize, total: usize) -> f32 {
 pub(crate) async fn export_frames(
     dir: PathBuf,
     dest: PathBuf,
-    frames: Vec<(
-        String,
-        edit_manifest::ToneEdit,
-        edit_manifest::CropMargins,
-        u8,
-        usize,
-    )>,
+    frames: Vec<(String, Develop, edit_manifest::CropMargins, u8, usize)>,
     options: ExportOptions,
-    preset: FilmPreset,
-    base_config: BaseConfig,
     start_date: Option<String>,
     mut progress: impl FnMut(usize, usize) + Send,
 ) -> (usize, usize, usize) {
@@ -322,8 +314,6 @@ pub(crate) async fn export_frames(
             crop,
             rotation,
             options,
-            preset,
-            base_config,
             start_date.clone(),
         )
         .await
@@ -356,12 +346,10 @@ pub(crate) async fn export_one(
     name: String,
     index: usize,
     dest: PathBuf,
-    tone: edit_manifest::ToneEdit,
+    develop: Develop,
     crop: edit_manifest::CropMargins,
     rotation: u8,
     options: ExportOptions,
-    preset: FilmPreset,
-    base_config: BaseConfig,
     start_date: Option<String>,
 ) -> Result<(), FrameError> {
     let max_edge = options.size.long_edge();
@@ -375,13 +363,10 @@ pub(crate) async fn export_one(
         width,
         height,
         src_long_edge,
-        inversion: _,
     } = decode_raw_detail(
         dir.clone(),
         name.clone(),
         if max_edge == 0 { u32::MAX } else { max_edge },
-        preset,
-        base_config,
     )
     .await
     .map_err(|err| {
@@ -401,12 +386,10 @@ pub(crate) async fn export_one(
     let source_h = (height as f32 / factor).round() as u32;
     let crop = scale_crop(crop, source_w, source_h, width, height);
 
-    // Bake the stored tone curve, exposure, then sRGB-encode via the one
-    // shared tail (`bake_tone`) — the detail shader's exact ordering per preset:
-    // film negatives get the EV gain on the true sensor data first (2^-EV from
-    // the user-space +EV, `sensor_gain`'s twin), then the density inversion,
-    // then the EV-exact pivoted curve; positive scans get curve then gain.
-    bake_tone(&mut mono, tone, preset, base_config);
+    // Bake the resolved density develop then sRGB-encode via the one shared
+    // tail (`bake_develop`) — the exact pointwise math the detail shader runs
+    // per fragment, so export == detail hold structurally.
+    bake_develop(&mut mono, develop);
 
     // When the roll carries a start date, stamp each output's DateTimeOriginal
     // with `start date @ 00:00:00 + frame's full-roll offset in seconds` — the

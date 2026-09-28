@@ -8,13 +8,11 @@ use std::path::Path;
 
 use crate::app::{
     AppModel, Message, Roll, RollDateField, THUMB_SIZE, TILE_ASPECT, Tile, Thumb, contrast_lift,
-    contrast_power_for_lift, detail_zoom_delta, highlight_lift, highlight_power_for_lift,
-    shadow_lift, shadow_power_for_lift,
+    contrast_power_for_lift, detail_zoom_delta,
 };
 use crate::detail_area::DetailArea;
 use crate::error::FrameError;
 use crate::exif_writer;
-use crate::film::{BaseMode, FILM_CHOICES, FilmPreset};
 use crate::fl;
 use crate::i18n::fl_dyn;
 use crate::library::{
@@ -132,11 +130,7 @@ pub(crate) fn frames_view(app: &AppModel) -> Element<'_, Message> {
             tile_view(
                 tile,
                 app.selected_frames.contains(&tile.name),
-                is_calibration_frame(
-                    app.roll.base_mode(),
-                    app.roll.calibration_frame(),
-                    &tile.name,
-                ),
+                is_calibration_frame(app.roll.calibration_frame(), &tile.name),
             )
         }))
         .fluid(THUMB_SIZE)
@@ -208,63 +202,62 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let label = widget::text(fl!("exposure-label"));
     // The `0.05 EV` step matches `edit_manifest::EV_TICK`, the keyboard nudge,
     // and the fixed-point storage grid.
-    let slider = widget::slider(-3.0..=4.0, app.exposure_ev, Message::ExposureChanged)
+    let slider = widget::slider(-3.0..=4.0, app.tone.exposure_ev, Message::ExposureChanged)
         .step(0.05_f32)
         // A finished drag is an edit flush point.
         .on_release(Message::EditSave);
 
-    // Tone-editing controls. For a film negative these act in the DENSITY
-    // domain (see `docs/tone-model-density.md`): Contrast scales the usable
-    // density window (`d_max · 2^-contrast`) and Highlights/Shadows are the
-    // toe/shoulder region lifts of the normalized positive. For an
-    // already-positive scan they fall back to the pivoted-power curve. Grid
-    // thumbnails are unaffected; every detail open starts from the stored
-    // edits. All three sliders expose their control as a stop-based value
-    // centered on the identity, so dragging right raises contrast / brightens
-    // the region. Contrast spans ±3 stops; Highlights/Shadows span ±2.
+    // Density-develop controls (see `docs/raw-pipeline-rewrite.md`): Contrast is
+    // a power about the midtone pivot (presented as a `±3`-stop lift), Black and
+    // White are density anchors, and the pivot shifts where the contrast bends.
+    // Every detail open starts from the stored edits. When one slider moves the
+    // others travel along so the develop stays fully defined.
     let contrast_label = widget::text(fl!("contrast-label"));
     let contrast_slider = widget::slider(
         -3.0..=3.0,
-        contrast_lift(app.curve_contrast),
-        // When any slider moves, the other values travel along so the
-        // remap always composes the full curve, not a half-updated one.
+        contrast_lift(app.tone.contrast),
         move |lift| {
-            Message::CurveChanged(
+            Message::DevelopChanged(
                 contrast_power_for_lift(lift),
-                app.curve_highlights,
-                app.curve_shadows,
-            )
-        },
-    )
-    .step(0.05_f32)
-    // A finished drag is an edit flush point, like exposure.
-    .on_release(Message::EditSave);
-    let highlights_label = widget::text(fl!("highlights-label"));
-    let highlights_slider = widget::slider(
-        -2.0..=2.0,
-        highlight_lift(app.curve_highlights),
-        move |lift| {
-            Message::CurveChanged(
-                app.curve_contrast,
-                highlight_power_for_lift(lift),
-                app.curve_shadows,
+                app.tone.black,
+                app.tone.white,
+                app.tone.pivot_offset,
             )
         },
     )
     .step(0.05_f32)
     .on_release(Message::EditSave);
-    let shadows_label = widget::text(fl!("shadows-label"));
-    let shadows_slider = widget::slider(
-        -2.0..=2.0,
-        shadow_lift(app.curve_shadows),
-        move |lift| {
-            Message::CurveChanged(
-                app.curve_contrast,
-                app.curve_highlights,
-                shadow_power_for_lift(lift),
-            )
-        },
-    )
+    let black_label = widget::text(fl!("black-label"));
+    let black_slider = widget::slider(-1.0..=1.0, app.tone.black, move |black| {
+        Message::DevelopChanged(
+            app.tone.contrast,
+            black,
+            app.tone.white,
+            app.tone.pivot_offset,
+        )
+    })
+    .step(0.05_f32)
+    .on_release(Message::EditSave);
+    let white_label = widget::text(fl!("white-label"));
+    let white_slider = widget::slider(0.0..=5.0, app.tone.white, move |white| {
+        Message::DevelopChanged(
+            app.tone.contrast,
+            app.tone.black,
+            white,
+            app.tone.pivot_offset,
+        )
+    })
+    .step(0.05_f32)
+    .on_release(Message::EditSave);
+    let pivot_label = widget::text(fl!("pivot-label"));
+    let pivot_slider = widget::slider(-0.5..=0.5, app.tone.pivot_offset, move |pivot| {
+        Message::DevelopChanged(
+            app.tone.contrast,
+            app.tone.black,
+            app.tone.white,
+            pivot,
+        )
+    })
     .step(0.05_f32)
     .on_release(Message::EditSave);
     // Keyboard crop readout + arm hint. The four values are the live margins
@@ -289,10 +282,12 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .push(slider)
         .push(contrast_label)
         .push(contrast_slider)
-        .push(highlights_label)
-        .push(highlights_slider)
-        .push(shadows_label)
-        .push(shadows_slider)
+        .push(black_label)
+        .push(black_slider)
+        .push(white_label)
+        .push(white_slider)
+        .push(pivot_label)
+        .push(pivot_slider)
         .push(reset_all)
         .push(widget::divider::horizontal::default())
         .push(rotation_readout)
@@ -619,44 +614,7 @@ pub(crate) fn roll_info_panel<'a>(
     )
     .width(Length::Fill);
 
-    // The film preset selector: None (no inversion), Generic, then the named
-    // stocks in `FILM_CHOICES` order. Index order MUST match `FilmPreset::index()`.
-    let mut preset_options = Vec::with_capacity(FILM_CHOICES.len());
-    for preset in FILM_CHOICES {
-        match preset.stock() {
-            Some(stock) => preset_options.push(stock.name.to_owned()),
-            None => preset_options.push(fl!("preset-none")),
-        }
-    }
-    let roll_dir = roll.dir.clone();
-    let preset = widget::dropdown::dropdown(
-        preset_options,
-        Some(roll.preset.index()),
-        move |index| Message::RollPresetChanged(roll_dir.clone(), FilmPreset::from_index(index)),
-    )
-    .width(Length::Fill);
-
-    // The base strategy selector: how the roll's black point is resolved. Only
-    // meaningful while a film (inversion) is chosen, so the row is hidden for a
-    // non-inverted roll. Index order MUST match `BaseMode::index()`.
-    let base = if roll.preset.stock().is_some() {
-        let base_dir = roll.dir.clone();
-        let base = widget::dropdown::dropdown(
-            vec![
-                fl!("base-preset"),
-                fl!("base-auto-per-frame"),
-                fl!("base-auto-selected-frame"),
-            ],
-            Some(roll.base_mode.index()),
-            move |index| Message::RollBaseModeChanged(base_dir.clone(), BaseMode::from_index(index)),
-        )
-        .width(Length::Fill);
-        Some(base)
-    } else {
-        None
-    };
-
-    widget::column::with_capacity(14)
+    widget::column::with_capacity(12)
         .push(name)
         .push(widget::divider::horizontal::default())
         .push(widget::text::body(fl!(
@@ -683,18 +641,6 @@ pub(crate) fn roll_info_panel<'a>(
             end_draft,
             RollDateField::End,
         ))
-        .push(widget::divider::horizontal::default())
-        .push(widget::text(fl!("preset-label")))
-        .push(preset)
-        .push_maybe(base.map(|base| {
-            let row: Element<'_, Message> = widget::column::with_capacity(2)
-                .push(widget::text(fl!("base-label")))
-                .push(base)
-                .spacing(space_xs)
-                .width(Length::Fill)
-                .into();
-            row
-        }))
         .push(widget::divider::horizontal::default())
         .push(remove)
         .spacing(space_xs)
@@ -956,12 +902,11 @@ fn tile_view(tile: &Tile, selected: bool, is_calibration_frame: bool) -> Element
     stack.width(Length::Fill).height(Length::Fill).into()
 }
 
-/// Whether `name` carries the auto-calibration dot: it is the roll's designated
-/// calibration frame AND the roll's base mode is [`BaseMode::AutoSelectedFrame`]
-/// (the only mode that reads a designated frame).
+/// Whether `name` carries the calibration dot: it is the roll's designated
+/// calibration frame (whose measured plateau pins the roll's base).
 #[must_use]
-fn is_calibration_frame(base_mode: BaseMode, calibration_frame: Option<&str>, name: &str) -> bool {
-    base_mode == BaseMode::AutoSelectedFrame && calibration_frame == Some(name)
+fn is_calibration_frame(calibration_frame: Option<&str>, name: &str) -> bool {
+    calibration_frame == Some(name)
 }
 
 /// The auto-calibration indicator: a small theme-accent circle pinned to the
@@ -1085,30 +1030,11 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
 mod tests {
     use super::*;
     #[test]
-    fn is_calibration_frame_gates_on_the_base_mode_and_designated_name() {
-        // The dot only appears for the designated frame under the
-        // AutoSelectedFrame base mode.
+    fn is_calibration_frame_matches_the_designated_name() {
+        // The dot appears only for the designated calibration frame.
         let frame = "IMG_0007.DNG";
-        assert!(is_calibration_frame(
-            BaseMode::AutoSelectedFrame,
-            Some(frame),
-            frame
-        ));
-        // Same base mode, wrong frame → no dot.
-        assert!(!is_calibration_frame(
-            BaseMode::AutoSelectedFrame,
-            Some(frame),
-            "IMG_0008.DNG"
-        ));
-        // No designated frame yet → no dot.
-        assert!(!is_calibration_frame(
-            BaseMode::AutoSelectedFrame,
-            None,
-            frame
-        ));
-        // Every other base mode ignores the designated frame.
-        for mode in [BaseMode::Preset, BaseMode::AutoPerFrame] {
-            assert!(!is_calibration_frame(mode, Some(frame), frame));
-        }
+        assert!(is_calibration_frame(Some(frame), frame));
+        assert!(!is_calibration_frame(Some(frame), "IMG_0008.DNG"));
+        assert!(!is_calibration_frame(None, frame));
     }
 }

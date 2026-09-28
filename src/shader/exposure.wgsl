@@ -56,34 +56,23 @@ struct Uniforms {
     // always visible around the frame. Zooming in grows the image into the
     // padding (it is a minimum, not a clip). 0.0 = no padding (normal mode).
     pad: f32,
-    // When non-zero, the texture is a TRUE sensor-linear NEGATIVE (a film
-    // preset) that must be density-inverted per fragment: `exposure` multiplies
-    // the sensor data FIRST, then the inversion maps transmission → positive,
-    // and only then the curve applies. When zero (an already-positive scan) the
-    // pipeline is unchanged: curve, then `exposure` gain, then sRGB.
-    inv: f32,
-    // Inversion params (valid when `inv != 0.0`), mirroring film::invert_value:
-    // `inv_base` is the clear-film transmission (positive black), `inv_d_max`
-    // the usable density range (positive white), `inv_gamma` the density-space
-    // tone exponent.
-    inv_base: f32,
-    // The EFFECTIVE usable density range: the stock's `d_max` scaled by the
-    // user Contrast (`d_max · 2^-contrast`), so the window can be tightened or
-    // widened in log-density.
-    inv_d_max: f32,
-    inv_gamma: f32,
-    // Density-domain region lifts (signed, normalized-positive units) for the
-    // film path: a toe mask weighted `(1-p)^2` and a shoulder mask `p^2`, each
-    // vanishing at the opposite end so the controls stay independent.
-    region_shadows: f32,
-    region_highlights: f32,
+    // --- Film develop (density domain), mirroring `film::Develop` ---
+    // `dev_base` is the clear-film transmission (positive black anchor); the
+    // `exposure` gain above is applied to the transmission FIRST, then the
+    // density is measured and the pointwise develop maps it to a positive.
+    dev_base: f32,
+    // Density mapped to output black / white (the `black`/`white` anchors).
+    dev_black: f32,
+    dev_white: f32,
+    // Contrast power about the pivot (1.0 = identity).
+    dev_contrast: f32,
+    // Signed offset from the [black,white] midpoint the contrast bends around.
+    dev_pivot: f32,
 };
 
 @group(0) @binding(0) var t_mono: texture_2d<f32>;
 @group(0) @binding(1) var s_mono: sampler;
 @group(0) @binding(2) var<uniform> uniforms: Uniforms;
-@group(0) @binding(3) var t_tone: texture_2d<f32>;
-@group(0) @binding(4) var s_tone: sampler;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -273,56 +262,33 @@ fn view_uv(frag: vec2<f32>) -> ViewSample {
 
 /// Sample + tone-curve + exposure + sRGB-encode, shared by both the base
 /// zoom-crop layer and the full-frame dim overlay so they match exactly.
+/// The pointwise density develop, mirroring `film::Develop::apply`:
+/// EV gain → density → black/white window → pivot-power contrast. Kept in
+/// lockstep with the Rust twin by the `develop_matches_wgsl_transcription` test.
+fn develop(transmission: f32) -> f32 {
+    // `uniforms.exposure` is the linear sensor gain (2^-EV for a film negative,
+    // from the CPU), so +EV lowers the transmission and brightens the positive.
+    let value = clamp(transmission * uniforms.exposure, 1e-6, uniforms.dev_base);
+    let density = -log(value / uniforms.dev_base) / log(10.0);
+    let span = max(abs(uniforms.dev_white - uniforms.dev_black), 1e-4);
+    let x = clamp((density - uniforms.dev_black) / span, 0.0, 1.0);
+    let pivot = clamp(0.5 + uniforms.dev_pivot, 1e-4, 1.0 - 1e-4);
+    var shaped: f32;
+    if (x <= pivot) {
+        shaped = pivot * pow(x / pivot, uniforms.dev_contrast);
+    } else {
+        shaped = 1.0 - (1.0 - pivot) * pow((1.0 - x) / (1.0 - pivot), uniforms.dev_contrast);
+    }
+    return clamp(shaped, 0.0, 1.0);
+}
+
 fn shade(uv: vec2<f32>) -> f32 {
     // Sample within [0, 1] (clamped to avoid sampler wrap reads at sub-rect
     // edges when rasterizing across the contained boundary). The texture is
-    // TRUE sensor-linear data for every preset: linear `[0,1]` relative to the
-    // sensor white point.
+    // TRUE sensor-linear data: linear `[0,1]` relative to the sensor white
+    // point.
     let mono_linear = textureSample(t_mono, s_mono, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0))).r;
-
-    var v: f32;
-    if uniforms.inv != 0.0 {
-        // --- Film negative: EV acts on the true sensor data FIRST ---
-        // The gain already carries the inverted sign (`2^-EV` from the CPU), so
-        // +EV lowers the transmission, raises the density, and brightens the
-        // positive — the same direction the non-inverted preset shows.
-        let transmission = mono_linear * uniforms.exposure;
-        // Density-space inversion (CPU twin: `film::invert_value`):
-        //   value = clamp(transmission, MIN_TRANSMISSION, base)
-        //   density = log10(base / value)
-        //   position = clamp(density / d_max, 0, 1)
-        //   positive = position^gamma
-        let clamped = clamp(transmission, 1e-6, uniforms.inv_base);
-        let density = -log(clamped / uniforms.inv_base) / log(10.0);
-        let position = clamp(density / uniforms.inv_d_max, 0.0, 1.0);
-        let positive = pow(position, uniforms.inv_gamma);
-        // Density-domain region shape (CPU twin: `film::region_shape`): a toe
-        // lift and a shoulder lift, each a region-local additive mask whose
-        // weight vanishes at the opposite end, so the two controls are
-        // independent. `K = 2` matches `film::REGION_MASK_K`.
-        let toe = pow(1.0 - positive, 2.0);
-        let shoulder = pow(positive, 2.0);
-        v = clamp(
-            positive
-                + uniforms.region_shadows * toe
-                + uniforms.region_highlights * shoulder,
-            0.0,
-            1.0,
-        );
-    } else {
-        // --- Already-positive scan (unchanged path) ---
-        // Live tone curve re-shapes the baked positive's values via the same
-        // gamma-domain tone LUT: the CPU folds the contrast power (pivot at the
-        // image's measured mid-gray), the shadows power (pivot at the measured
-        // white point), and the highlights power (pivot at the measured shadow
-        // anchor) into the LUT at build time. Identity at the defaults
-        // (byte-identical render).
-        let remapped = textureSample(t_tone, s_tone, vec2<f32>(pow(mono_linear, 0.4545455), 0.5)).r
-            / 512.0;
-        // Linear-light exposure via the Rust-computed 2^EV gain.
-        v = clamp(remapped * uniforms.exposure, 0.0, 1.0);
-    }
-    return linear_to_srgb(v);
+    return linear_to_srgb(develop(mono_linear));
 }
 
 @fragment
