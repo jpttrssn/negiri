@@ -4,15 +4,21 @@ Reference for continuing work on the roll library (rolls ↔ frame grid ↔ deta
 
 ## Current state
 
-> **RAW pipeline rewrite (steps 1–5) landed** on `raw-pipeline-rewrite`: the
+> **RAW pipeline rewrite (steps 1–8) landed** on `raw-pipeline-rewrite`: the
 > film path is now **film-only and density-domain** with one pointwise
 > `film::Develop` (exposure, contrast, black, white, midtone pivot) shared by
 > the WGSL detail shader and the CPU bakes. Film presets / `MonoStock` /
 > region masks / `unsharp_mask` / the tone LUT are gone; the roll's clear-film
-> base comes from a designated calibration frame. See
-> `docs/raw-pipeline-rewrite.md`. Bullets below that still describe presets or
-> the positive-scan path are pre-rewrite and pending cleanup; the histogram
-> widget (step 6) is the main remaining piece.
+> base comes from a designated calibration frame. The editing drawer leads
+> with a **histogram (Output/Input axis toggle, Output default) + classic
+> `T(p)` curve overlay** (`pipeline::histogram_from_develop` +
+> `ui::HistogramPlot`; `film::Develop::curve_point` is the straight diagonal at
+> the identity controls, and exposure moves the bars, not the curve).
+> `just check` + `cargo test --locked` are green (201 tests); the only
+> outstanding item is the manual visual check on real negatives. See
+> `docs/raw-pipeline-rewrite.md`. Bullets
+> below that still describe presets or the positive-scan path are pre-rewrite
+> and pending cleanup.
 
 ### File layout
 

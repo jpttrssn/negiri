@@ -686,6 +686,35 @@ mod tests {
     }
 
     #[test]
+    fn tone_builds_a_develop_with_the_roll_base() {
+        // `to_develop` pins the roll's resolved clear-film base and carries the
+        // stored shape controls straight through.
+        let tone = ToneEdit {
+            exposure_ev: -0.4,
+            contrast: 1.6,
+            black: 0.15,
+            white: 2.9,
+            pivot_offset: -0.1,
+        };
+        let develop = tone.to_develop(0.71);
+        assert!((develop.base - 0.71).abs() < 1e-6);
+        assert!((develop.exposure_ev - (-0.4)).abs() < 1e-6);
+        assert!((develop.contrast - 1.6).abs() < 1e-6);
+        assert!((develop.black - 0.15).abs() < 1e-6);
+        assert!((develop.white - 2.9).abs() < 1e-6);
+        assert!((develop.pivot_offset - (-0.1)).abs() < 1e-6);
+        // The identity tone yields a develop at that base whose shape controls
+        // are identity; only the exposure carries the default `+0.7 EV`.
+        let identity = ToneEdit::identity().to_develop(0.8);
+        assert!((identity.base - 0.8).abs() < 1e-6);
+        assert!((identity.exposure_ev - DEFAULT_EXPOSURE_EV).abs() < 1e-6);
+        assert!((identity.contrast - 1.0).abs() < 1e-6);
+        assert!(identity.black.abs() < 1e-6);
+        assert!((identity.white - DEFAULT_WHITE).abs() < 1e-6);
+        assert!(identity.pivot_offset.abs() < 1e-6);
+    }
+
+    #[test]
     fn round_trip_preserves_edits_and_name() {
         let dir = temp_dir("roundtrip");
         std::fs::create_dir_all(&dir).unwrap();

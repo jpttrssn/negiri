@@ -13,7 +13,9 @@ use crate::library::{
     LibraryCell, MonthAliases, library_cell_index, library_cells, nav_target, paginate,
     record_roll_dates, record_roll_name, roll_dates_valid, valid_iso_date,
 };
-use crate::pipeline::{DetailDecode, convert_thumbnail, decode_raw_detail, resized_dims};
+use crate::pipeline::{
+    DetailDecode, convert_thumbnail, decode_raw_detail, histogram_from_develop, resized_dims,
+};
 use crate::shader;
 use crate::ui::{
     FrameMeta, editing_panel, frame_info_panel, frames_view, help_overlay, library_view,
@@ -31,6 +33,7 @@ use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, image::Handle, menu, toaster};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
@@ -108,6 +111,10 @@ const CROP_MODE_PADDING: f32 = 100.0;
 /// Maximum detail-view zoom in `log2` units: 1.0 = contain fit, each +1
 /// doubles the rendered scale, so this caps at 2^6 = 64× the fit scale.
 const MAX_DETAIL_ZOOM: f32 = 7.0;
+
+/// Bins in the drawer histogram (post-sRGB display axis). 256 keeps the plot
+/// crisp at the drawer width while staying cheap to bin on a slider drag.
+const HISTOGRAM_BINS: usize = 256;
 
 /// Detail-view zoom (log2 units) at which the native hi-res decode is
 /// prefetched on a preview whose 1:1 cap sits above it. 2.0 = 2× contain:
@@ -289,6 +296,29 @@ pub(crate) struct AppModel {
     /// Most recent cursor position over the detail preview, widget-relative
     /// logical points; anchors wheel-zoom at the cursor.
     detail_cursor: Option<Point>,
+    /// The decoded overview mono for the open frame, sampled to build the
+    /// drawer histogram. Shared as an `Arc` so a per-tick histogram request
+    /// clones only a refcount, never the multi-MB buffer. Built once per decode
+    /// landing.
+    histogram_mono: Option<Arc<Vec<f32>>>,
+    /// Binned histogram of the develop (the drawer's top plot), or `None`
+    /// before the first decode/compute lands.
+    pub(crate) histogram: Option<Vec<f32>>,
+    /// Which tone axis the drawer histogram bins over (Output = the developed
+    /// result, the default; Input = the develop's input tone, sharing the tone
+    /// curve's axis). User-selected; not persisted to the manifest, but kept
+    /// across frames and opens while the app runs.
+    pub(crate) histogram_mode: crate::pipeline::HistogramMode,
+    /// Monotonic generation for histogram requests; a landed result is applied
+    /// only when its generation still matches (a newer request superseded it).
+    histogram_generation: u64,
+    /// True while a histogram compute is in flight. New requests while busy only
+    /// set [`Self::histogram_dirty`], coalescing a fast slider drag into at most
+    /// one running + one queued compute instead of one per tick.
+    histogram_inflight: bool,
+    /// Set when a develop change arrived while a compute was in flight, so the
+    /// landing re-runs once for the latest develop.
+    histogram_dirty: bool,
     /// The live density develop previewed in the detail view: exposure plus the
     /// four shape controls (contrast, black, white, midtone pivot). Loaded from
     /// the stored manifest on open and applied to the GPU shader as uniforms.
@@ -596,6 +626,13 @@ pub(crate) enum Message {
     /// A neighbor preload decode finished. Unlike [`Message::DetailReady`] this
     /// only lands into the detail LRU cache; it never becomes the active shader.
     DetailPreloaded(PathBuf, String, Result<DetailDecode, FrameError>),
+    /// A drawer histogram compute landed: the binned developed mono plus the
+    /// measured input density range for `serial` (applied only while it is
+    /// still the latest request).
+    HistogramReady(u64, Vec<f32>),
+    /// The user toggled the drawer histogram between the develop's output
+    /// distribution (default) and its input tone axis.
+    SetHistogramMode(crate::pipeline::HistogramMode),
     /// The startup roll scan finished.
     RollsLoaded(Vec<Roll>),
     /// A single roll was scanned after being added; push it into the library.
@@ -976,6 +1013,12 @@ impl cosmic::Application for AppModel {
             detail_pan: Point::default(),
             detail_panning: false,
             detail_cursor: None,
+            histogram_mono: None,
+            histogram: None,
+            histogram_mode: crate::pipeline::HistogramMode::default(),
+            histogram_generation: 0,
+            histogram_inflight: false,
+            histogram_dirty: false,
             tone: edit_manifest::ToneEdit::default(),
             crop: edit_manifest::CropMargins::default(),
             roll_date_drafts: RollDateDrafts {
@@ -1644,6 +1687,30 @@ impl cosmic::Application for AppModel {
                 self.handle_detail_preloaded(&dir, &name, result)
             }
 
+            Message::HistogramReady(generation, bins) => {
+                self.histogram_inflight = false;
+                if generation == self.histogram_generation {
+                    self.histogram = Some(bins);
+                }
+                // A develop change arrived mid-compute: run once more for the
+                // latest state (coalescing a fast drag into two computes total).
+                if self.histogram_dirty {
+                    self.histogram_dirty = false;
+                    return self.request_histogram();
+                }
+                Task::none()
+            }
+
+            Message::SetHistogramMode(mode) => {
+                if self.histogram_mode != mode {
+                    self.histogram_mode = mode;
+                    // Re-bin for the new axis; the generation guard drops any
+                    // in-flight compute for the old mode.
+                    return self.request_histogram();
+                }
+                Task::none()
+            }
+
             Message::ThumbnailActivated(name) => self.open_frame(&name),
 
             Message::DetailFadeTick => {
@@ -1663,7 +1730,7 @@ impl cosmic::Application for AppModel {
                 // RAM-only until an edit flush point; the shader stays live.
                 // Shared with the keyboard `AdjustEdit` path via `set_exposure`.
                 self.set_exposure(ev);
-                Task::none()
+                self.request_histogram()
             }
 
             Message::AdjustEdit(adjust) => {
@@ -1697,7 +1764,7 @@ impl cosmic::Application for AppModel {
                 // Every other adjust acts as usual.
                 self.editing_key_held = true;
                 self.apply_edit_adjust(adjust);
-                Task::none()
+                self.request_histogram()
             }
 
             Message::EditKeyReleased => {
@@ -1780,7 +1847,7 @@ impl cosmic::Application for AppModel {
                 // `DetailClosed`, window close) — same lifecycle as exposure.
                 // Shared with the keyboard `AdjustEdit` path via `set_develop`.
                 self.set_develop_shape(contrast, black, white, pivot);
-                Task::none()
+                self.request_histogram()
             }
 
             Message::ResetAll => {
@@ -3170,7 +3237,7 @@ impl AppModel {
                 "cache hit: {name} {width}x{height} (src {src_long_edge})"
             ));
             self.install_detail_shader(mono, width, height, src_long_edge);
-            return Task::none();
+            return self.request_histogram();
         }
 
         detail_trace(format_args!(
@@ -3202,6 +3269,10 @@ impl AppModel {
     ) {
         let image_id = self.next_image_id;
         self.next_image_id = self.next_image_id.wrapping_add(1);
+        // Share the overview mono (a refcount, not a buffer copy) so the drawer
+        // histogram can be recomputed on the blocking pool as the develop
+        // changes.
+        self.histogram_mono = Some(Arc::new(mono.clone()));
         self.detail_shader = Some(shader::DetailProgram::new(
             mono,
             width,
@@ -3233,6 +3304,34 @@ impl AppModel {
         if src_long_edge <= HI_RES_SIZE {
             self.detail_native_queued = true;
         }
+    }
+
+    /// Schedules a drawer-histogram recompute for the current develop, from the
+    /// shared overview mono on the blocking pool.
+    ///
+    /// Coalesces: while a compute is in flight a new request only marks the
+    /// histogram dirty (the landing re-runs once), so a fast slider drag does
+    /// at most one running + one queued pass instead of one per tick. The `Arc`
+    /// clone is a refcount bump, never a buffer copy. A no-op with no decoded
+    /// mono (nothing to sample).
+    fn request_histogram(&mut self) -> Task<cosmic::Action<Message>> {
+        let Some(mono) = self.histogram_mono.clone() else {
+            self.histogram = None;
+            return Task::none();
+        };
+        if self.histogram_inflight {
+            self.histogram_dirty = true;
+            return Task::none();
+        }
+        let develop = self.tone.to_develop(self.roll.base_or_default());
+        self.histogram_generation = self.histogram_generation.wrapping_add(1);
+        let generation = self.histogram_generation;
+        self.histogram_inflight = true;
+        let mode = self.histogram_mode;
+        cosmic::task::future(async move {
+            let bins = histogram_from_develop(mono.as_slice(), develop, HISTOGRAM_BINS, mode);
+            Message::HistogramReady(generation, bins)
+        })
     }
 
     /// Handles a finished neighbor preload decode: lands the overview into the
@@ -3351,6 +3450,14 @@ impl AppModel {
         // context) goes away; a late `EditKeyReleased` will find it clear and
         // no-op rather than committing a stale selection.
         self.editing_key_held = false;
+        self.histogram_mono = None;
+        self.histogram = None;
+        // Bump the generation so an in-flight histogram compute for the closing
+        // frame can never paint over the next open, and reset the coalescing
+        // flags for the next frame.
+        self.histogram_generation = self.histogram_generation.wrapping_add(1);
+        self.histogram_inflight = false;
+        self.histogram_dirty = false;
         self.tone = edit_manifest::ToneEdit::default();
         self.crop = edit_manifest::CropMargins::default();
         self.rotation = 0;
@@ -3927,6 +4034,10 @@ impl AppModel {
                     }
                     let image_id = self.next_image_id;
                     self.next_image_id = self.next_image_id.wrapping_add(1);
+                    // Share the overview mono for the drawer histogram (a
+                    // refcount, recomputed on the blocking pool as the develop
+                    // changes).
+                    self.histogram_mono = Some(Arc::new(mono.clone()));
                     self.detail_shader = Some(shader::DetailProgram::new(
                         mono,
                         width,
@@ -4003,6 +4114,9 @@ impl AppModel {
                     ));
                     return self.decode_detail_next();
                 }
+            }
+            if landed {
+                return self.request_histogram();
             }
         } else {
             detail_trace(format_args!("arrived superseded: {name}"));

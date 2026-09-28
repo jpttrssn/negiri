@@ -22,7 +22,7 @@ use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
 use cosmic::iced::{ContentFit, Length};
 use cosmic::prelude::*;
-use cosmic::widget::{self, icon};
+use cosmic::widget::{self, canvas, icon};
 
 /// Basic EXIF readout for the frame-info drawer, parsed lazily from the RAW
 /// file on demand and cached on its [`Tile`]. Every field is an already
@@ -188,6 +188,7 @@ pub(crate) fn frames_view(app: &AppModel) -> Element<'_, Message> {
 /// shader is still loading, since `detail_view` already shows the cached
 /// thumbnail during that brief decode gap. The drawer pane supplies the
 /// width and padding, so the panel fills the available space.
+#[allow(clippy::too_many_lines)] // one linear push per control; no nested logic
 pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
@@ -198,6 +199,32 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
             .width(Length::Fill)
             .into();
     }
+
+    // Input-tone histogram + classic `T(p)` curve overlay at the top of the
+    // drawer (see `docs/raw-pipeline-rewrite.md`): one fixed `[0,1]` axis, the
+    // curve the straight diagonal at the identity controls. Drawn only once a
+    // bin set has landed.
+    let histogram = widget::canvas(HistogramPlot {
+        bins: app.histogram.as_deref(),
+        develop: app.tone.to_develop(app.roll.base_or_default()),
+    })
+    .width(Length::Fill)
+    .height(Length::Fixed(HISTOGRAM_HEIGHT));
+
+    // Histogram axis toggle, sat directly under the plot: off (default) bins
+    // the developed output; on bins the develop's input tone (sharing the tone
+    // curve's axis).
+    let show_input =
+        app.histogram_mode == crate::pipeline::HistogramMode::Input;
+    let histogram_toggle = widget::toggler(show_input)
+        .label(fl!("histogram-input-axis"))
+        .on_toggle(move |on| {
+            Message::SetHistogramMode(if on {
+                crate::pipeline::HistogramMode::Input
+            } else {
+                crate::pipeline::HistogramMode::Output
+            })
+        });
 
     let label = widget::text(fl!("exposure-label"));
     // The `0.05 EV` step matches `edit_manifest::EV_TICK`, the keyboard nudge,
@@ -277,7 +304,9 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let reset_all = widget::button::standard(fl!("reset-all")).on_press(Message::ResetAll);
     let reset_crop = widget::button::standard(fl!("reset-crop")).on_press(Message::ResetCrop);
 
-    widget::column::with_capacity(20)
+    widget::column::with_capacity(24)
+        .push(histogram)
+        .push(histogram_toggle)
         .push(label)
         .push(slider)
         .push(contrast_label)
@@ -296,6 +325,138 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .spacing(space_s)
         .width(Length::Fill)
         .into()
+}
+
+/// Fixed height (logical points) of the drawer's histogram plot.
+const HISTOGRAM_HEIGHT: f32 = 120.0;
+
+/// The drawer's tone plot: an input-tone histogram with the develop's transfer
+/// curve overlaid on the **same** fixed `[0,1]` input axis (the classic layout;
+/// darktable draws the module-input histogram behind its tone curve).
+///
+/// - **Histogram** (filled bars): the distribution of the develop's input tone
+///   `p ∈ [0,1]`, binned post-exposure, with log-scaled bar heights so sparse
+///   shadow/highlight populations stay visible next to a dominant peak.
+/// - **Curve** (stroke): the develop's `[0,1] → [0,1]` transfer
+///   ([`crate::film::Develop::curve_point`]): the straight diagonal at the
+///   identity controls, bending with contrast/pivot and reaching 0/1 at the
+///   Black/White anchors. Exposure is not part of the curve — it shifts the
+///   bars, not the shape.
+struct HistogramPlot<'a> {
+    /// Input-tone histogram bin densities (one per bin, normalized to sum 1), or
+    /// `None` while the first compute is in flight.
+    bins: Option<&'a [f32]>,
+    /// The live develop the curve overlay traces.
+    develop: crate::film::Develop,
+}
+
+/// The log-scale bar height for one histogram bin as a `[0,1]` fraction of the
+/// plot height. `count`/`max` is the linear share of the busiest bin; the
+/// fractional power (`GAMMA = 0.25`) lifts small populations so they stay
+/// visible beside a dominant peak while the busiest bin still reaches `1.0`
+/// and zero count yields `0.0`.
+#[must_use]
+fn bin_log_height(count: f32, max: f32) -> f32 {
+    const GAMMA: f32 = 0.25;
+    if count <= 0.0 || max <= 0.0 {
+        return 0.0;
+    }
+    (count / max).clamp(0.0, 1.0).powf(GAMMA)
+}
+
+/// The develop's transfer curve as `(x, y)` plot fractions in `[0,1]`, sampled
+/// at `steps + 1` points: `x = p` (the fixed input axis), `y = T(p)` (the
+/// develop's fixed-domain shape via [`crate::film::Develop::curve_point`]).
+///
+/// At the identity controls this is the straight diagonal `[0,0] → [1,1]`: the
+/// classic tone-curve widget's default. Contrast/pivot bend it, and the
+/// Black/White anchors move where it reaches 0/1. Exposure is excluded.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+fn curve_points(develop: crate::film::Develop, steps: usize) -> Vec<(f32, f32)> {
+    let steps = steps.max(1);
+    (0..=steps)
+        .map(|i| {
+            let x = i as f32 / steps as f32;
+            (x, crate::film::Develop::curve_point(&develop, x))
+        })
+        .collect()
+}
+
+impl canvas::Program<Message, cosmic::Theme, cosmic::Renderer> for HistogramPlot<'_> {
+    type State = ();
+
+    #[allow(clippy::cast_precision_loss)]
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &cosmic::Renderer,
+        theme: &cosmic::Theme,
+        bounds: cosmic::iced::Rectangle,
+        _cursor: cosmic::iced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        // Sampled samples along the curve overlay's display axis.
+        const CURVE_STEPS: usize = 128;
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let (w, h) = (frame.width(), frame.height());
+        if w <= 0.0 || h <= 0.0 {
+            return vec![frame.into_geometry()];
+        }
+
+        let accent: cosmic::iced::Color = theme.cosmic().accent.base.into();
+        let bin_color: cosmic::iced::Color =
+            cosmic::iced::Color::from_rgba(accent.r, accent.g, accent.b, 0.45);
+        let plot_color: cosmic::iced::Color =
+            cosmic::iced::Color::from_rgba(accent.r, accent.g, accent.b, 0.10);
+        // Plot rect inset a hair so the axes read as a frame, not the widget edge.
+        let plot = canvas::Path::rectangle(
+            cosmic::iced::Point::new(0.5, 0.5),
+            cosmic::iced::Size::new(w - 1.0, h - 1.0),
+        );
+        frame.fill(&plot, plot_color);
+
+        if let Some(bins) = self.bins {
+            let max = bins.iter().copied().fold(0.0_f32, f32::max);
+            let n = bins.len().max(1);
+            // Width of one bin in plot pixels, at least one pixel so a sparse
+            // distribution (e.g. a clipped frame) still shows bars.
+            let bw = (w / n as f32).max(1.0);
+            for (i, &count) in bins.iter().enumerate() {
+                let bar_h = bin_log_height(count, max) * h;
+                if bar_h <= 0.0 {
+                    continue;
+                }
+                let x = i as f32 / n as f32 * w;
+                let rect = canvas::Path::rectangle(
+                    cosmic::iced::Point::new(x, h - bar_h),
+                    cosmic::iced::Size::new(bw.min(w - x), bar_h),
+                );
+                frame.fill(&rect, bin_color);
+            }
+        }
+
+        // Transfer curve: stroke the develop's fixed `[0,1] → [0,1]` shape over
+        // the same input axis as the bars. The identity controls give the
+        // straight diagonal `[0,0] → [1,1]` (canvas y is top-down, hence the
+        // `1 - y` flip).
+        let mut builder = canvas::path::Builder::new();
+        for (i, (x, y)) in curve_points(self.develop, CURVE_STEPS).into_iter().enumerate() {
+            let point = cosmic::iced::Point::new(x * w, (1.0 - y) * h);
+            if i == 0 {
+                builder.move_to(point);
+            } else {
+                builder.line_to(point);
+            }
+        }
+        frame.stroke(
+            &builder.build(),
+            canvas::Stroke::default()
+                .with_color(accent)
+                .with_width(1.5),
+        );
+
+        vec![frame.into_geometry()]
+    }
 }
 
 /// The fixed width (logical points) reserved for every help row's key chip, so
@@ -1036,5 +1197,115 @@ mod tests {
         assert!(is_calibration_frame(Some(frame), frame));
         assert!(!is_calibration_frame(Some(frame), "IMG_0008.DNG"));
         assert!(!is_calibration_frame(None, frame));
+    }
+
+    #[test]
+    fn curve_points_identity_is_the_straight_diagonal() {
+        // The default develop (identity contrast/pivot, black 0, white
+        // DEFAULT_D_MAX) must plot as the classic straight diagonal [0,0]->[1,1].
+        let develop = crate::film::Develop::with_base(0.82);
+        let points = curve_points(develop, 64);
+        assert_eq!(points.len(), 65);
+        for (x, y) in points {
+            assert!((y - x).abs() < 1e-5, "identity curve off-diagonal at x={x}: {y}");
+        }
+    }
+
+    #[test]
+    fn curve_points_are_monotone_and_in_range() {
+        // A shape control keeps the curve a valid monotone transfer in [0,1].
+        let develop = crate::film::Develop {
+            contrast: 2.0,
+            black: 0.1,
+            white: 2.0,
+            pivot_offset: 0.2,
+            ..crate::film::Develop::with_base(0.82)
+        };
+        let mut prev = -1.0_f32;
+        for (x, y) in curve_points(develop, 128) {
+            assert!((0.0..=1.0).contains(&y), "y out of range at x={x}: {y}");
+            assert!(y >= prev - 1e-6, "curve fell at x={x}: {prev} -> {y}");
+            prev = y;
+        }
+    }
+
+    #[test]
+    fn curve_points_steepen_with_contrast_through_the_pivot() {
+        let identity = crate::film::Develop::with_base(0.82);
+        let more = crate::film::Develop {
+            contrast: 2.0,
+            ..identity
+        };
+        let at = |d, x: f32| {
+            let points = curve_points(d, 100);
+            let idx = (x * 100.0).round() as usize;
+            points[idx].1
+        };
+        assert!(at(more, 0.25) < at(identity, 0.25), "contrast dark not lower");
+        assert!(
+            at(more, 0.75) > at(identity, 0.75),
+            "contrast bright not higher"
+        );
+    }
+
+    #[test]
+    fn curve_points_reflect_black_and_white_endpoints() {
+        let identity = crate::film::Develop::with_base(0.82);
+        let at = |d, x: f32| {
+            let points = curve_points(d, 100);
+            points[(x * 100.0).round() as usize].1
+        };
+        // Raising the black point moves the black anchor up the input axis: the
+        // curve stays at 0 longer then rises to meet the diagonal, so a
+        // below-mid input comes out darker (shadows crushed).
+        let black_up = crate::film::Develop {
+            black: 0.4,
+            ..identity
+        };
+        assert!(
+            at(black_up, 0.25) < at(identity, 0.25),
+            "black anchor did not crush the toe"
+        );
+        // Lowering the white point brings the white anchor down: a bright input
+        // reaches full output sooner (highlights clipped).
+        let white_down = crate::film::Develop {
+            white: 1.8,
+            ..identity
+        };
+        assert!(
+            at(white_down, 0.75) > at(identity, 0.75),
+            "white anchor did not raise the shoulder"
+        );
+    }
+
+    #[test]
+    fn curve_points_ignore_exposure() {
+        // Exposure shifts the histogram, not the tone-shape curve.
+        let identity = crate::film::Develop::with_base(0.82);
+        let exposed = crate::film::Develop {
+            exposure_ev: 2.0,
+            ..identity
+        };
+        assert_eq!(curve_points(exposed, 32), curve_points(identity, 32));
+    }
+
+
+    #[test]
+    fn bin_log_height_is_monotone_and_normalized() {
+        // Zero count → no bar; the busiest bin reaches full height; and the
+        // mapping is monotone in the count.
+        assert_eq!(bin_log_height(0.0, 10.0), 0.0);
+        assert_eq!(bin_log_height(1.0, 0.0), 0.0);
+        assert!((bin_log_height(10.0, 10.0) - 1.0).abs() < 1e-6);
+        let small = bin_log_height(1.0, 10_000.0);
+        let large = bin_log_height(100.0, 10_000.0);
+        assert!(small > 0.0 && small < large && large < 1.0);
+        // A 1-in-10000 population is lifted well above its linear share so it
+        // is not flattened to invisibility next to the peak.
+        let linear = 1.0 / 10_000.0;
+        assert!(
+            bin_log_height(1.0, 10_000.0) > linear * 100.0,
+            "tiny population not lifted"
+        );
     }
 }

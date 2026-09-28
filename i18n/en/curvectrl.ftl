@@ -44,6 +44,7 @@ roll-frames = {$count ->
    *[other] {$count} frames
 }
 git-description = Git commit {$hash} on {$date}
+histogram-input-axis = Input axis
 exposure-label = Exposure
 contrast-label = Contrast
 black-label = Black

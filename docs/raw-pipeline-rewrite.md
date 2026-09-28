@@ -1,6 +1,8 @@
 # RAW pipeline rewrite: film-only, density-domain, pointwise
 
-Status: steps 1–5 done (film-only path landed; histogram widget remains).
+Status: steps 1–8 done (film-only path + drawer histogram/curve; tests + lint
+green). The only outstanding item is the manual visual check on real
+negatives, which needs image data.
 Scope: `src/pipeline.rs`, `src/shader.rs`, `src/film.rs` (plus manifest/UI
 fields and a histogram widget). The app shell, library, crop, export, and
 keyboard model are retained.
@@ -136,3 +138,59 @@ Deviations from the original R5 field list: `black` is stored per frame too
 (it is an independent density anchor, not derivable from `base`), and the
 per-frame `base` is resolved from the roll-level calibration (no per-frame base
 override yet). Film presets / `MonoStock` / `BaseMode` are removed outright.
+
+R4's "reset to calibration frame resets black only" is not implemented as a
+dedicated action: the per-frame `black` anchor is independent of the roll base,
+and `ResetAll` restores the panel's opened state rather than the calibration
+value. A per-frame base override / calibration-only black reset remains a
+future addition.
+
+## Step 6 result: drawer histogram + curve overlay
+
+- `pipeline::histogram_from_develop(mono, develop, bins, mode)` bins the mono
+  over one of two axes (`HistogramMode`, toggled in the drawer; **Output
+  default**, persisted while the app runs):
+  - **Output** (default): the developed result `srgb_encode(develop.apply(v))`
+    — the "what does the photo look like" distribution; exposure and every
+    shape control move it.
+  - **Input**: the post-exposure density normalized onto the fixed
+    `p = density / DEFAULT_D_MAX` axis, sharing the tone curve's coordinate;
+    exposure shifts the bars along the axis.
+- `AppModel` keeps the overview mono as `histogram_mono: Arc<Vec<f32>>` (a
+  refcount, never copied per tick) and recomputes the bins on the blocking pool
+  whenever the develop changes. Computes **coalesce** — at most one running +
+  one queued, so a fast drag does ~two passes instead of one per tick — with a
+  monotonic generation so a stale landing never paints.
+- `ui::HistogramPlot` is an `iced` `canvas::Program` at the top of the editing
+  drawer, with a small **Input axis** toggler directly under the plot (off =
+  Output, on = Input):
+  - **Histogram** (bars): whichever axis `HistogramMode` selects, bar heights on
+    a fractional-power (`^0.25`) scale so sparse shadow/highlight populations
+    stay visible beside a dominant peak.
+  - **Curve** (stroke): `film::Develop::curve_point(p)` — the fixed-domain
+    `[0,1] → [0,1]` shape on the input axis. At the identity controls it is the
+    straight diagonal `[0,0] → [1,1]` (the classic tone-curve default);
+    contrast/pivot bend it and the Black/White anchors move where it reaches
+    0/1. **Exposure is excluded** from the curve. The curve is drawn in both
+    modes; in Output mode the bars are in result space, so the curve is an
+    overlay rather than sharing their axis.
+
+## Steps 7–8 result: tests + verification
+
+- **`T` parity**: `film::develop_matches_wgsl_transcription` (CPU `apply` vs the
+  WGSL expression) and `film::apply_agrees_with_apply_density` (the two entry
+  points).
+- **Identity / range**: `develop_is_identity_at_defaults`,
+  `develop_is_monotone_and_in_range`.
+- **Slider direction**: `film::slider_directions_are_right_to_increase` pins
+  exposure/contrast/black/white/pivot rightward directions;
+  `app::clamps_bound_the_develop_controls` pins the slider bounds.
+- **Anchor resolution**: `edit_manifest::calibration_base_and_frame_round_trip`,
+  `clear_calibration_drops_frame_and_base`, `base_or_default`,
+  `tone_builds_a_develop_with_the_roll_base`.
+- **Binning**: `pipeline::histogram_*` (normalization, measured + robust density
+  range, outlier rejection, flat/empty fallback) and `ui::curve_points_*`
+  (monotone, narrow-range, contrast steepening), `ui::bin_log_height_*`.
+- `just check` (clippy `--all-features --locked`) and `cargo test --locked` are
+  green (202 tests); `cargo build --release --locked` compiles.
+- **Manual visual check** on real negatives is still pending (needs image data).

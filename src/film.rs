@@ -93,6 +93,22 @@ impl Develop {
     pub fn apply_density(&self, density: f32) -> f32 {
         let span = (self.white - self.black).abs().max(1e-4);
         let x = ((density - self.black) / span).clamp(0.0, 1.0);
+        self.shape(x)
+    }
+
+    /// The tone-shape transfer as a fixed `[0,1] → [0,1]` curve: the classic
+    /// tone-curve widget's `y = T(x)` (contrast/pivot on a normalized window
+    /// position). `apply_density` is the density-window wrapper around it, and
+    /// the drawer's curve overlay plots exactly this — so the plot cannot drift
+    /// from the render.
+    ///
+    /// `x` is the normalized position within the `[black, white]` window; the
+    /// black/white endpoints live in the *density* domain (see [`Self::apply`]),
+    /// so this fixed-domain transfer is the contrast/pivot shape only. At
+    /// `contrast = 1`, `pivot_offset = 0` it is the identity (`T(x) = x`).
+    #[must_use]
+    pub fn shape(&self, x: f32) -> f32 {
+        let x = x.clamp(0.0, 1.0);
         let pivot = (0.5 + self.pivot_offset).clamp(1e-4, 1.0 - 1e-4);
         let shaped = if x <= pivot {
             pivot * (x / pivot).powf(self.contrast)
@@ -100,6 +116,22 @@ impl Develop {
             1.0 - (1.0 - pivot) * ((1.0 - x) / (1.0 - pivot)).powf(self.contrast)
         };
         shaped.clamp(0.0, 1.0)
+    }
+
+    /// The classic tone-curve overlay's `p → y` transfer: a fixed input axis
+    /// `p ∈ [0,1]` mapped through a nominal density ramp (`p · DEFAULT_D_MAX`)
+    /// into the `[black, white]` window, then the contrast/pivot [`Self::shape`].
+    ///
+    /// At the identity develop (`black = 0`, `white = DEFAULT_D_MAX`,
+    /// `contrast = 1`, `pivot = 0`) this is exactly `y = p` — the straight
+    /// diagonal `[0,0] → [1,1]`. The Black/White anchors move where the transfer
+    /// reaches 0 and 1 (raising Black crushes the toe, lowering White clips the
+    /// shoulder); contrast/pivot bend the middle. Exposure is **not** part of
+    /// this curve (it shifts the histogram, not the shape).
+    #[must_use]
+    pub fn curve_point(&self, p: f32) -> f32 {
+        let density = p.clamp(0.0, 1.0) * DEFAULT_D_MAX;
+        self.apply_density(density)
     }
 }
 
@@ -209,6 +241,34 @@ mod tests {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_agrees_with_apply_density() {
+        // `apply` folds the `2^-EV` gain into the transmission then computes the
+        // density; `apply_density` takes the density directly. For the same
+        // physical input they must agree — this is the seam the shader uses
+        // (`apply_density`-style) and the CPU bakes use (`apply`).
+        for ev in [-1.5_f32, 0.0, 0.8] {
+            for base in [0.5_f32, 0.82, 0.95] {
+                let d = Develop {
+                    exposure_ev: ev,
+                    base,
+                    black: 0.1,
+                    white: 2.4,
+                    contrast: 1.6,
+                    pivot_offset: -0.2,
+                };
+                for t in [0.001_f32, 0.05, 0.3, 0.6, 0.9] {
+                    let gain = (-ev).exp2();
+                    let density = f32::log10(base / (t * gain).clamp(MIN_TRANSMISSION_DEV, base));
+                    assert!(
+                        (d.apply(t) - d.apply_density(density)).abs() < 1e-6,
+                        "ev {ev} base {base} t {t}"
+                    );
                 }
             }
         }
