@@ -37,9 +37,16 @@ pub const DEFAULT_PIVOT: f32 = 0.0;
 /// `0.05 EV` matches the keyboard nudge and keeps the `0.7 EV` default at 14.
 pub const EV_TICK: f32 = 0.05;
 
-/// Fixed-point quantum for the stored develop controls (contrast lift, black /
-/// white density, midtone pivot). Matches every develop slider's step.
+/// Fixed-point quantum for the stored develop controls (contrast lift, white
+/// density, midtone pivot). Matches those sliders' step.
 pub const TONE_TICK: f32 = 0.05;
+
+/// Fixed-point quantum for the stored black density anchor. Half of
+/// [`TONE_TICK`]: the black anchor shifts the develop numerator additively
+/// (`(density - black)/span`), so its per-tick effect is about twice the white
+/// anchor's; the finer grid gives Black a comparable feel and matches the
+/// black slider's step.
+pub const BLACK_TICK: f32 = 0.025;
 
 /// Stored exposure tick bounds (the exposure slider's −3..+4 EV range).
 const EXPOSURE_TICK_MIN: i16 = -60;
@@ -48,9 +55,9 @@ const EXPOSURE_TICK_MAX: i16 = 80;
 /// `0.125..=8.0`).
 const CONTRAST_TICK_MIN: i16 = -60;
 const CONTRAST_TICK_MAX: i16 = 60;
-/// Stored black density anchor bounds (±1.0 density).
-const BLACK_TICK_MIN: i16 = -20;
-const BLACK_TICK_MAX: i16 = 20;
+/// Stored black density anchor bounds (±1.0 density, on the [`BLACK_TICK`] grid).
+const BLACK_TICK_MIN: i16 = -40;
+const BLACK_TICK_MAX: i16 = 40;
 /// Stored white density anchor bounds (`0.5..5.0` density).
 const WHITE_TICK_MIN: i16 = 10;
 const WHITE_TICK_MAX: i16 = 100;
@@ -101,12 +108,12 @@ fn contrast_power(ticks: i16) -> f32 {
 
 /// The stored black density anchor tick.
 fn black_ticks(black: f32) -> i16 {
-    quantize_tick(black, TONE_TICK, BLACK_TICK_MIN, BLACK_TICK_MAX)
+    quantize_tick(black, BLACK_TICK, BLACK_TICK_MIN, BLACK_TICK_MAX)
 }
 
 /// The black density anchor a stored tick decodes to.
 fn black_density(ticks: i16) -> f32 {
-    f32::from(ticks) * TONE_TICK
+    f32::from(ticks) * BLACK_TICK
 }
 
 /// The stored white density anchor tick.
@@ -140,7 +147,7 @@ pub struct EditData {
     /// identity.
     #[serde(default = "default_contrast_lift_ticks")]
     pub contrast_lift_ticks: i16,
-    /// Black density anchor in [`TONE_TICK`] ticks, `0` = identity.
+    /// Black density anchor in [`BLACK_TICK`] ticks, `0` = identity.
     #[serde(default = "default_identity_tone_ticks")]
     pub black_ticks: i16,
     /// White density anchor in [`TONE_TICK`] ticks ([`DEFAULT_WHITE`] default).
@@ -780,7 +787,7 @@ mod tests {
 
         assert!(text.contains("exposure_ticks = 8"), "{text}");
         assert!(text.contains("contrast_lift_ticks ="), "{text}");
-        assert!(text.contains("black_ticks = 5"), "{text}");
+        assert!(text.contains("black_ticks = 10"), "{text}");
         assert!(text.contains("white_ticks = 40"), "{text}");
         assert!(text.contains("pivot_ticks = -2"), "{text}");
     }
@@ -965,7 +972,7 @@ curve_shadows_ticks = -3
         for tick in [-60_i16, -10, 0, 10, 60] {
             assert_eq!(contrast_lift_ticks(contrast_power(tick)), tick);
         }
-        for tick in [-20_i16, -5, 0, 5, 20] {
+        for tick in [-40_i16, -5, 0, 5, 40] {
             assert_eq!(black_ticks(black_density(tick)), tick);
         }
         for tick in [10_i16, 48, 100] {

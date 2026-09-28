@@ -263,7 +263,10 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
             app.tone.pivot_offset,
         )
     })
-    .step(0.05_f32)
+    // `0.025` matches `edit_manifest::BLACK_TICK`: the black anchor shifts the
+    // develop numerator additively, so its per-tick effect is ~2× the white
+    // anchor's; the finer grid gives it a comparable feel.
+    .step(0.025_f32)
     .on_release(Message::EditSave);
     let white_label = widget::text(fl!("white-label"));
     let white_slider = widget::slider(0.0..=5.0, app.tone.white, move |white| {

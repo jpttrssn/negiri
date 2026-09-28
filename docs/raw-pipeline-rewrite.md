@@ -128,7 +128,11 @@ same performance class as what already ships. **Decision: no tone LUT** — eval
   `decode_raw_detail` returns only the true sensor-linear mono + geometry.
 - **`edit_manifest.rs`** stores `{exposure_ticks, contrast_lift_ticks, black_ticks,
   white_ticks, pivot_ticks}` (schema v1, legacy keys re-edited, no migration) plus
-  the roll-level `base` + `calibration_frame`.
+  the roll-level `base` + `calibration_frame`. Black uses a dedicated half-density
+  quantum `BLACK_TICK = 0.025` (half of `TONE_TICK`): the black anchor shifts the
+  develop numerator additively, so its per-tick effect is ~2× the other density
+  anchors; the finer grid gives Black a feel comparable to White and matches the
+  black slider/keyboard steps.
 - **UI**: the editing panel is Exposure / Contrast / Black / White / Midtone;
   the roll-info drawer's film-preset and base-mode dropdowns are gone. A roll's
   calibration frame defaults to its first frame and is measured on roll open;

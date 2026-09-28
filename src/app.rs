@@ -88,6 +88,15 @@ const EDIT_NUDGE_EV: f32 = 0.05;
 const EDIT_STEP_CURVE: f32 = 0.20;
 /// Keyboard shortcut nudge step for a tone-curve power with the Shift modifier.
 const EDIT_NUDGE_CURVE: f32 = 0.05;
+/// Keyboard shortcut step for the Black density anchor with a bare key. Half of
+/// `EDIT_STEP_CURVE` because the black anchor's per-tick effect is ~2× the other
+/// develop controls (it shifts the develop numerator additively), and
+/// `edit_manifest::BLACK_TICK` is likewise half of `TONE_TICK`.
+const EDIT_STEP_BLACK: f32 = 0.10;
+/// Keyboard shortcut nudge step for the Black density anchor with Shift. Matches
+/// `edit_manifest::BLACK_TICK` and the black slider's step, so every black edit
+/// lands on the fixed-point storage grid.
+const EDIT_NUDGE_BLACK: f32 = 0.025;
 /// Keyboard shortcut step for a crop-window move: a bare move key (`h`/`j`/`k`/`l`
 /// or an arrow) translates the crop window by this many source pixels.
 const CROP_STEP_PX: i32 = 5;
@@ -3752,7 +3761,7 @@ impl AppModel {
             EditAdjust::Black(delta) => {
                 self.set_develop_shape(
                     self.tone.contrast,
-                    clamp_density(self.tone.black + delta),
+                    clamp_black(self.tone.black + delta),
                     self.tone.white,
                     self.tone.pivot_offset,
                 );
@@ -3761,7 +3770,7 @@ impl AppModel {
                 self.set_develop_shape(
                     self.tone.contrast,
                     self.tone.black,
-                    clamp_density(self.tone.white + delta),
+                    clamp_white(self.tone.white + delta),
                     self.tone.pivot_offset,
                 );
             }
@@ -4460,9 +4469,17 @@ fn clamp_contrast_power(power: f32) -> f32 {
     power.clamp(0.125, 8.0)
 }
 
-/// Clamps a density anchor (black or white) to the slider's range `0.0..=5.0`.
-fn clamp_density(density: f32) -> f32 {
-    density.clamp(0.0, 5.0)
+/// Clamps the Black density anchor to its slider/manifest range `-1.0..=1.0`
+/// (±40 [`edit_manifest::BLACK_TICK`] ticks), so a keyboard shortcut and the
+/// slider agree on bounds.
+fn clamp_black(black: f32) -> f32 {
+    black.clamp(-1.0, 1.0)
+}
+
+/// Clamps the White density anchor to its slider/manifest range `0.5..=5.0`,
+/// so a keyboard shortcut and the slider agree on bounds.
+fn clamp_white(white: f32) -> f32 {
+    white.clamp(0.5, 5.0)
 }
 
 /// Clamps the midtone pivot offset to the `−0.5..=0.5` window-fraction range
@@ -4647,13 +4664,18 @@ fn edit_adjust_for(key: &str, _alt: bool, shift: bool) -> Option<EditAdjust> {
     } else {
         EDIT_STEP_CURVE
     };
+    let black = if shift {
+        EDIT_NUDGE_BLACK
+    } else {
+        EDIT_STEP_BLACK
+    };
     match key {
         "-" => Some(EditAdjust::Exposure(-ev)),
         "=" => Some(EditAdjust::Exposure(ev)),
         "[" => Some(EditAdjust::Contrast(-curve)),
         "]" => Some(EditAdjust::Contrast(curve)),
-        ";" => Some(EditAdjust::Black(-curve)),
-        "'" => Some(EditAdjust::Black(curve)),
+        ";" => Some(EditAdjust::Black(-black)),
+        "'" => Some(EditAdjust::Black(black)),
         "," => Some(EditAdjust::White(-curve)),
         "." => Some(EditAdjust::White(curve)),
         "u" => Some(EditAdjust::Pivot(-curve)),
@@ -5644,10 +5666,32 @@ mod tests {
         assert_eq!(clamp_ev(99.0), 4.0);
         assert_eq!(clamp_contrast_power(0.0), 0.125);
         assert_eq!(clamp_contrast_power(99.0), 8.0);
-        assert_eq!(clamp_density(-1.0), 0.0);
-        assert_eq!(clamp_density(99.0), 5.0);
+        assert_eq!(clamp_black(-99.0), -1.0);
+        assert_eq!(clamp_black(99.0), 1.0);
+        assert_eq!(clamp_white(-99.0), 0.5);
+        assert_eq!(clamp_white(99.0), 5.0);
         assert_eq!(clamp_pivot(-9.0), -0.5);
         assert_eq!(clamp_pivot(9.0), 0.5);
+    }
+
+    #[test]
+    fn black_tick_matches_the_white_tick_feel() {
+        // In the normalized window `x = (density - black)/(white - black)`, the
+        // black anchor shifts the numerator additively (Δx = Δblack/span) while
+        // the white anchor only changes the denominator
+        // (Δx = density·Δwhite/span²). The dedicated `BLACK_TICK` is half
+        // `TONE_TICK`, so at the default anchors a black tick lands within a few
+        // percent of a white tick at mid density.
+        let span = edit_manifest::DEFAULT_WHITE - edit_manifest::DEFAULT_BLACK;
+        let black_dx = edit_manifest::BLACK_TICK / span;
+        let mid_density = span / 2.0;
+        let white_dx =
+            mid_density * edit_manifest::TONE_TICK / (span * span);
+        assert!(
+            (black_dx - white_dx).abs() < 5e-4,
+            "black dx {black_dx} vs white dx {white_dx}"
+        );
+        assert!(edit_manifest::BLACK_TICK < edit_manifest::TONE_TICK);
     }
 
     #[test]
@@ -5712,22 +5756,23 @@ mod tests {
             edit_adjust_for("]", false, true),
             Some(EditAdjust::Contrast(EDIT_NUDGE_CURVE))
         );
-        // Black pair: `;`/`'` coarse, Shift nudge.
+        // Black pair: `;`/`'` coarse, Shift nudge. Halved from the other curve
+        // steps because the black anchor's per-tick effect is ~2× theirs.
         assert_eq!(
             edit_adjust_for(";", false, false),
-            Some(EditAdjust::Black(-EDIT_STEP_CURVE))
+            Some(EditAdjust::Black(-EDIT_STEP_BLACK))
         );
         assert_eq!(
             edit_adjust_for("'", false, false),
-            Some(EditAdjust::Black(EDIT_STEP_CURVE))
+            Some(EditAdjust::Black(EDIT_STEP_BLACK))
         );
         assert_eq!(
             edit_adjust_for(";", false, true),
-            Some(EditAdjust::Black(-EDIT_NUDGE_CURVE))
+            Some(EditAdjust::Black(-EDIT_NUDGE_BLACK))
         );
         assert_eq!(
             edit_adjust_for("'", false, true),
-            Some(EditAdjust::Black(EDIT_NUDGE_CURVE))
+            Some(EditAdjust::Black(EDIT_NUDGE_BLACK))
         );
         // White pair: `,`/`.` coarse, Shift nudge.
         assert_eq!(
