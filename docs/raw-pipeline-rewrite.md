@@ -101,3 +101,12 @@ manifest structure (new fields).
 6. Histogram + canvas widget.
 7. Tests: `T` parity, identity, slider direction, anchor resolution, binning.
 8. `just check` + `cargo test --locked`; manual visual check.
+
+## Step 1 result: no LUT
+
+Micro-benchmark of the develop function `T` (film density path, ~5 transcendentals):
+single-threaded CPU ~18.7 ns/pixel (≈1.25 s for an 8192² frame). The CPU bake is a
+background batch and parallelizable. The GPU already evaluates a `log`+`pow`
+per fragment in the current film branch, so direct pointwise evaluation is the
+same performance class as what already ships. **Decision: no tone LUT** — evaluate
+`T` directly in WGSL and in Rust, deleting the LUT/tolerance/parity machinery.
