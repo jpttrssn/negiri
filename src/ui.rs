@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use crate::app::{
-    AppModel, Message, Roll, RollDateField, THUMB_SIZE, TILE_ASPECT, Tile, Thumb, contrast_lift,
+    AppModel, Message, Roll, RollDateField, THUMB_SIZE, TILE_ASPECT, Thumb, Tile, contrast_lift,
     contrast_power_for_lift, detail_zoom_delta,
 };
 use crate::detail_area::DetailArea;
@@ -15,9 +15,7 @@ use crate::error::FrameError;
 use crate::exif_writer;
 use crate::fl;
 use crate::i18n::fl_dyn;
-use crate::library::{
-    LibraryCell, format_roll_card_dates, library_cell_index, library_cells,
-};
+use crate::library::{LibraryCell, format_roll_card_dates, library_cell_index, library_cells};
 use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
 use cosmic::iced::{ContentFit, Length};
@@ -191,6 +189,7 @@ pub(crate) fn frames_view(app: &AppModel) -> Element<'_, Message> {
 #[allow(clippy::too_many_lines)] // one linear push per control; no nested logic
 pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
+    let space_xs = cosmic::theme::spacing().space_xs;
 
     if app.detail_shader.is_none() {
         return widget::column::with_capacity(1)
@@ -214,8 +213,7 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // Histogram axis toggle, sat directly under the plot: off (default) bins
     // the developed output; on bins the develop's input tone (sharing the tone
     // curve's axis).
-    let show_input =
-        app.histogram_mode == crate::pipeline::HistogramMode::Input;
+    let show_input = app.histogram_mode == crate::pipeline::HistogramMode::Input;
     let histogram_toggle = widget::toggler(show_input)
         .label(fl!("histogram-input-axis"))
         .on_toggle(move |on| {
@@ -224,7 +222,8 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
             } else {
                 crate::pipeline::HistogramMode::Output
             })
-        });
+        })
+        .spacing(space_xs);
 
     let label = widget::text(fl!("exposure-label"));
     // The `0.05 EV` step matches `edit_manifest::EV_TICK`, the keyboard nudge,
@@ -240,20 +239,17 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // Every detail open starts from the stored edits. When one slider moves the
     // others travel along so the develop stays fully defined.
     let contrast_label = widget::text(fl!("contrast-label"));
-    let contrast_slider = widget::slider(
-        -3.0..=3.0,
-        contrast_lift(app.tone.contrast),
-        move |lift| {
+    let contrast_slider =
+        widget::slider(-3.0..=3.0, contrast_lift(app.tone.contrast), move |lift| {
             Message::DevelopChanged(
                 contrast_power_for_lift(lift),
                 app.tone.black,
                 app.tone.white,
                 app.tone.pivot_offset,
             )
-        },
-    )
-    .step(0.05_f32)
-    .on_release(Message::EditSave);
+        })
+        .step(0.05_f32)
+        .on_release(Message::EditSave);
     let black_label = widget::text(fl!("black-label"));
     let black_slider = widget::slider(-1.0..=1.0, app.tone.black, move |black| {
         Message::DevelopChanged(
@@ -281,12 +277,7 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     .on_release(Message::EditSave);
     let pivot_label = widget::text(fl!("pivot-label"));
     let pivot_slider = widget::slider(-0.5..=0.5, app.tone.pivot_offset, move |pivot| {
-        Message::DevelopChanged(
-            app.tone.contrast,
-            app.tone.black,
-            app.tone.white,
-            pivot,
-        )
+        Message::DevelopChanged(app.tone.contrast, app.tone.black, app.tone.white, pivot)
     })
     .step(0.05_f32)
     .on_release(Message::EditSave);
@@ -307,6 +298,11 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let reset_all = widget::button::standard(fl!("reset-all")).on_press(Message::ResetAll);
     let reset_crop = widget::button::standard(fl!("reset-crop")).on_press(Message::ResetCrop);
 
+    let crop_row = widget::row::with_capacity(2)
+        .push(crop_readout)
+        .push(reset_crop)
+        .spacing(space_s);
+
     widget::column::with_capacity(24)
         .push(histogram)
         .push(histogram_toggle)
@@ -323,8 +319,7 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .push(reset_all)
         .push(widget::divider::horizontal::default())
         .push(rotation_readout)
-        .push(crop_readout)
-        .push(reset_crop)
+        .push(crop_row)
         .spacing(space_s)
         .width(Length::Fill)
         .into()
@@ -443,7 +438,10 @@ impl canvas::Program<Message, cosmic::Theme, cosmic::Renderer> for HistogramPlot
         // straight diagonal `[0,0] → [1,1]` (canvas y is top-down, hence the
         // `1 - y` flip).
         let mut builder = canvas::path::Builder::new();
-        for (i, (x, y)) in curve_points(self.develop, CURVE_STEPS).into_iter().enumerate() {
+        for (i, (x, y)) in curve_points(self.develop, CURVE_STEPS)
+            .into_iter()
+            .enumerate()
+        {
             let point = cosmic::iced::Point::new(x * w, (1.0 - y) * h);
             if i == 0 {
                 builder.move_to(point);
@@ -453,9 +451,7 @@ impl canvas::Program<Message, cosmic::Theme, cosmic::Renderer> for HistogramPlot
         }
         frame.stroke(
             &builder.build(),
-            canvas::Stroke::default()
-                .with_color(accent)
-                .with_width(1.5),
+            canvas::Stroke::default().with_color(accent).with_width(1.5),
         );
 
         vec![frame.into_geometry()]
@@ -517,7 +513,12 @@ pub(crate) const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
 /// One help row: an accent key chip + its description. The chip sits in a
 /// fixed-width column (`HELP_KEY_WIDTH`) left-aligned, so every row's key
 /// values and descriptions line up vertically like a table.
-pub(crate) fn help_row<'a>(key: &'a str, label: &'a str, space_s: u16, space_m: u16) -> Element<'a, Message> {
+pub(crate) fn help_row<'a>(
+    key: &'a str,
+    label: &'a str,
+    space_s: u16,
+    space_m: u16,
+) -> Element<'a, Message> {
     widget::row::with_capacity(2)
         .push(
             widget::container(
@@ -1210,7 +1211,10 @@ mod tests {
         let points = curve_points(develop, 64);
         assert_eq!(points.len(), 65);
         for (x, y) in points {
-            assert!((y - x).abs() < 1e-5, "identity curve off-diagonal at x={x}: {y}");
+            assert!(
+                (y - x).abs() < 1e-5,
+                "identity curve off-diagonal at x={x}: {y}"
+            );
         }
     }
 
@@ -1244,7 +1248,10 @@ mod tests {
             let idx = (x * 100.0).round() as usize;
             points[idx].1
         };
-        assert!(at(more, 0.25) < at(identity, 0.25), "contrast dark not lower");
+        assert!(
+            at(more, 0.25) < at(identity, 0.25),
+            "contrast dark not lower"
+        );
         assert!(
             at(more, 0.75) > at(identity, 0.75),
             "contrast bright not higher"
@@ -1291,7 +1298,6 @@ mod tests {
         };
         assert_eq!(curve_points(exposed, 32), curve_points(identity, 32));
     }
-
 
     #[test]
     fn bin_log_height_is_monotone_and_normalized() {
