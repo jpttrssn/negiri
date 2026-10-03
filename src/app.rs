@@ -75,28 +75,31 @@ const MAX_CONCURRENT_PRELOADS: usize = 2;
 /// the overview LRU cache (so Left/Right paging to a neighbor is instant).
 const DETAIL_PRELOAD_DISTANCE: usize = 1;
 
-/// Keyboard shortcut step for exposure (EV) when an edit control is adjusted
-/// with a bare key.
-const EDIT_STEP_EV: f32 = 0.50;
-/// Keyboard shortcut nudge step for exposure (EV) with the Shift modifier.
-/// Equal to `edit_manifest::EV_TICK` (and the exposure slider's step), so every
-/// exposure edit lands on the fixed-point storage grid.
-const EDIT_NUDGE_EV: f32 = 0.05;
-/// Keyboard shortcut step for a tone-curve power (contrast/highlights/shadows)
-/// with a bare key. Highlights and Shadows apply it to their user-facing lift
-/// value in stops, so a step UP lifts the region.
-const EDIT_STEP_CURVE: f32 = 0.20;
-/// Keyboard shortcut nudge step for a tone-curve power with the Shift modifier.
-const EDIT_NUDGE_CURVE: f32 = 0.05;
-/// Keyboard shortcut step for the Black density anchor with a bare key. Half of
-/// `EDIT_STEP_CURVE` because the black anchor's per-tick effect is ~2× the other
-/// develop controls (it shifts the develop numerator additively), and
-/// `edit_manifest::BLACK_TICK` is likewise half of `TONE_TICK`.
-const EDIT_STEP_BLACK: f32 = 0.10;
-/// Keyboard shortcut nudge step for the Black density anchor with Shift. Matches
-/// `edit_manifest::BLACK_TICK` and the black slider's step, so every black edit
-/// lands on the fixed-point storage grid.
-const EDIT_NUDGE_BLACK: f32 = 0.025;
+/// Coarse drag steps one bare edit key advances, per control. Integers, so a
+/// bare key always lands on the storage lattice and can never desynchronize from
+/// the bare drag it is derived from (pinned by `bare_key_steps_are_whole_coarse_steps`).
+const KEY_COARSE_STEPS_EV: i16 = 5;
+const KEY_COARSE_STEPS_TONE: i16 = 4;
+const KEY_COARSE_STEPS_BLACK: i16 = 4;
+
+/// Keyboard shortcut step for exposure (EV) with a bare key: `0.25 EV`.
+const EDIT_STEP_EV: f32 = edit_manifest::EV_STEP * KEY_COARSE_STEPS_EV as f32;
+/// Keyboard shortcut nudge step for exposure (EV) with the Shift modifier: one
+/// stored tick, the same fine grid a Shift-held slider drag uses, so both land
+/// on the manifest's storage lattice.
+const EDIT_NUDGE_EV: f32 = edit_manifest::EV_TICK;
+/// Keyboard shortcut step for a develop control's lift (contrast, white,
+/// midtone pivot) with a bare key, in that control's own domain: `0.20`.
+const EDIT_STEP_CURVE: f32 = edit_manifest::TONE_STEP * KEY_COARSE_STEPS_TONE as f32;
+/// Keyboard shortcut nudge step for a develop control with the Shift modifier:
+/// one stored tick, matching the Shift-held slider drag.
+const EDIT_NUDGE_CURVE: f32 = edit_manifest::TONE_TICK;
+/// Keyboard shortcut step for the Black density anchor with a bare key: `0.10`,
+/// half of `EDIT_STEP_CURVE` — see [`edit_manifest::BLACK_TICKS_PER_UNIT`].
+const EDIT_STEP_BLACK: f32 = edit_manifest::BLACK_STEP * KEY_COARSE_STEPS_BLACK as f32;
+/// Keyboard shortcut nudge step for the Black density anchor with Shift: one
+/// stored tick, matching the Shift-held slider drag.
+const EDIT_NUDGE_BLACK: f32 = edit_manifest::BLACK_TICK;
 /// Keyboard shortcut step for a crop-window move: a bare move key (`h`/`j`/`k`/`l`
 /// or an arrow) translates the crop window by this many source pixels.
 const CROP_STEP_PX: i32 = 5;
@@ -4456,37 +4459,38 @@ fn zoom_about_anchor(zoom_old: f32, zoom_new: f32, pan: Point, cursor: Point) ->
     )
 }
 
-/// Clamps an exposure adjustment in EV to the slider's range (−3.0..=+4.0).
+/// Clamps an exposure adjustment in EV to the exposure slider's range
+/// (`−3.0..=+4.0`, from the stored tick bounds).
 fn clamp_ev(ev: f32) -> f32 {
-    ev.clamp(-3.0, 4.0)
+    edit_manifest::clamp_to(ev, edit_manifest::exposure_range())
 }
 
-/// Clamps the Contrast power (a mid-pivoted power) to the slider's range
-/// `0.125..=8.0` so a keyboard shortcut and the slider agree on bounds. The
-/// range is a symmetric reciprocal pair around the `1.0` identity, so the
-/// stop-based lift scale spans an even ±3 stops.
+/// Clamps the Contrast power (a mid-pivoted power) to the contrast control's
+/// range `0.125..=8.0` so a keyboard shortcut and the slider agree on bounds.
+/// The range is a symmetric reciprocal pair around the `1.0` identity (both
+/// ends derived from the stored lift bounds), so the stop-based lift scale spans
+/// an even ±3 stops.
 fn clamp_contrast_power(power: f32) -> f32 {
-    power.clamp(0.125, 8.0)
+    edit_manifest::clamp_to(power, edit_manifest::contrast_power_range())
 }
 
 /// Clamps the Black density anchor to its slider/manifest range `-1.0..=1.0`
-/// (±40 [`edit_manifest::BLACK_TICK`] ticks), so a keyboard shortcut and the
-/// slider agree on bounds.
+/// (±200 stored ticks), so a keyboard shortcut and the slider agree on bounds.
 fn clamp_black(black: f32) -> f32 {
-    black.clamp(-1.0, 1.0)
+    edit_manifest::clamp_to(black, edit_manifest::black_range())
 }
 
 /// Clamps the White density anchor to its slider/manifest range `0.5..=5.0`,
 /// so a keyboard shortcut and the slider agree on bounds.
 fn clamp_white(white: f32) -> f32 {
-    white.clamp(0.5, 5.0)
+    edit_manifest::clamp_to(white, edit_manifest::white_range())
 }
 
 /// Clamps the midtone pivot offset to the `−0.5..=0.5` window-fraction range
 /// (the develop clamps internally too, but keeping the stored value in range
 /// avoids an unrepresentable edit).
 fn clamp_pivot(pivot: f32) -> f32 {
-    pivot.clamp(-0.5, 0.5)
+    edit_manifest::clamp_to(pivot, edit_manifest::pivot_range())
 }
 
 /// The Contrast slider's user-facing "lift value" in stops: `+log2(power)`, so
@@ -5675,21 +5679,55 @@ mod tests {
     }
 
     #[test]
+    fn bare_key_steps_are_whole_coarse_steps() {
+        // A bare key must advance a whole number of coarse drag steps, so the
+        // keyboard shares the slider's ladder and always lands on the storage
+        // lattice; Shift+key is exactly one stored tick. Both hold by
+        // construction (`EDIT_STEP_*` is derived from `*_STEP`), so this is the
+        // guard that keeps the derivation honest.
+        for (key_step, coarse_step) in [
+            (EDIT_STEP_EV, edit_manifest::EV_STEP),
+            (EDIT_STEP_CURVE, edit_manifest::TONE_STEP),
+            (EDIT_STEP_BLACK, edit_manifest::BLACK_STEP),
+        ] {
+            let steps = key_step / coarse_step;
+            assert!(
+                (steps - steps.round()).abs() < 1e-6 && steps >= 1.0,
+                "key step {key_step} is not a whole number of coarse steps {coarse_step}"
+            );
+        }
+        for (nudge, fine) in [
+            (EDIT_NUDGE_EV, edit_manifest::EV_TICK),
+            (EDIT_NUDGE_CURVE, edit_manifest::TONE_TICK),
+            (EDIT_NUDGE_BLACK, edit_manifest::BLACK_TICK),
+        ] {
+            assert_eq!(nudge, fine, "the Shift nudge must be one stored tick");
+        }
+        // The exposure keys move a quarter EV per press (five coarse steps).
+        assert_eq!(EDIT_STEP_EV, 0.25);
+    }
+
+    #[test]
     fn black_tick_matches_the_white_tick_feel() {
         // In the normalized window `x = (density - black)/(white - black)`, the
         // black anchor shifts the numerator additively (Δx = Δblack/span) while
         // the white anchor only changes the denominator
-        // (Δx = density·Δwhite/span²). The dedicated `BLACK_TICK` is half
-        // `TONE_TICK`, so at the default anchors a black tick lands within a few
-        // percent of a white tick at mid density.
+        // (Δx = density·Δwhite/span²). Black's grid is twice as fine (200 ticks
+        // per density vs 100), so at the default anchors a black tick lands
+        // within a few percent of a white tick at mid density.
         let span = edit_manifest::DEFAULT_WHITE - edit_manifest::DEFAULT_BLACK;
-        let black_dx = edit_manifest::BLACK_TICK / span;
+        let one_black_tick = 1.0 / f32::from(edit_manifest::BLACK_TICKS_PER_UNIT);
+        let one_tone_tick = 1.0 / f32::from(edit_manifest::TONE_TICKS_PER_UNIT);
+        let black_dx = one_black_tick / span;
         let mid_density = span / 2.0;
-        let white_dx =
-            mid_density * edit_manifest::TONE_TICK / (span * span);
+        let white_dx = mid_density * one_tone_tick / (span * span);
         assert!(
             (black_dx - white_dx).abs() < 5e-4,
             "black dx {black_dx} vs white dx {white_dx}"
+        );
+        assert!(
+            edit_manifest::BLACK_TICKS_PER_UNIT > edit_manifest::TONE_TICKS_PER_UNIT,
+            "black's grid must be the finer of the two"
         );
         assert!(edit_manifest::BLACK_TICK < edit_manifest::TONE_TICK);
     }

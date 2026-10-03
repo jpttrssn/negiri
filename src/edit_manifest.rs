@@ -3,6 +3,7 @@
 use crate::film::{self, Develop};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 /// File name of the per-roll edit manifest inside a roll directory.
@@ -32,70 +33,183 @@ pub const DEFAULT_WHITE: f32 = film::DEFAULT_D_MAX;
 /// Midtone pivot offset applied until an edit records otherwise (identity `0`).
 pub const DEFAULT_PIVOT: f32 = 0.0;
 
-/// Fixed-point quantum for the stored exposure (EV). The manifest stores an
-/// integer tick count so on-disk values are exact and carry no f32 noise;
-/// `0.05 EV` matches the keyboard nudge and keeps the `0.7 EV` default at 14.
-pub const EV_TICK: f32 = 0.05;
+/// Stored ticks in one fine control step (a Shift-held slider drag or Shift+key)
+/// — exactly one tick, so a fine edit is stored without rounding.
+pub const FINE_TICKS: i16 = 1;
 
-/// Fixed-point quantum for the stored develop controls (contrast lift, white
-/// density, midtone pivot). Matches those sliders' step.
-pub const TONE_TICK: f32 = 0.05;
+/// Stored ticks in one coarse control step (a bare slider drag or bare shortcut
+/// key).
+///
+/// Both rungs are integer tick counts, so the control ladder is a refinement of
+/// the storage lattice: re-tuning either one can never reinterpret a stored
+/// count, only change which stored values a drag can *reach*. A coarse step is a
+/// whole number of ticks, so it always lands on the fine grid without rounding.
+pub const COARSE_TICKS: i16 = 5;
 
-/// Fixed-point quantum for the stored black density anchor. Half of
-/// [`TONE_TICK`]: the black anchor shifts the develop numerator additively
-/// (`(density - black)/span`), so its per-tick effect is about twice the white
-/// anchor's; the finer grid gives Black a comparable feel and matches the
-/// black slider's step.
-pub const BLACK_TICK: f32 = 0.025;
+/// Stored ticks per 1 EV — the exposure storage grid, stated as an exact integer
+/// count rather than a float quantum (so a decoded value is correctly rounded:
+/// `40` ticks is exactly `f32(0.4)`).
+///
+/// **This is a data contract, frozen.** It defines the meaning of every stored
+/// integer and must never move because a control's UX changed; the UI derives
+/// its ranges and steps from it instead (see [`exposure_range`], [`EV_STEP`]).
+/// `i16` leaves ±327 EV of headroom, so there is no pressure to ever coarsen it:
+/// one tick is ~1/100 EV, still ~330 codes of the 16-bit export.
+pub const EV_TICKS_PER_EV: i16 = 100;
 
-/// Stored exposure tick bounds (the exposure slider's −3..+4 EV range).
-const EXPOSURE_TICK_MIN: i16 = -60;
-const EXPOSURE_TICK_MAX: i16 = 80;
+/// Stored ticks per unit of the develop controls' own domains — the contrast
+/// lift (stops), the white density anchor (density), and the midtone pivot
+/// (window fraction) all share one grid.
+pub const TONE_TICKS_PER_UNIT: i16 = 100;
+
+/// Stored ticks per unit of the black density anchor: twice [`TONE_TICKS_PER_UNIT`],
+/// because the black anchor shifts the develop numerator additively
+/// (`(density - black)/span`) and is otherwise ~2× stronger per tick than the
+/// white anchor. Its fine step is therefore half of the other develop controls'.
+pub const BLACK_TICKS_PER_UNIT: i16 = 200;
+
+/// Converts a tick count in any control's domain to that domain's value.
+///
+/// The one place a tick becomes a float. Dividing by an exact integer count is
+/// correctly rounded, so decoding is exact (`70` ticks is `f32(0.7)`, not
+/// `0.69999999`), and both `i16 → f32` operands fit the f32 mantissa, so the
+/// conversion is lossless and needs no rounding allowance.
+const fn step_value(ticks: i16, ticks_per_unit: i16) -> f32 {
+    ticks as f32 / ticks_per_unit as f32
+}
+
+/// Converts a control-domain value to the nearest whole tick.
+const fn ticks_of(value: f32, ticks_per_unit: i16) -> f32 {
+    value * ticks_per_unit as f32
+}
+
+/// The exposure's one-tick (Shift) step, in EV.
+pub const EV_TICK: f32 = step_value(FINE_TICKS, EV_TICKS_PER_EV);
+
+/// The exposure coarse drag step, in EV.
+pub const EV_STEP: f32 = step_value(COARSE_TICKS, EV_TICKS_PER_EV);
+
+/// The contrast / white / pivot one-tick (Shift) step.
+pub const TONE_TICK: f32 = step_value(FINE_TICKS, TONE_TICKS_PER_UNIT);
+
+/// The contrast / white / pivot coarse drag step.
+pub const TONE_STEP: f32 = step_value(COARSE_TICKS, TONE_TICKS_PER_UNIT);
+
+/// The black anchor's one-tick (Shift) step.
+pub const BLACK_TICK: f32 = step_value(FINE_TICKS, BLACK_TICKS_PER_UNIT);
+
+/// The black anchor's coarse drag step — half of [`TONE_STEP`]; see
+/// [`BLACK_TICKS_PER_UNIT`] for why its grid is the finer one.
+pub const BLACK_STEP: f32 = step_value(COARSE_TICKS, BLACK_TICKS_PER_UNIT);
+
+/// Stored exposure tick bounds: the control's whole domain, so they are both the
+/// slider's range (see [`exposure_range`]) and the encode clamp.
+const EXPOSURE_TICK_MIN: i16 = -300;
+const EXPOSURE_TICK_MAX: i16 = 400;
 /// Stored contrast lift-tick bounds (the centered `−3..=3` stop track, power
 /// `0.125..=8.0`).
-const CONTRAST_TICK_MIN: i16 = -60;
-const CONTRAST_TICK_MAX: i16 = 60;
+const CONTRAST_TICK_MIN: i16 = -300;
+const CONTRAST_TICK_MAX: i16 = 300;
 /// Stored black density anchor bounds (±1.0 density, on the [`BLACK_TICK`] grid).
-const BLACK_TICK_MIN: i16 = -40;
-const BLACK_TICK_MAX: i16 = 40;
+const BLACK_TICK_MIN: i16 = -200;
+const BLACK_TICK_MAX: i16 = 200;
 /// Stored white density anchor bounds (`0.5..5.0` density).
-const WHITE_TICK_MIN: i16 = 10;
-const WHITE_TICK_MAX: i16 = 100;
+const WHITE_TICK_MIN: i16 = 50;
+const WHITE_TICK_MAX: i16 = 500;
 /// Stored midtone pivot offset bounds (the `−0.5..=0.5` window-fraction range).
-const PIVOT_TICK_MIN: i16 = -10;
-const PIVOT_TICK_MAX: i16 = 10;
+const PIVOT_TICK_MIN: i16 = -50;
+const PIVOT_TICK_MAX: i16 = 50;
 
-/// `+0.7 EV` default in ticks (`0.7 / EV_TICK`).
-const DEFAULT_EXPOSURE_TICKS: i16 = 14;
+/// `+0.7 EV` default in ticks (`70 / EV_TICKS_PER_EV`).
+const DEFAULT_EXPOSURE_TICKS: i16 = 70;
 /// Identity contrast lift in ticks (power `1.0` ⇔ `0` stops).
 const DEFAULT_CONTRAST_LIFT_TICKS: i16 = 0;
-/// Default white density in ticks ([`DEFAULT_WHITE`] / [`TONE_TICK`]).
-const DEFAULT_WHITE_TICKS: i16 = 48;
+/// Default white density in ticks ([`DEFAULT_WHITE`] × [`TONE_TICKS_PER_UNIT`]).
+const DEFAULT_WHITE_TICKS: i16 = 240;
 
-/// Rounds `value` to the nearest tick and clamps to `[min, max]`, so every
-/// stored edit lands on the fixed-point grid.
+/// A control's whole range, derived from its stored tick bounds.
+///
+/// The bounds are the single source of truth: they set the slider's range *and*
+/// the encode clamp below, so the widget can never produce a value off the
+/// storage lattice, and the two uses of a control's domain cannot drift apart.
+fn value_range(min: i16, max: i16, ticks_per_unit: i16) -> RangeInclusive<f32> {
+    step_value(min, ticks_per_unit)..=step_value(max, ticks_per_unit)
+}
+
+/// The exposure slider's range in EV (`−3.0..=4.0`), from the
+/// [`EXPOSURE_TICK_MIN`]..=[`EXPOSURE_TICK_MAX`] tick bounds.
+pub fn exposure_range() -> RangeInclusive<f32> {
+    value_range(EXPOSURE_TICK_MIN, EXPOSURE_TICK_MAX, EV_TICKS_PER_EV)
+}
+
+/// The contrast slider's range in stop-lift (`−3.0..=3.0`), from the
+/// [`CONTRAST_TICK_MIN`]..=[`CONTRAST_TICK_MAX`] lift-tick bounds.
+pub fn contrast_lift_range() -> RangeInclusive<f32> {
+    value_range(CONTRAST_TICK_MIN, CONTRAST_TICK_MAX, TONE_TICKS_PER_UNIT)
+}
+
+/// The same contrast domain in the raw power the develop functions take
+/// (`0.125..=8.0`): the lift bounds mapped through the power curve. Because the
+/// lift bounds are symmetric, the result is a reciprocal pair around the `1.0`
+/// identity, so the stop-lift track spans an even ±3 stops.
+pub fn contrast_power_range() -> RangeInclusive<f32> {
+    contrast_power(CONTRAST_TICK_MIN)..=contrast_power(CONTRAST_TICK_MAX)
+}
+
+/// The black anchor slider's range in density (`−1.0..=1.0`).
+pub fn black_range() -> RangeInclusive<f32> {
+    value_range(BLACK_TICK_MIN, BLACK_TICK_MAX, BLACK_TICKS_PER_UNIT)
+}
+
+/// The white anchor slider's range in density (`0.5..=5.0`).
+pub fn white_range() -> RangeInclusive<f32> {
+    value_range(WHITE_TICK_MIN, WHITE_TICK_MAX, TONE_TICKS_PER_UNIT)
+}
+
+/// The midtone pivot slider's range in window fraction (`−0.5..=0.5`).
+pub fn pivot_range() -> RangeInclusive<f32> {
+    value_range(PIVOT_TICK_MIN, PIVOT_TICK_MAX, TONE_TICKS_PER_UNIT)
+}
+
+/// Clamps `value` into a control's `range()`.
+///
+/// `RangeInclusive::clamp` needs `Ord`, which `f32` deliberately does not
+/// implement (NaN has no order), so this is the float-safe equivalent.
+pub fn clamp_to(value: f32, range: RangeInclusive<f32>) -> f32 {
+    value.clamp(*range.start(), *range.end())
+}
+
+/// Rounds `value` to the nearest whole tick and clamps to `[min, max]`, so every
+/// stored edit lands on the fine (Shift) grid.
+///
+/// The clamp is the control's own range: `min`/`max` are its tick bounds, so a
+/// stored value outside the domain cannot exist after a write. Narrowing a
+/// control's range is therefore a data change for any edit already stored past
+/// the new bound (it would be clamped on this frame's next exposure/develop
+/// write, paste, or reset), which is why range changes are widen-only while
+/// manifests exist.
 #[allow(clippy::cast_possible_truncation)]
-fn quantize_tick(value: f32, tick: f32, min: i16, max: i16) -> i16 {
-    ((value / tick).round() as i32).clamp(i32::from(min), i32::from(max)) as i16
+fn quantize_ticks(value: f32, ticks_per_unit: i16, min: i16, max: i16) -> i16 {
+    (ticks_of(value, ticks_per_unit).round() as i32).clamp(i32::from(min), i32::from(max)) as i16
 }
 
 /// The stored exposure tick for an EV value.
 fn exposure_ticks(ev: f32) -> i16 {
-    quantize_tick(ev, EV_TICK, EXPOSURE_TICK_MIN, EXPOSURE_TICK_MAX)
+    quantize_ticks(ev, EV_TICKS_PER_EV, EXPOSURE_TICK_MIN, EXPOSURE_TICK_MAX)
 }
 
 /// The exposure EV a stored tick decodes to.
 fn exposure_ev(ticks: i16) -> f32 {
-    f32::from(ticks) * EV_TICK
+    step_value(ticks, EV_TICKS_PER_EV)
 }
 
 /// The stored contrast lift tick for a mid-pivoted power. The lift is
 /// `+log2(power)` (a rightward drag raises contrast), stored in the lift domain
-/// so the `0.05` slider grid is exact through the integer round-trip.
+/// so the fine (Shift) grid is exact through the integer round-trip.
 fn contrast_lift_ticks(power: f32) -> i16 {
-    quantize_tick(
-        power.clamp(0.125, 8.0).log2(),
-        TONE_TICK,
+    quantize_ticks(
+        clamp_to(power, contrast_power_range()).log2(),
+        TONE_TICKS_PER_UNIT,
         CONTRAST_TICK_MIN,
         CONTRAST_TICK_MAX,
     )
@@ -103,44 +217,44 @@ fn contrast_lift_ticks(power: f32) -> i16 {
 
 /// The contrast power a stored lift tick decodes to.
 fn contrast_power(ticks: i16) -> f32 {
-    (f32::from(ticks) * TONE_TICK).exp2()
+    step_value(ticks, TONE_TICKS_PER_UNIT).exp2()
 }
 
 /// The stored black density anchor tick.
 fn black_ticks(black: f32) -> i16 {
-    quantize_tick(black, BLACK_TICK, BLACK_TICK_MIN, BLACK_TICK_MAX)
+    quantize_ticks(black, BLACK_TICKS_PER_UNIT, BLACK_TICK_MIN, BLACK_TICK_MAX)
 }
 
 /// The black density anchor a stored tick decodes to.
 fn black_density(ticks: i16) -> f32 {
-    f32::from(ticks) * BLACK_TICK
+    step_value(ticks, BLACK_TICKS_PER_UNIT)
 }
 
 /// The stored white density anchor tick.
 fn white_ticks(white: f32) -> i16 {
-    quantize_tick(white, TONE_TICK, WHITE_TICK_MIN, WHITE_TICK_MAX)
+    quantize_ticks(white, TONE_TICKS_PER_UNIT, WHITE_TICK_MIN, WHITE_TICK_MAX)
 }
 
 /// The white density anchor a stored tick decodes to.
 fn white_density(ticks: i16) -> f32 {
-    f32::from(ticks) * TONE_TICK
+    step_value(ticks, TONE_TICKS_PER_UNIT)
 }
 
 /// The stored midtone pivot offset tick.
 fn pivot_ticks(pivot: f32) -> i16 {
-    quantize_tick(pivot, TONE_TICK, PIVOT_TICK_MIN, PIVOT_TICK_MAX)
+    quantize_ticks(pivot, TONE_TICKS_PER_UNIT, PIVOT_TICK_MIN, PIVOT_TICK_MAX)
 }
 
 /// The midtone pivot offset a stored tick decodes to.
 fn pivot_offset(ticks: i16) -> f32 {
-    f32::from(ticks) * TONE_TICK
+    step_value(ticks, TONE_TICKS_PER_UNIT)
 }
 
-/// Serializable per-file edits, stored as exact integer ticks (see [`EV_TICK`]
-/// / [`TONE_TICK`]) rather than f32.
+/// Serializable per-file edits, stored as exact integer ticks (see
+/// [`EV_TICKS_PER_EV`]) rather than f32.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EditData {
-    /// Exposure compensation in [`EV_TICK`] ticks (`14` = `+0.70 EV`).
+    /// Exposure compensation in [`EV_TICK`] ticks (`70` = `+0.70 EV`).
     #[serde(default = "default_exposure_ticks")]
     pub exposure_ticks: i16,
     /// Contrast lift in stop ticks (about the midtone pivot, `+log2`), `0` =
@@ -320,6 +434,14 @@ pub enum CropDirection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RollManifest {
     /// Manifest format revision; bumped when the on-disk schema changes.
+    ///
+    /// Pre-release, so a tick-grid change is NOT versioned: the integer grids
+    /// above (`*_TICKS_PER_*`) were refined in place — 5× for EV / contrast /
+    /// white / pivot, and Black's a further 5× on a 5× wider range — which
+    /// silently reinterprets every tick count a current build wrote (earlier
+    /// fine work reads back near identity).
+    /// The schema has never shipped, so there is nothing to migrate; a released
+    /// build must bump this instead.
     pub version: u32,
     /// Optional human-readable roll label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -384,8 +506,8 @@ impl RollManifest {
 
     /// Records the develop shape for `name` (contrast, black, white, midtone
     /// pivot), updating an existing entry in place. Values are quantized to
-    /// [`TONE_TICK`]; the identities are contrast `1.0`, black `0.0`, white
-    /// [`DEFAULT_WHITE`], pivot `0.0`.
+    /// [`TONE_TICK`] ([`BLACK_TICK`] for the black anchor); the identities are
+    /// contrast `1.0`, black `0.0`, white [`DEFAULT_WHITE`], pivot `0.0`.
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn set_develop(&mut self, name: &str, tone: ToneEdit) {
@@ -436,7 +558,8 @@ impl RollManifest {
     ///
     /// A paste never touches the target's crop or rotation: the crop margins
     /// and the user rotation survive [`Self::set_tone`] unchanged (or stay
-    /// default on a fresh file). Values are quantized to [`TONE_TICK`].
+    /// default on a fresh file). Values are quantized to [`TONE_TICK`]
+    /// ([`BLACK_TICK`] for the black anchor).
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn set_tone(&mut self, name: &str, tone: ToneEdit) {
@@ -660,7 +783,6 @@ pub fn reconcile(manifest: &mut RollManifest, files: &[String]) {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -747,6 +869,8 @@ mod tests {
 
         assert_eq!(loaded, manifest);
         assert_eq!(loaded.name(), Some("My Roll"));
+        // Decoding is exact: a tick divides by an exact integer tick count, so
+        // these equal the requested values bit for bit.
         assert_eq!(loaded.tone("IMG_0001.DNG").exposure_ev, 0.40);
         assert_eq!(loaded.tone("IMG_0002.RAW").exposure_ev, -0.75);
         let tone = loaded.tone("IMG_0001.DNG");
@@ -785,11 +909,99 @@ mod tests {
         let text = std::fs::read_to_string(manifest_path(&dir)).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert!(text.contains("exposure_ticks = 8"), "{text}");
+        assert!(text.contains("exposure_ticks = 40"), "{text}");
         assert!(text.contains("contrast_lift_ticks ="), "{text}");
-        assert!(text.contains("black_ticks = 10"), "{text}");
-        assert!(text.contains("white_ticks = 40"), "{text}");
-        assert!(text.contains("pivot_ticks = -2"), "{text}");
+        assert!(text.contains("black_ticks = 50"), "{text}");
+        assert!(text.contains("white_ticks = 200"), "{text}");
+        assert!(text.contains("pivot_ticks = -10"), "{text}");
+    }
+
+    #[test]
+    fn coarse_and_fine_steps_are_whole_numbers_of_stored_ticks() {
+        // The control ladder rests on this: both rungs are integer tick counts,
+        // so a bare drag / bare key can never land between ticks and the Shift
+        // rung stays a pure refinement of the coarse one. Exact integer
+        // arithmetic — no epsilon, because both sides are integers.
+        for (coarse, fine, ticks_per_unit, min, max) in [
+            (
+                EV_STEP,
+                EV_TICK,
+                EV_TICKS_PER_EV,
+                EXPOSURE_TICK_MIN,
+                EXPOSURE_TICK_MAX,
+            ),
+            (
+                TONE_STEP,
+                TONE_TICK,
+                TONE_TICKS_PER_UNIT,
+                CONTRAST_TICK_MIN,
+                CONTRAST_TICK_MAX,
+            ),
+            (
+                BLACK_STEP,
+                BLACK_TICK,
+                BLACK_TICKS_PER_UNIT,
+                BLACK_TICK_MIN,
+                BLACK_TICK_MAX,
+            ),
+        ] {
+            assert_eq!(
+                quantize_ticks(coarse, ticks_per_unit, min, max),
+                COARSE_TICKS
+            );
+            assert_eq!(quantize_ticks(fine, ticks_per_unit, min, max), FINE_TICKS);
+        }
+    }
+
+    #[test]
+    fn control_ranges_are_on_lattice_and_match_their_bounds() {
+        // (b): the widget range is derived from the stored tick bounds, so its
+        // end points are always whole ticks — the slider can never hand an edit
+        // a value the manifest would have to round.
+        for (range, ticks_per_unit, min, max) in [
+            (
+                exposure_range(),
+                EV_TICKS_PER_EV,
+                EXPOSURE_TICK_MIN,
+                EXPOSURE_TICK_MAX,
+            ),
+            (
+                contrast_lift_range(),
+                TONE_TICKS_PER_UNIT,
+                CONTRAST_TICK_MIN,
+                CONTRAST_TICK_MAX,
+            ),
+            (
+                black_range(),
+                BLACK_TICKS_PER_UNIT,
+                BLACK_TICK_MIN,
+                BLACK_TICK_MAX,
+            ),
+            (
+                white_range(),
+                TONE_TICKS_PER_UNIT,
+                WHITE_TICK_MIN,
+                WHITE_TICK_MAX,
+            ),
+            (
+                pivot_range(),
+                TONE_TICKS_PER_UNIT,
+                PIVOT_TICK_MIN,
+                PIVOT_TICK_MAX,
+            ),
+        ] {
+            assert_eq!(
+                quantize_ticks(*range.start(), ticks_per_unit, min, max),
+                min
+            );
+            assert_eq!(quantize_ticks(*range.end(), ticks_per_unit, min, max), max);
+        }
+        // The contrast slider shows stops, the develop functions take a power;
+        // both come from one symmetric pair of lift-tick bounds.
+        let power = contrast_power_range();
+        assert_eq!(*power.start(), 0.125);
+        assert_eq!(*power.end(), 8.0);
+        assert_eq!(contrast_lift_range(), -3.0..=3.0);
     }
 
     #[test]
@@ -930,7 +1142,7 @@ fortune = "ignored"
 base = 0.66
 calibration_frame = "a.DNG"
 [edits."a.DNG"]
-exposure_ticks = 30
+exposure_ticks = 150
 curve_contrast_lift_ticks = 8
 curve_highlights_ticks = 5
 curve_shadows_ticks = -3
@@ -969,16 +1181,18 @@ curve_shadows_ticks = -3
         for ev in [-3.0_f32, 0.0, 0.7, 2.0, 4.0] {
             assert!((exposure_ev(exposure_ticks(ev)) - ev).abs() < 1e-5);
         }
-        for tick in [-60_i16, -10, 0, 10, 60] {
+        // Coarse multiples (5, 20, 250) and single ticks (-4, -1, 4) alike
+        // round-trip through the lift↔power map.
+        for tick in [-300_i16, -50, -4, 0, 5, 20, 250, 300] {
             assert_eq!(contrast_lift_ticks(contrast_power(tick)), tick);
         }
-        for tick in [-40_i16, -5, 0, 5, 40] {
+        for tick in [-200_i16, -20, -1, 0, 1, 20, 180, 200] {
             assert_eq!(black_ticks(black_density(tick)), tick);
         }
-        for tick in [10_i16, 48, 100] {
+        for tick in [50_i16, 120, 240, 475, 500] {
             assert_eq!(white_ticks(white_density(tick)), tick);
         }
-        for tick in [-10_i16, 0, 10] {
+        for tick in [-50_i16, -4, -1, 0, 1, 4, 45, 50] {
             assert_eq!(pivot_ticks(pivot_offset(tick)), tick);
         }
     }

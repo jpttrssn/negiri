@@ -11,6 +11,7 @@ use crate::app::{
     contrast_power_for_lift, detail_zoom_delta,
 };
 use crate::detail_area::DetailArea;
+use crate::edit_manifest;
 use crate::error::FrameError;
 use crate::exif_writer;
 use crate::fl;
@@ -226,12 +227,22 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .spacing(space_xs);
 
     let label = widget::text(fl!("exposure-label"));
-    // The `0.05 EV` step matches `edit_manifest::EV_TICK`, the keyboard nudge,
-    // and the fixed-point storage grid.
-    let slider = widget::slider(-3.0..=4.0, app.tone.exposure_ev, Message::ExposureChanged)
-        .step(0.05_f32)
-        // A finished drag is an edit flush point.
-        .on_release(Message::EditSave);
+    // Every slider below runs on the same two rungs: a coarse bare drag of
+    // `*_STEP` and, while Shift is held, a fine one-tick drag of `*_TICK` —
+    // which is exactly the manifest's storage tick, so a fine drag is stored
+    // without rounding and cannot jump back on release.
+    //
+    // The ranges are `edit_manifest`'s, derived from the stored tick bounds, so a
+    // slider can only ever hand an edit a value the manifest stores exactly.
+    let slider = widget::slider(
+        edit_manifest::exposure_range(),
+        app.tone.exposure_ev,
+        Message::ExposureChanged,
+    )
+    .step(edit_manifest::EV_STEP)
+    .shift_step(edit_manifest::EV_TICK)
+    // A finished drag is an edit flush point.
+    .on_release(Message::EditSave);
 
     // Density-develop controls (see `docs/raw-pipeline-rewrite.md`): Contrast is
     // a power about the midtone pivot (presented as a `±3`-stop lift), Black and
@@ -239,19 +250,25 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // Every detail open starts from the stored edits. When one slider moves the
     // others travel along so the develop stays fully defined.
     let contrast_label = widget::text(fl!("contrast-label"));
-    let contrast_slider =
-        widget::slider(-3.0..=3.0, contrast_lift(app.tone.contrast), move |lift| {
+    // The contrast slider works in the stop-lift domain (what the manifest
+    // stores); `contrast_power_for_lift` maps to the power the develop takes.
+    let contrast_slider = widget::slider(
+        edit_manifest::contrast_lift_range(),
+        contrast_lift(app.tone.contrast),
+        move |lift| {
             Message::DevelopChanged(
                 contrast_power_for_lift(lift),
                 app.tone.black,
                 app.tone.white,
                 app.tone.pivot_offset,
             )
-        })
-        .step(0.05_f32)
-        .on_release(Message::EditSave);
+        },
+    )
+    .step(edit_manifest::TONE_STEP)
+    .shift_step(edit_manifest::TONE_TICK)
+    .on_release(Message::EditSave);
     let black_label = widget::text(fl!("black-label"));
-    let black_slider = widget::slider(-1.0..=1.0, app.tone.black, move |black| {
+    let black_slider = widget::slider(edit_manifest::black_range(), app.tone.black, move |black| {
         Message::DevelopChanged(
             app.tone.contrast,
             black,
@@ -259,13 +276,11 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
             app.tone.pivot_offset,
         )
     })
-    // `0.025` matches `edit_manifest::BLACK_TICK`: the black anchor shifts the
-    // develop numerator additively, so its per-tick effect is ~2× the white
-    // anchor's; the finer grid gives it a comparable feel.
-    .step(0.025_f32)
+    .step(edit_manifest::BLACK_STEP)
+    .shift_step(edit_manifest::BLACK_TICK)
     .on_release(Message::EditSave);
     let white_label = widget::text(fl!("white-label"));
-    let white_slider = widget::slider(0.0..=5.0, app.tone.white, move |white| {
+    let white_slider = widget::slider(edit_manifest::white_range(), app.tone.white, move |white| {
         Message::DevelopChanged(
             app.tone.contrast,
             app.tone.black,
@@ -273,13 +288,19 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
             app.tone.pivot_offset,
         )
     })
-    .step(0.05_f32)
+    .step(edit_manifest::TONE_STEP)
+    .shift_step(edit_manifest::TONE_TICK)
     .on_release(Message::EditSave);
     let pivot_label = widget::text(fl!("pivot-label"));
-    let pivot_slider = widget::slider(-0.5..=0.5, app.tone.pivot_offset, move |pivot| {
-        Message::DevelopChanged(app.tone.contrast, app.tone.black, app.tone.white, pivot)
-    })
-    .step(0.05_f32)
+    let pivot_slider = widget::slider(
+        edit_manifest::pivot_range(),
+        app.tone.pivot_offset,
+        move |pivot| {
+            Message::DevelopChanged(app.tone.contrast, app.tone.black, app.tone.white, pivot)
+        },
+    )
+    .step(edit_manifest::TONE_STEP)
+    .shift_step(edit_manifest::TONE_TICK)
     .on_release(Message::EditSave);
     // Keyboard crop readout + arm hint. The four values are the live margins
     // removed from each edge in source pixels (top/right/bottom/left).
@@ -493,9 +514,11 @@ pub(crate) const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("- / =", "help-edit-exposure"),
             ("[ / ]", "help-edit-contrast"),
-            ("; / '", "help-edit-highlights"),
-            (", / .", "help-edit-shadows"),
+            ("; / '", "help-edit-black"),
+            (", / .", "help-edit-white"),
+            ("u / i", "help-edit-pivot"),
             ("r", "help-edit-rotate"),
+            ("Shift", "help-edit-nudge"),
         ],
     ),
     (
