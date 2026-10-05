@@ -758,8 +758,9 @@ pub(crate) enum Message {
     /// The live density develop shape changed: new contrast, black, white, and
     /// midtone pivot. Applies to the shader as uniform-only updates.
     DevelopChanged(f32, f32, f32, f32),
-    /// Reset every first-class edit (exposure + tone curve) to their
-    /// identities in one action, and persist the reset like any other edit.
+    /// Reset every first-class edit (tone develop + crop + rotation) back to
+    /// the snapshot taken when the detail panel was opened — not to their
+    /// identities — and persist the reset like any other edit.
     ResetAll,
     /// Reset only the crop margins to zero (show the full frame), leaving the
     /// exposure and tone edits untouched, and persist the reset.
