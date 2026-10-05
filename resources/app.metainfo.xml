@@ -1,34 +1,38 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.jpttrssn.curvectrl</id>
+  <id>io.github.jpttrssn.negiri</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <developer_name>Jonatan Pettersson</developer_name>
-  <url type="homepage">https://github.com/jpttrssn/curvectrl</url>
-  <url type="bugtracker">https://github.com/jpttrssn/curvectrl</url>
-  <name>CurveCtrl</name>
-  <summary>A keyboard-centric film negative RAW image editor</summary>
+  <url type="homepage">https://github.com/jpttrssn/negiri</url>
+  <url type="bugtracker">https://github.com/jpttrssn/negiri</url>
+  <name>Negiri</name>
+  <summary>A film negative RAW image editor</summary>
   <description>
-    <p>A keyboard-centric film roll library and non-destructive RAW editor focused on digital camera scans of black and white film rolls.</p>
+    <p>A film roll library and non-destructive RAW editor focused on digital camera scans of black and white film rolls.</p>
     <ul>
       <li>Manage your film rolls</li>
-      <li>Film inversion presets</li>
-      <li>Auto inversion per frame or choosen frame</li>
-      <li>Basic tone curve adjustments</li>
-      <li>Crop mode tuned for removing edges</li>
+      <li>Non-destructive per-frame edits, stored in a hand-editable .film-roll.toml sidecar</li>
+      <li>Film-negative inversion in the optical-density domain: exposure, contrast, black, white, midtone pivot</li>
+      <li>One designated calibration frame per roll sets its clear-film base</li>
+      <li>Histogram with an output/input axis toggle, plus a classic T(p) curve overlay</li>
+      <li>Crop mode tuned for removing edges, plus quarter-turn display rotation</li>
+      <li>Post-gain 2x2 CFA averaging for lower read noise on monochrome negatives</li>
+      <li>Keyboard-centric: VIM navigation, a ? shortcut overlay, Shift for fine steps</li>
       <li>Set and export original roll date with chronological frame order</li>
       <li>Search by roll name or date</li>
+      <li>Export to JPEG or 16-bit PNG with EXIF capture-time stamping</li>
     </ul>
   </description>
   <icon type="remote" width="64" height="64" scale="1">
-    https://github.com/jpttrssn/curvectrl/raw/main/resources/icons/hicolor/scalable/apps/io.github.jpttrssn.curvectrl.svg
+    https://github.com/jpttrssn/negiri/raw/main/resources/icons/hicolor/scalable/apps/io.github.jpttrssn.negiri.svg
   </icon>
-  <url type="vcs-browser">https://github.com/jpttrssn/curvectrl</url>
-  <launchable type="desktop-id">io.github.jpttrssn.curvectrl.desktop</launchable>
+  <url type="vcs-browser">https://github.com/jpttrssn/negiri</url>
+  <launchable type="desktop-id">io.github.jpttrssn.negiri.desktop</launchable>
   <provides>
     <id>com.system76.CosmicApplication</id>
     <binaries>
-      <binary>curvectrl</binary>
+      <binary>negiri</binary>
     </binaries>
   </provides>
   <requires>
@@ -43,7 +47,11 @@
     <category>COSMIC</category>
   </categories>
   <keywords>
-    <keyword>COSMIC</keyword>
+    <keyword>film</keyword>
+    <keyword>negative</keyword>
+    <keyword>RAW</keyword>
+    <keyword>photo</keyword>
+    <keyword>editor</keyword>
   </keywords>
   <content_rating type="oars-1.1" />
 </component>

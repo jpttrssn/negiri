@@ -38,7 +38,7 @@ use std::time::Instant;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const APP_ICON: &[u8] =
-    include_bytes!("../resources/icons/hicolor/scalable/apps/io.github.jpttrssn.curvectrl.svg");
+    include_bytes!("../resources/icons/hicolor/scalable/apps/io.github.jpttrssn.negiri.svg");
 
 /// Maximum dimension of decoded RAW thumbnails, also the maximum Page 1 tile width.
 pub(crate) const THUMB_SIZE: f32 = 384.0;
@@ -878,7 +878,7 @@ impl cosmic::Application for AppModel {
     type Message = Message;
 
     /// Unique identifier in RDNN (reverse domain name notation) format.
-    const APP_ID: &'static str = "io.github.jpttrssn.curvectrl";
+    const APP_ID: &'static str = "io.github.jpttrssn.negiri";
 
     fn core(&self) -> &cosmic::Core {
         &self.core

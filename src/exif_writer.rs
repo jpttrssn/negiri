@@ -420,7 +420,7 @@ mod tests {
         let stamped = splice_after_soi(&stream, &jpeg_app1(&tiff));
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
-            "curvectrl_exif_readback_{}.jpg",
+            "negiri_exif_readback_{}.jpg",
             std::process::id()
         ));
         std::fs::write(&path, &stamped).unwrap();

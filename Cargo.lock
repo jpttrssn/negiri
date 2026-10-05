@@ -1102,30 +1102,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
-name = "curvectrl"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "i18n-embed",
- "i18n-embed-fl",
- "image",
- "jpeg-encoder",
- "kamadak-exif",
- "libcosmic",
- "log",
- "naga",
- "open",
- "png 0.18.1",
- "rawloader",
- "rust-embed",
- "serde",
- "thiserror 2.0.20",
- "tokio",
- "toml 0.8.23",
- "xdgen",
-]
-
-[[package]]
 name = "darling"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3166,6 +3142,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "negiri"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "i18n-embed",
+ "i18n-embed-fl",
+ "image",
+ "jpeg-encoder",
+ "kamadak-exif",
+ "libcosmic",
+ "log",
+ "naga",
+ "open",
+ "png 0.18.1",
+ "rawloader",
+ "rust-embed",
+ "serde",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml 0.8.23",
+ "xdgen",
 ]
 
 [[package]]

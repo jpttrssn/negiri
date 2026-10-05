@@ -8,7 +8,7 @@
 //! diagnostics are `log::error!`): the dependency tree's chatter — libcosmic,
 //! iced, wgpu, i18n-embed, zbus — stays quiet unless `RUST_LOG` opts into it.
 //! `RUST_LOG=debug` (a bare level) raises the threshold for every crate;
-//! `RUST_LOG=curvectrl=trace` raises only ours. The
+//! `RUST_LOG=negiri=trace` raises only ours. The
 //! `EXPOSURE_TRACE_DETAIL`/`EXPOSURE_TRACE_REBAKE` env vars force our crate to
 //! `trace`, preserving the codebase's existing detail/rebake tracing knobs.
 //!
@@ -66,7 +66,7 @@ pub(crate) fn init() {
 /// Defaults: our crate `error` (the app's diagnostics are all `error!`), every
 /// dependency `off`. The `EXPOSURE_TRACE_*` knobs force our crate to `trace`.
 /// `RUST_LOG` overrides: a bare level (`debug`) applies to every scope; a
-/// `curvectrl=<level>` form applies only to our crate. Other targets are
+/// `negiri=<level>` form applies only to our crate. Other targets are
 /// ignored.
 fn scopes_from_env() -> (LevelFilter, LevelFilter) {
     let mut own = LevelFilter::Error;

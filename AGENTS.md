@@ -20,7 +20,7 @@ COSMIC desktop app (libcosmic, Rust edition 2024) for film roll library manageme
 ## Codegen and i18n
 
 - `build.rs` runs `xdgen` at compile time: generates `target/xdgen/app.desktop` and `app.metainfo.xml` from the templates in `resources/` combined with fluent strings from `i18n/`. Edit templates in `resources/`, never generated output (`target/` is gitignored).
-- User-facing strings use the `fl!` macro with message IDs from `i18n/en/curvectrl.ftl`. Add new messages there; missing translations fall back to English.
+- User-facing strings use the `fl!` macro with message IDs from `i18n/en/negiri.ftl`. Add new messages there; missing translations fall back to English.
 
 ## Conventions
 

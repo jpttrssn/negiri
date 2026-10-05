@@ -1,9 +1,9 @@
 [Desktop Entry]
-Name=CurveCtrl
+Name=Negiri
 Comment=A film negative scanning and RAW image editor
 Type=Application
-Icon=io.github.jpttrssn.curvectrl
-Exec=curvectrl %F
+Icon=io.github.jpttrssn.negiri
+Exec=negiri %F
 Terminal=false
 StartupNotify=true
 Categories=COSMIC

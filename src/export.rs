@@ -772,7 +772,7 @@ mod tests {
         // swapped every sample (0x8000 was stored and read back as 0x0080 = 128).
         let mono = vec![0.5, 0.5, 0.5, 0.5];
         let dest = std::env::temp_dir().join(format!(
-            "curvectrl_png_smoke_{}.png",
+            "negiri_png_smoke_{}.png",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.subsec_nanos())
@@ -833,7 +833,7 @@ mod tests {
         // (dots per inch) + Xdensity 72 (00 48 BE) + Ydensity 72.
         let mono = vec![0.5; 4];
         let dest = std::env::temp_dir().join(format!(
-            "curvectrl_jpeg_dpi_{}.jpg",
+            "negiri_jpeg_dpi_{}.jpg",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.subsec_nanos())
@@ -880,7 +880,7 @@ mod tests {
         // A unique temp path per run so parallel test threads never collide.
         let mut dest = std::env::temp_dir();
         dest.push(format!(
-            "curvectrl_jpeg_smoke_{}.jpg",
+            "negiri_jpeg_smoke_{}.jpg",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.subsec_nanos())

@@ -1,13 +1,21 @@
-# CurveCtrl
-A keyboard-centric film roll library and non-destructive RAW editor focused on digital camera scans of black and white film rolls developed for the COSMIC desktop.
+<p align="center">
+  <img src="resources/icons/hicolor/scalable/apps/io.github.jpttrssn.negiri.svg" alt="Negiri" width="180">
+</p>
+
+# Negiri
+A film roll library and non-destructive RAW editor focused on digital camera scans of black and white film rolls developed for the COSMIC desktop.
 
 - Manage your film rolls
-- Film inversion presets
-- Auto base/black-point per frame or choosen frame
-- Basic tone curve adjustments
-- Crop mode tuned for removing edges
+- Non-destructive per-frame edits, stored in a hand-editable `.film-roll.toml` sidecar
+- Film-negative inversion in the optical-density domain: exposure, contrast, black, white, midtone pivot
+- One designated calibration frame per roll sets its clear-film base
+- Histogram with an output/input axis toggle, plus a classic `T(p)` curve overlay
+- Crop mode tuned for removing edges, plus quarter-turn display rotation
+- Post-gain 2×2 CFA averaging for lower read noise on monochrome negatives
+- Keyboard-centric: VIM navigation, a `?` shortcut overlay, Shift for fine steps
 - Set and export original roll date with chronological frame order
 - Search by roll name or date
+- Export to JPEG or 16-bit PNG with EXIF capture-time stamping
 
 ## Installation
 
@@ -32,7 +40,7 @@ If packaging for a Linux distribution, vendor dependencies locally with the `ven
 ```sh
 just vendor
 just build-vendored
-just rootdir=debian/curvectrl prefix=/usr install
+just rootdir=debian/negiri prefix=/usr install
 ```
 
 It is recommended to build a source tarball with the vendored dependencies, which can typically be done by running `just vendor` on the host system before it enters the build environment.
