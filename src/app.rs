@@ -169,10 +169,18 @@ impl Zoom {
 pub(crate) struct AppModel {
     /// Application state which is managed by the COSMIC runtime.
     core: cosmic::Core,
-    /// Display a context drawer with the designated page if defined.
+    /// Display a context drawer with the designated page if defined. Purely a
+    /// per-view drawer target — the About panel is tracked by `about_open`,
+    /// never by this field.
     context_page: ContextPage,
     /// Per-view context-drawer open/closed memory (see [`DrawerMemory`]).
     drawer_memory: DrawerMemory,
+    /// Whether the app-level About panel is showing. It is a transient overlay
+    /// over the context slot, independent of `context_page`/`drawer_memory`:
+    /// opening it never disturbs the current view's drawer state, and closing
+    /// it (its X, bare Space, or any view transition) restores that state via
+    /// [`AppModel::restore_drawer_for`].
+    about_open: bool,
     /// The about page for this app.
     about: About,
     /// Key bindings for the application's menu bar, consumed by
@@ -831,6 +839,10 @@ pub(crate) enum Message {
     /// Quit the application, persisting any open edits first.
     Quit,
     ToggleContextPage(ContextPage),
+    /// Toggle the app-level About panel (View → About, its X button). Separate
+    /// from [`Message::ToggleContextPage`] so opening and closing the panel can
+    /// never be confused with a view drawer's page.
+    ToggleAbout,
     /// Toggle the current page's context drawer (bare Space). Since the
     /// keyboard subscription's filter closure cannot capture app state, this
     /// defers the page choice to the update handler: editing while a detail
@@ -909,8 +921,9 @@ impl cosmic::Application for AppModel {
         // Construct the app model with the runtime's core.
         let mut app = AppModel {
             core,
-            context_page: ContextPage::default(),
+            context_page: DrawerView::Library.page(),
             drawer_memory: DrawerMemory::default(),
+            about_open: false,
             about,
             key_binds: HashMap::from([
                 (
@@ -1310,12 +1323,18 @@ impl cosmic::Application for AppModel {
             return None;
         }
 
-        match self.context_page {
-            ContextPage::About => Some(context_drawer::about(
+        // The About panel owns the context slot while it is open: it is not a
+        // view drawer, so it takes precedence over `context_page` and cannot
+        // race it for the slot.
+        if self.about_open {
+            return Some(context_drawer::about(
                 &self.about,
                 |url| Message::LaunchUrl(url.to_string()),
-                Message::ToggleContextPage(ContextPage::About),
-            )),
+                Message::ToggleAbout,
+            ));
+        }
+
+        match self.context_page {
             ContextPage::Editing => {
                 // Without a selection there is nothing to edit.
                 let name = self.selected.as_ref()?;
@@ -2045,7 +2064,10 @@ impl cosmic::Application for AppModel {
                 ) {
                     self.library_selection = None;
                     if self.context_page == ContextPage::RollInfo {
-                        self.core_mut().set_show_context(false);
+                        // An About panel covering this drawer keeps the slot:
+                        // `about_open` alone decides its visibility.
+                        let about_open = self.about_open;
+                        self.core_mut().set_show_context(about_open);
                         self.drawer_memory.set(DrawerView::Library, false);
                     }
                 }
@@ -2403,21 +2425,30 @@ impl cosmic::Application for AppModel {
             }
 
             Message::ToggleContextPage(context_page) => {
-                // The drawer's close button (X) routes here with its own page;
-                // the View → About menu routes here with `About`. About is a
-                // transient panel: the menu opens it, its X (or Space) dismisses
-                // it by restoring the current view's remembered drawer state,
-                // and the view drawers' X closes them, clearing that view's
-                // remembered state.
-                if context_page == ContextPage::About && self.context_page != ContextPage::About {
-                    self.context_page = ContextPage::About;
-                    self.core_mut().set_show_context(true);
-                } else if self.context_page == ContextPage::About {
-                    self.restore_drawer_for(self.current_view());
-                } else if context_page == self.current_view().page() {
+                // A view drawer's close button (X) routes here with its own
+                // page: hide the drawer and clear that view's remembered
+                // state. The About panel never comes through here — it is not
+                // a page, it routes through `Message::ToggleAbout`.
+                if context_page == self.current_view().page() {
                     self.core_mut().set_show_context(false);
                     self.drawer_memory.set(self.current_view(), false);
                 }
+                Task::none()
+            }
+
+            Message::ToggleAbout => {
+                // View → About opens the transient panel over the context
+                // slot without touching `context_page`/`drawer_memory`, so an
+                // open view drawer underneath is merely covered while About
+                // shows. Closing it (this message again from the menu, or the
+                // panel's X) restores the current view's remembered state via
+                // `restore_drawer_for`, which also drops `about_open`.
+                if self.about_open {
+                    self.restore_drawer_for(self.current_view());
+                    return Task::none();
+                }
+                self.about_open = true;
+                self.core_mut().set_show_context(true);
                 Task::none()
             }
 
@@ -2426,18 +2457,9 @@ impl cosmic::Application for AppModel {
                 // view's context drawer. About, if showing, is dismissed and
                 // the view's own remembered state is restored.
                 let view = self.current_view();
-                // A genuinely showing About (menu-opened) is dismissed by
-                // restoring the view's remembered drawer state — see #18.
-                if self.context_page == ContextPage::About && self.core.window.show_context {
+                if self.about_open {
                     self.restore_drawer_for(view);
                     return Task::none();
-                }
-                // A "phantom" About is only `ContextPage`'s launch default
-                // (nothing is showing): clear it and fall through so the very
-                // first toggle opens the drawer instead of silently restoring
-                // the remembered-closed state.
-                if self.context_page == ContextPage::About {
-                    self.context_page = view.page();
                 }
                 if self.core.window.show_context {
                     self.drawer_memory.set(view, false);
@@ -3609,8 +3631,11 @@ impl AppModel {
     /// Point the context drawer at `view`'s panel with that view's remembered
     /// open/closed state, clamped to validity. Called on every view transition
     /// so the drawer follows the current view without ever closing on
-    /// navigation.
+    /// navigation, and by every path that dismisses the About panel (its X,
+    /// View → About again, bare Space) — so the transient About is dropped
+    /// here, in one place, and the view's remembered state takes over.
     fn restore_drawer_for(&mut self, view: DrawerView) {
+        self.about_open = false;
         self.context_page = view.page();
         let open = self.drawer_memory.get(view) && self.view_drawer_valid(view);
         self.core_mut().set_show_context(open);
@@ -3971,7 +3996,10 @@ impl AppModel {
         {
             self.library_selection = None;
             if self.context_page == ContextPage::RollInfo {
-                self.core_mut().set_show_context(false);
+                // An About panel covering this drawer keeps the slot:
+                // `about_open` alone decides its visibility.
+                let about_open = self.about_open;
+                self.core_mut().set_show_context(about_open);
                 self.drawer_memory.set(DrawerView::Library, false);
             }
         }
@@ -4801,11 +4829,12 @@ fn detail_result_is_current(
     selected == Some(finished) && inflight == Some(finished)
 }
 
-/// The context page to display in the context drawer.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+/// The context page to display in the context drawer: which *view's* panel it
+/// shows. Deliberately excludes the app-level About panel (see
+/// [`AppModel::about_open`]) — it is not tied to a view, and folding it in here
+/// made "is About showing?" ambiguous (the launch default vs. a real panel).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ContextPage {
-    #[default]
-    About,
     /// The editing panel for the active detail view.
     Editing,
     /// The metadata drawer for the library roll selection (`library_selection`).
@@ -4896,7 +4925,7 @@ impl menu::action::MenuAction for MenuAction {
             MenuAction::PasteEdits => Message::PasteEdits,
             MenuAction::Export => Message::ExportRequested,
             MenuAction::CalibrateBase => Message::CalibrateBaseFromFrame,
-            MenuAction::About => Message::ToggleContextPage(ContextPage::About),
+            MenuAction::About => Message::ToggleAbout,
             MenuAction::Details => Message::ToggleContext,
             MenuAction::ToggleCropMode => Message::ToggleCropMode,
         }
