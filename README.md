@@ -14,7 +14,7 @@ A film roll library and non-destructive RAW editor focused on digital camera sca
 - Post-gain 2×2 CFA averaging for lower read noise on monochrome negatives
 - Keyboard-centric: VIM navigation, a `?` shortcut overlay, Shift for fine steps
 - Set and export original roll date with chronological frame order
-- Search by roll name or date
+- Search by roll metadata
 - Export to JPEG or 16-bit PNG with EXIF capture-time stamping
 
 ## Installation
