@@ -1231,10 +1231,11 @@ impl cosmic::Application for AppModel {
             menu::items(
                 &self.key_binds,
                 vec![
-                    menu::Item::Button(fl!("about"), None, MenuAction::About),
                     details,
                     menu::Item::Divider,
                     crop_mode,
+                    menu::Item::Divider,
+                    menu::Item::Button(fl!("about"), None, MenuAction::About),
                 ],
             ),
         );
