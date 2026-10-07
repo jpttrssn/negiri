@@ -30,15 +30,20 @@ use cosmic::iced::widget::Stack;
 use cosmic::iced::widget::scrollable::Viewport;
 use cosmic::iced::{Length, Point, Size, Subscription};
 use cosmic::prelude::*;
+use cosmic::theme;
+use cosmic::widget::responsive_menu_bar;
 use cosmic::widget::{self, about::About, icon, image::Handle, menu, toaster};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const APP_ICON: &[u8] =
     include_bytes!("../resources/icons/hicolor/scalable/apps/io.github.jpttrssn.negiri.svg");
+
+static MENU_ID: LazyLock<cosmic::widget::Id> =
+    LazyLock::new(|| cosmic::widget::Id::new("responsive-menu"));
 
 /// Maximum dimension of decoded RAW thumbnails, also the maximum Page 1 tile width.
 pub(crate) const THUMB_SIZE: f32 = 384.0;
@@ -1135,19 +1140,16 @@ impl cosmic::Application for AppModel {
             menu::Item::Button(fl!("menu-export"), None, MenuAction::Export)
         };
 
-        let file_menu = menu::Tree::with_children(
-            menu::root(fl!("menu-file")).apply(Element::from),
-            menu::items(
-                &self.key_binds,
-                vec![
-                    menu::Item::Button(fl!("menu-add-roll"), None, MenuAction::AddRoll),
-                    remove_roll,
-                    menu::Item::Divider,
-                    export,
-                    menu::Item::Divider,
-                    menu::Item::Button(fl!("menu-quit"), None, MenuAction::Quit),
-                ],
-            ),
+        let file_menu = (
+            fl!("menu-file"),
+            vec![
+                menu::Item::Button(fl!("menu-add-roll"), None, MenuAction::AddRoll),
+                remove_roll,
+                menu::Item::Divider,
+                export,
+                menu::Item::Divider,
+                menu::Item::Button(fl!("menu-quit"), None, MenuAction::Quit),
+            ],
         );
 
         // Copy/paste edits are only actionable while a frame selection exists
@@ -1187,21 +1189,18 @@ impl cosmic::Application for AppModel {
             ]
         };
 
-        let edit_menu = menu::Tree::with_children(
-            menu::root(fl!("menu-edit")).apply(Element::from),
-            menu::items(
-                &self.key_binds,
-                [
-                    vec![
-                        menu::Item::Button(fl!("menu-select-all"), None, MenuAction::SelectAll),
-                        menu::Item::Divider,
-                        copy_edits,
-                        paste_edits,
-                    ],
-                    calibrate_items,
-                ]
-                .concat(),
-            ),
+        let edit_menu = (
+            fl!("menu-edit"),
+            [
+                vec![
+                    menu::Item::Button(fl!("menu-select-all"), None, MenuAction::SelectAll),
+                    menu::Item::Divider,
+                    copy_edits,
+                    paste_edits,
+                ],
+                calibrate_items,
+            ]
+            .concat(),
         );
 
         // The generic Details item opens the context drawer: the editing panel
@@ -1226,27 +1225,28 @@ impl cosmic::Application for AppModel {
             menu::Item::ButtonDisabled(fl!("menu-crop-mode"), None, MenuAction::ToggleCropMode)
         };
 
-        let view_menu = menu::Tree::with_children(
-            menu::root(fl!("menu-view")).apply(Element::from),
-            menu::items(
-                &self.key_binds,
-                vec![
-                    details,
-                    menu::Item::Divider,
-                    crop_mode,
-                    menu::Item::Divider,
-                    menu::Item::Button(fl!("about"), None, MenuAction::About),
-                ],
-            ),
+        let view_menu = (
+            fl!("menu-view"),
+            vec![
+                details,
+                menu::Item::Divider,
+                crop_mode,
+                menu::Item::Divider,
+                menu::Item::Button(fl!("about"), None, MenuAction::About),
+            ],
         );
 
-        // Menu popups must be backed by real Wayland surfaces (and know which
-        // window to anchor to), so the bar forwards surface actions to the
-        // cosmic runtime — matching how cosmic-files wires its menu bar.
-        let menu_bar = menu::bar(vec![file_menu, edit_menu, view_menu])
-            .window_id_maybe(self.core().main_window_id())
-            .on_surface_action(Message::Surface)
-            .item_width(menu::ItemWidth::Uniform(250));
+        let menu_bar = responsive_menu_bar()
+            .item_height(menu::ItemHeight::Dynamic(40))
+            .item_width(menu::ItemWidth::Uniform(360))
+            .spacing(theme::spacing().space_xxxs.into())
+            .into_element(
+                self.core(),
+                &self.key_binds,
+                MENU_ID.clone(),
+                Message::Surface,
+                vec![file_menu, edit_menu, view_menu],
+            );
 
         vec![menu_bar.into()]
     }
