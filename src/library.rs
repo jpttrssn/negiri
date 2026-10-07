@@ -210,18 +210,19 @@ impl MonthAliases {
 }
 
 /// One whitespace-separated library search token. `Text` matches the roll name
-/// as a case-insensitive substring; `Date` matches the roll name the same way
-/// OR a committed roll date. Additional searchable roll data (tags, film type,
-/// …) is a new variant plus a `roll_matches_terms` arm — nothing else changes.
+/// or any of its free-form film-metadata fields as a case-insensitive
+/// substring; `Date` matches those the same way OR a committed roll date.
 enum SearchTerm {
-    /// A plain term matched against the roll name (case-insensitive substring).
+    /// A plain term matched against the roll name and film metadata
+    /// (case-insensitive substring).
     Text(String),
-    /// A date-shaped term matched against the roll name as a substring OR the
-    /// committed dates (`None` predicate fields are wildcards). `2026` → year
-    /// only; `may` → month only; adjacent tokens stay independent (`may 2026`
-    /// is a May AND a 2026 predicate, per the chosen simple semantics).
+    /// A date-shaped term matched against the roll name and film metadata as a
+    /// substring OR the committed dates (`None` predicate fields are
+    /// wildcards). `2026` → year only; `may` → month only; adjacent tokens stay
+    /// independent (`may 2026` is a May AND a 2026 predicate, per the chosen
+    /// simple semantics).
     Date {
-        /// The lowercased source token, for the name-substring fallback.
+        /// The lowercased source token, for the name/metadata-substring fallback.
         text: String,
         month: Option<u32>,
         year: Option<u32>,
@@ -258,18 +259,35 @@ fn parse_search_query(query: &str, months: &MonthAliases) -> Vec<SearchTerm> {
         .collect()
 }
 
+/// Whether the lowercased `text` appears in the roll's name or any of its
+/// free-form film-metadata fields (film, location, camera, lens, developer
+/// notes) as a case-insensitive substring.
+fn roll_text_matches(roll: &Roll, text: &str) -> bool {
+    roll.name.to_lowercase().contains(text)
+        || [
+            roll.meta.film.as_deref(),
+            roll.meta.location.as_deref(),
+            roll.meta.camera.as_deref(),
+            roll.meta.lens.as_deref(),
+            roll.meta.developer_notes.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value.to_lowercase().contains(text))
+}
+
 /// Whether `roll` satisfies every term in `terms` (AND-across-tokens). `[]`
-/// matches every roll. A `Date` term matches when the source token appears in
-/// the roll name (so an undated roll named "Trip 2026" answers `2026`, and
-/// "Mayfield" answers `may`) OR when either committed date satisfies the
-/// month/year predicate (`parse_iso_date`) — a roll spanning two months answers
-/// both month queries.
+/// matches every roll. A `Text` term matches the roll name or its film metadata
+/// (case-insensitive substring). A `Date` term matches when the source token
+/// appears in the name or metadata (so an undated roll named "Trip 2026" answers
+/// `2026`, and "Mayfield" answers `may`) OR when either committed date satisfies
+/// the month/year predicate (`parse_iso_date`) — a roll spanning two months
+/// answers both month queries.
 fn roll_matches_terms(roll: &Roll, terms: &[SearchTerm]) -> bool {
     terms.iter().all(|term| match term {
-        SearchTerm::Text(text) => roll.name.to_lowercase().contains(text),
+        SearchTerm::Text(text) => roll_text_matches(roll, text),
         SearchTerm::Date { text, month, year } => {
-            let name_matches = roll.name.to_lowercase().contains(text);
-            name_matches
+            roll_text_matches(roll, text)
                 || [roll.start_date.as_deref(), roll.end_date.as_deref()]
                     .into_iter()
                     .flatten()
@@ -284,10 +302,10 @@ fn roll_matches_terms(roll: &Roll, terms: &[SearchTerm]) -> bool {
     })
 }
 
-/// Rolls matching the toolbar query: every token must match the roll name
-/// (case-insensitive substring) or a committed roll date (year / month).
-/// Shared by the library view and arrow-key navigation so both move over the
-/// same visible set.
+/// Rolls matching the toolbar query: every token must match the roll name or
+/// its film metadata (case-insensitive substring) or a committed roll date
+/// (year / month). Shared by the library view and arrow-key navigation so both
+/// move over the same visible set.
 pub(crate) fn filtered_rolls<'a>(rolls: &'a [Roll], query: &str, months: &MonthAliases) -> Vec<&'a Roll> {
     let terms = parse_search_query(query, months);
     rolls
@@ -705,6 +723,55 @@ mod tests {
         assert_eq!(filtered_rolls(&rolls, "may", &aliases).len(), 1);
         assert_eq!(filtered_rolls(&rolls, "june", &aliases).len(), 1);
         assert_eq!(filtered_rolls(&rolls, "june 2026", &aliases).len(), 1);
+    }
+
+    #[test]
+    fn search_matches_film_metadata_fields() {
+        let aliases = test_aliases();
+        let mut r = roll("/a", "Roll");
+        r.meta.film = Some("Kodak Tri-X 400".into());
+        r.meta.location = Some("Chicago".into());
+        r.meta.camera = Some("Nikon FM2".into());
+        r.meta.lens = Some("50mm f/1.4".into());
+        r.meta.developer_notes = Some("HC-110 dilution B".into());
+        let rolls = [r];
+
+        // Each metadata field is searchable as a case-insensitive substring.
+        for query in ["tri-x", "chicago", "nikon", "50mm", "hc-110"] {
+            assert_eq!(filtered_rolls(&rolls, query, &aliases).len(), 1, "{query}");
+        }
+        // Matching is case-insensitive both ways.
+        assert_eq!(filtered_rolls(&rolls, "KODAK", &aliases).len(), 1);
+        // A term no field contains matches nothing.
+        assert!(filtered_rolls(&rolls, "leica", &aliases).is_empty());
+    }
+
+    #[test]
+    fn search_metadata_terms_are_and_composed_with_name() {
+        let aliases = test_aliases();
+        let mut r = roll("/a", "Summer");
+        r.meta.camera = Some("Nikon FM2".into());
+        r.meta.film = Some("Kodak Tri-X".into());
+        let rolls = [r];
+
+        // Name AND metadata must both match the same roll.
+        assert_eq!(filtered_rolls(&rolls, "summer nikon", &aliases).len(), 1);
+        assert!(filtered_rolls(&rolls, "summer leica", &aliases).is_empty());
+        // Two metadata terms AND together.
+        assert_eq!(filtered_rolls(&rolls, "nikon tri-x", &aliases).len(), 1);
+        assert!(filtered_rolls(&rolls, "nikon portra", &aliases).is_empty());
+    }
+
+    #[test]
+    fn search_date_token_falls_back_to_metadata_substring() {
+        let aliases = test_aliases();
+        // "may" is a date-shaped token; a roll with no date but a "Mayfair"
+        // location still answers it through the metadata substring fallback.
+        let mut r = roll("/a", "Roll");
+        r.meta.location = Some("Mayfair".into());
+        let rolls = [r];
+
+        assert_eq!(filtered_rolls(&rolls, "may", &aliases).len(), 1);
     }
 
     #[test]
