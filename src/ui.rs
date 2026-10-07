@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::app::{
     AppModel, Message, Roll, RollDateField, THUMB_SIZE, TILE_ASPECT, Thumb, Tile, contrast_lift,
-    contrast_power_for_lift, detail_zoom_delta,
+    contrast_power_for_lift, detail_zoom_delta, white_density_from_ui, white_ui_from_density,
 };
 use crate::detail_area::DetailArea;
 use crate::edit_manifest;
@@ -280,14 +280,21 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     .shift_step(edit_manifest::BLACK_TICK)
     .on_release(Message::EditSave);
     let white_label = widget::text(fl!("white-label"));
-    let white_slider = widget::slider(edit_manifest::white_range(), app.tone.white, move |white| {
-        Message::DevelopChanged(
-            app.tone.contrast,
-            app.tone.black,
-            white,
-            app.tone.pivot_offset,
-        )
-    })
+    // The White slider runs on an INVERTED axis (right = brighter): the develop's
+    // density anchor darkens as it rises, so the handle shows its mirror and
+    // converts back on drag (see `white_ui_from_density`).
+    let white_slider = widget::slider(
+        edit_manifest::white_range(),
+        white_ui_from_density(app.tone.white),
+        move |ui| {
+            Message::DevelopChanged(
+                app.tone.contrast,
+                app.tone.black,
+                white_density_from_ui(ui),
+                app.tone.pivot_offset,
+            )
+        },
+    )
     .step(edit_manifest::TONE_STEP)
     .shift_step(edit_manifest::TONE_TICK)
     .on_release(Message::EditSave);

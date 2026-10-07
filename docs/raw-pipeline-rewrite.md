@@ -52,7 +52,7 @@ before any LUT fallback.
 | Exposure | brightens | `+` density offset |
 | Contrast | more contrast | steeper `T` |
 | Black | raise black point (darken/clip darks) | black density anchor `+` |
-| White | raise white point (brighten/clip brights) | white density anchor `+` |
+| White | raise white point (brighten/clip brights) | white density anchor `−` |
 | Midtone pivot | bend toward brights | pivot offset `+` from midpoint |
 
 Each direction gets a unit test asserting the monotone effect, so a sign cannot

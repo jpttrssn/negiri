@@ -869,7 +869,11 @@ pub(crate) enum MoveDir {
 /// A single editing-control adjustment from a keyboard shortcut: which control
 /// and the signed delta to apply (positive = increase). The step (coarse vs
 /// nudge) is resolved at construction by `edit_adjust_for`, so the handler
-/// only clamps against the control's range and applies.
+/// only clamps against the control's range and applies. Deltas are in each
+/// control's UI axis (what the slider drags), not necessarily its stored
+/// domain: Contrast carries a stop lift (converted to a power) and White an
+/// inverted-axis value (converted to the density anchor); see
+/// `apply_edit_adjust`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EditAdjust {
     Exposure(f32),
@@ -3812,10 +3816,13 @@ impl AppModel {
                 );
             }
             EditAdjust::White(delta) => {
+                // `delta` is in the White slider's UI axis (right = brighter),
+                // which is the density anchor mirrored — so a positive step
+                // LOWERS the stored density (see `white_density_from_ui`).
                 self.set_develop_shape(
                     self.tone.contrast,
                     self.tone.black,
-                    clamp_white(self.tone.white + delta),
+                    clamp_white(self.tone.white - delta),
                     self.tone.pivot_offset,
                 );
             }
@@ -4538,6 +4545,24 @@ pub(crate) fn contrast_lift(power: f32) -> f32 {
 /// range (round-trip `lift ↔ power` is exact within the range).
 pub(crate) fn contrast_power_for_lift(value: f32) -> f32 {
     clamp_contrast_power(value.exp2())
+}
+
+/// The White slider's user-facing value: the white density anchor mirrored about
+/// the middle of its range, so INCREASING it raises the white point (brightens /
+/// clips highlights) — matching every other control's rightward "increase"
+/// convention. The develop's `white` density does the opposite (a higher anchor
+/// darkens), so White is the one control whose UI axis is inverted. The mirror
+/// is its own inverse and maps the tick lattice onto itself.
+pub(crate) fn white_ui_from_density(density: f32) -> f32 {
+    let range = edit_manifest::white_range();
+    *range.start() + *range.end() - density
+}
+
+/// The stored white density anchor for a White-slider value (or keyboard step):
+/// the inverse of [`white_ui_from_density`] (the same mirror).
+pub(crate) fn white_density_from_ui(ui: f32) -> f32 {
+    let range = edit_manifest::white_range();
+    *range.start() + *range.end() - ui
 }
 
 /// Translates the crop window by `delta_px` in `direction`, keeping the window
@@ -5776,6 +5801,30 @@ mod tests {
             "black's grid must be the finer of the two"
         );
         assert!(edit_manifest::BLACK_TICK < edit_manifest::TONE_TICK);
+    }
+
+    #[test]
+    fn white_ui_axis_inverts_the_density_anchor() {
+        // The White slider runs on a mirrored density axis so right = brighter:
+        // the range endpoints swap, and the mirror is an involution that keeps
+        // the tick lattice.
+        let range = edit_manifest::white_range();
+        assert!((white_ui_from_density(*range.start()) - *range.end()).abs() < 1e-6);
+        assert!((white_ui_from_density(*range.end()) - *range.start()).abs() < 1e-6);
+        for density in [0.5_f32, 1.8, 2.4, 3.1, 5.0] {
+            let round_trip = white_density_from_ui(white_ui_from_density(density));
+            assert!(
+                (round_trip - density).abs() < 1e-6,
+                "white density {density} round-tripped to {round_trip}"
+            );
+        }
+        // Rightward = brighter: a higher UI value lowers the density anchor,
+        // which `film::slider_directions_are_right_to_increase` pins as brighter.
+        assert!(white_density_from_ui(4.0) < white_density_from_ui(2.0));
+        // A positive keyboard step (`.`), interpreted in the UI axis, lowers the
+        // density too — so the increase key matches the slider's rightward drag.
+        let stepped = white_density_from_ui(white_ui_from_density(2.4) + EDIT_STEP_CURVE);
+        assert!(stepped < 2.4, "`.` should brighten, density went to {stepped}");
     }
 
     #[test]
