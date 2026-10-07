@@ -11,7 +11,7 @@ use crate::film::{MIN_PLAUSIBLE_BASE, measure_base};
 use crate::fl;
 use crate::library::{
     LibraryCell, MonthAliases, library_cell_index, library_cells, nav_target, paginate,
-    record_roll_dates, record_roll_name, roll_dates_valid, valid_iso_date,
+    record_roll_dates, record_roll_meta, record_roll_name, roll_dates_valid, valid_iso_date,
 };
 use crate::pipeline::{
     DetailDecode, convert_thumbnail, decode_raw_detail, histogram_from_develop, resized_dims,
@@ -363,6 +363,11 @@ pub(crate) struct AppModel {
     /// the selected roll's current name on selection change and committed on
     /// submit.
     roll_name_draft: String,
+    /// Draft text for the roll-info drawer's free-form film metadata fields
+    /// (film, location, camera, lens, developer notes), seeded from the
+    /// selected roll's committed metadata on selection change and committed
+    /// per-field on submit.
+    roll_meta_draft: edit_manifest::RollMeta,
     /// Whether the detail view is in crop mode — a focused, VIM-like modal
     /// state toggled by the bare `c` key or the View → Crop mode menu item.
     /// Only meaningfully on with a detail view open. While active the surround
@@ -421,6 +426,42 @@ pub(crate) struct AppModel {
 pub(crate) enum RollDateField {
     Start,
     End,
+}
+
+/// Which free-form roll metadata field a draft/commit message targets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RollMetaField {
+    Film,
+    Location,
+    Camera,
+    Lens,
+    DeveloperNotes,
+}
+
+impl RollMetaField {
+    /// The field's current value in `meta` (empty when unset), for seeding the
+    /// drawer's draft input.
+    fn get(self, meta: &edit_manifest::RollMeta) -> &str {
+        match self {
+            Self::Film => meta.film.as_deref(),
+            Self::Location => meta.location.as_deref(),
+            Self::Camera => meta.camera.as_deref(),
+            Self::Lens => meta.lens.as_deref(),
+            Self::DeveloperNotes => meta.developer_notes.as_deref(),
+        }
+        .unwrap_or("")
+    }
+
+    /// Writes the field in `meta` (`None` clears it).
+    fn set(self, meta: &mut edit_manifest::RollMeta, value: Option<String>) {
+        match self {
+            Self::Film => meta.film = value,
+            Self::Location => meta.location = value,
+            Self::Camera => meta.camera = value,
+            Self::Lens => meta.lens = value,
+            Self::DeveloperNotes => meta.developer_notes = value,
+        }
+    }
 }
 
 /// Draft ISO date text for the two roll-info drawer date fields (start and
@@ -499,6 +540,9 @@ pub(crate) struct Roll {
     pub start_date: Option<String>,
     /// The roll's optional end date (ISO `YYYY-MM-DD`), if already set.
     pub end_date: Option<String>,
+    /// The roll's free-form film metadata (film stock, location, camera, lens,
+    /// developer notes). Mirrors the edit manifest; display-only.
+    pub meta: edit_manifest::RollMeta,
     /// Decoded cover thumbnail state.
     pub thumb: Thumb,
 }
@@ -794,6 +838,15 @@ pub(crate) enum Message {
     /// trimmed draft (empty reverts to the directory leaf) to the roll's
     /// manifest and update the in-memory roll and card.
     RollNameDraftSubmit,
+    /// The user typed into one of the roll-info drawer's free-form metadata
+    /// fields (film, location, camera, lens, developer notes). Carries the
+    /// affected field and the new draft text (kept in RAM so typing doesn't
+    /// fight a read-only view); nothing is committed until submit.
+    RollMetaDraftChange(RollMetaField, String),
+    /// A free-form roll metadata field was submitted (Enter/return): persist
+    /// the trimmed draft (empty clears the field) to the roll's manifest and
+    /// update the in-memory roll.
+    RollMetaDraftSubmit(RollMetaField),
     /// Toggle the detail view's crop mode: a focused modal state (bare `c` or
     /// View → Crop mode) in which the surround renders white and the shader
     /// dims everything outside the crop, frame paging is disabled, and only
@@ -1062,6 +1115,7 @@ impl cosmic::Application for AppModel {
                 end: String::new(),
             },
             roll_name_draft: String::new(),
+            roll_meta_draft: edit_manifest::RollMeta::default(),
             rotation: 0,
             crop_mode: false,
             help_visible: false,
@@ -1373,6 +1427,7 @@ impl cosmic::Application for AppModel {
                             &self.roll_name_draft,
                             &self.roll_date_drafts.start,
                             &self.roll_date_drafts.end,
+                            &self.roll_meta_draft,
                         ),
                         Message::ToggleContextPage(ContextPage::RollInfo),
                     )
@@ -1629,7 +1684,7 @@ impl cosmic::Application for AppModel {
         // committed dates; stale uncommitted text is dropped). Runs before
         // dispatch so every path — navigation, Space, direct selection — is
         // covered by one guard.
-        self.sync_roll_date_drafts();
+        self.sync_roll_drafts();
 
         // While the global help overlay is shown, it is modal: only `?`/Escape
         // (ToggleHelp), the plumbing that must keep flowing underneath
@@ -1947,15 +2002,15 @@ impl cosmic::Application for AppModel {
             Message::RollDateDraftSubmit(field) => {
                 let draft = self.roll_date_drafts.get(field).trim().to_owned();
                 if !draft.is_empty() && !valid_iso_date(&draft) {
-                    self.sync_roll_date_drafts();
+                    self.sync_roll_drafts();
                     return Task::none();
                 }
                 let Some(LibrarySelection::Roll(dir)) = self.library_selection.clone() else {
-                    self.sync_roll_date_drafts();
+                    self.sync_roll_drafts();
                     return Task::none();
                 };
                 let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) else {
-                    self.sync_roll_date_drafts();
+                    self.sync_roll_drafts();
                     return Task::none();
                 };
                 let next = if draft.is_empty() { None } else { Some(draft) };
@@ -1972,7 +2027,7 @@ impl cosmic::Application for AppModel {
                     }
                 };
                 if !coherent {
-                    self.sync_roll_date_drafts();
+                    self.sync_roll_drafts();
                     return Task::none();
                 }
                 match field {
@@ -2004,11 +2059,11 @@ impl cosmic::Application for AppModel {
             Message::RollNameDraftSubmit => {
                 let draft = self.roll_name_draft.trim().to_owned();
                 let Some(LibrarySelection::Roll(dir)) = self.library_selection.clone() else {
-                    self.sync_roll_date_drafts();
+                    self.sync_roll_drafts();
                     return Task::none();
                 };
                 let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) else {
-                    self.sync_roll_date_drafts();
+                    self.sync_roll_drafts();
                     return Task::none();
                 };
                 roll.name = if draft.is_empty() {
@@ -2022,6 +2077,38 @@ impl cosmic::Application for AppModel {
                     draft
                 };
                 self.roll_name_draft = roll.name.clone();
+                Task::none()
+            }
+
+            // A free-form roll metadata field gained a keystroke: keep the draft
+            // text in RAM (never touching the committed value) so the read-only
+            // view can re-render it. Commit happens only on submit.
+            Message::RollMetaDraftChange(field, value) => {
+                field.set(&mut self.roll_meta_draft, Some(value));
+                Task::none()
+            }
+
+            // A free-form roll metadata field was submitted (Enter/return): the
+            // trimmed draft becomes the field's value — an empty draft clears
+            // it. The in-memory roll is updated and the manifest is flushed.
+            Message::RollMetaDraftSubmit(field) => {
+                let trimmed = field.get(&self.roll_meta_draft).trim().to_owned();
+                let Some(LibrarySelection::Roll(dir)) = self.library_selection.clone() else {
+                    self.sync_roll_drafts();
+                    return Task::none();
+                };
+                let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) else {
+                    self.sync_roll_drafts();
+                    return Task::none();
+                };
+                let value = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
+                field.set(&mut roll.meta, value);
+                record_roll_meta(&roll.dir, roll.meta.clone());
+                self.roll_meta_draft = roll.meta.clone();
                 Task::none()
             }
 
@@ -2686,7 +2773,7 @@ impl AppModel {
     /// the selection changes, so the drawer never shows a previous roll's edits.
     fn set_library_selection(&mut self, selection: LibrarySelection) {
         self.library_selection = Some(selection);
-        self.sync_roll_date_drafts();
+        self.sync_roll_drafts();
     }
 
     /// Drills into a roll's frame grid (double click, or Enter on the selected
@@ -3661,13 +3748,13 @@ impl AppModel {
         self.core_mut().set_show_context(open);
     }
 
-    /// Reseeds the roll-info drawer's date drafts whenever the library roll
-    /// selection no longer matches the key the drafts were seeded from (a
-    /// different roll always starts from its own committed dates; a stale
-    /// selection such as the Add Roll tile clears the key so the next roll
-    /// reseeds). Cheap: a path comparison — it runs at the top of `update` for
-    /// every message.
-    fn sync_roll_date_drafts(&mut self) {
+    /// Reseeds the roll-info drawer's drafts (name, dates, and free-form film
+    /// metadata) whenever the library roll selection no longer matches the key
+    /// the drafts were seeded from (a different roll always starts from its own
+    /// committed values; a stale selection such as the Add Roll tile clears the
+    /// key so the next roll reseeds). Cheap: a path comparison — it runs at the
+    /// top of `update` for every message.
+    fn sync_roll_drafts(&mut self) {
         let Some(LibrarySelection::Roll(dir)) = self.library_selection.clone() else {
             self.roll_date_drafts.key = None;
             return;
@@ -3675,19 +3762,13 @@ impl AppModel {
         if self.roll_date_drafts.key.as_deref() == Some(dir.as_path()) {
             return;
         }
-        let (start, end, name) =
-            self.rolls
-                .iter()
-                .find(|roll| roll.dir == dir)
-                .map_or((None, None, None), |roll| {
-                    (
-                        roll.start_date.as_deref(),
-                        roll.end_date.as_deref(),
-                        Some(roll.name.as_str()),
-                    )
-                });
-        self.roll_date_drafts = RollDateDrafts::from_dates(dir, start, end);
-        self.roll_name_draft = name.unwrap_or("").to_owned();
+        let Some(roll) = self.rolls.iter().find(|roll| roll.dir == dir) else {
+            return;
+        };
+        self.roll_date_drafts =
+            RollDateDrafts::from_dates(dir, roll.start_date.as_deref(), roll.end_date.as_deref());
+        self.roll_name_draft = roll.name.clone();
+        self.roll_meta_draft = roll.meta.clone();
     }
 
     /// Kicks off the lazy EXIF parse for the highlighted frame if the frame-info
@@ -4232,6 +4313,7 @@ async fn load_roll(dir: PathBuf) -> Roll {
         frame_count,
         start_date,
         end_date,
+        meta: manifest.meta(),
         thumb: Thumb::Loading,
     }
 }

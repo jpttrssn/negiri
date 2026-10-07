@@ -469,6 +469,35 @@ pub struct RollManifest {
     /// means the roll is undated or a single-day roll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_date: Option<String>,
+    /// The film stock the roll was shot on (free text, e.g. `Kodak Tri-X 400`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub film: Option<String>,
+    /// Where the roll was shot (free text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// The camera the roll was shot with (free text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<String>,
+    /// The lens(es) used for the roll (free text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lens: Option<String>,
+    /// Free-form developer/process notes for the roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_notes: Option<String>,
+}
+
+/// The roll's free-form film metadata (film stock, location, camera, lens, and
+/// developer notes) as one aggregate, mirroring how [`ToneEdit`] aggregates the
+/// per-frame edit scalars. Each field is an optional string; `None` means the
+/// field was never recorded (and serializes to nothing, keeping untouched rolls'
+/// manifests clean).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RollMeta {
+    pub film: Option<String>,
+    pub location: Option<String>,
+    pub camera: Option<String>,
+    pub lens: Option<String>,
+    pub developer_notes: Option<String>,
 }
 
 impl Default for RollManifest {
@@ -481,6 +510,11 @@ impl Default for RollManifest {
             calibration_frame: None,
             start_date: None,
             end_date: None,
+            film: None,
+            location: None,
+            camera: None,
+            lens: None,
+            developer_notes: None,
         }
     }
 }
@@ -689,6 +723,31 @@ impl RollManifest {
     pub fn set_dates(&mut self, start: Option<String>, end: Option<String>) {
         self.start_date = start;
         self.end_date = end;
+    }
+
+    /// The roll's free-form film metadata as one [`RollMeta`] aggregate
+    /// (decoded from the flat manifest fields).
+    #[must_use]
+    pub fn meta(&self) -> RollMeta {
+        RollMeta {
+            film: self.film.clone(),
+            location: self.location.clone(),
+            camera: self.camera.clone(),
+            lens: self.lens.clone(),
+            developer_notes: self.developer_notes.clone(),
+        }
+    }
+
+    /// Records the roll's free-form film metadata, replacing all five fields at
+    /// once. A `None` field clears it (and serializes to nothing).
+    ///
+    /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
+    pub fn set_meta(&mut self, meta: RollMeta) {
+        self.film = meta.film;
+        self.location = meta.location;
+        self.camera = meta.camera;
+        self.lens = meta.lens;
+        self.developer_notes = meta.developer_notes;
     }
 
     /// The frame name designated as the roll's calibration reference (the
@@ -1130,6 +1189,37 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(loaded.start_date(), Some("2026-05-30"));
         assert_eq!(loaded.end_date(), Some("2026-06-02"));
+    }
+
+    #[test]
+    fn roll_meta_round_trips() {
+        let dir = temp_dir("roll-meta");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = RollManifest::default();
+        manifest.set_meta(RollMeta {
+            film: Some("Kodak Tri-X 400".to_owned()),
+            location: Some("Chicago".to_owned()),
+            camera: Some("Nikon FM2".to_owned()),
+            lens: Some("50mm f/1.4".to_owned()),
+            developer_notes: Some("HC-110 dil B, 6:30".to_owned()),
+        });
+        save_roll_manifest(&dir, &manifest).unwrap();
+        let loaded = load_roll_manifest(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(loaded.meta(), manifest.meta());
+        assert_eq!(loaded.meta().film.as_deref(), Some("Kodak Tri-X 400"));
+        assert_eq!(loaded.meta().developer_notes.as_deref(), Some("HC-110 dil B, 6:30"));
+    }
+
+    #[test]
+    fn default_manifest_omits_empty_roll_meta() {
+        let text = toml::to_string_pretty(&RollManifest::default()).unwrap();
+        for key in ["film", "location", "camera", "lens", "developer_notes"] {
+            assert!(
+                !text.contains(key),
+                "default manifest unexpectedly contains `{key}`:\n{text}"
+            );
+        }
     }
 
     #[test]

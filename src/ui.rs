@@ -7,8 +7,9 @@
 use std::path::Path;
 
 use crate::app::{
-    AppModel, Message, Roll, RollDateField, THUMB_SIZE, TILE_ASPECT, Thumb, Tile, contrast_lift,
-    contrast_power_for_lift, detail_zoom_delta, white_density_from_ui, white_ui_from_density,
+    AppModel, Message, Roll, RollDateField, RollMetaField, THUMB_SIZE, TILE_ASPECT, Thumb, Tile,
+    contrast_lift, contrast_power_for_lift, detail_zoom_delta, white_density_from_ui,
+    white_ui_from_density,
 };
 use crate::detail_area::DetailArea;
 use crate::edit_manifest;
@@ -784,15 +785,33 @@ fn roll_date_field(label: String, value: &str, field: RollDateField) -> Element<
         .into()
 }
 
+/// A labeled free-form text field for the roll-info drawer's film metadata,
+/// committed on Enter via [`Message::RollMetaDraftSubmit`]. Seeded from the live
+/// draft so an in-progress edit survives view re-renders.
+fn roll_meta_field(label: String, value: &str, field: RollMetaField) -> Element<'_, Message> {
+    widget::column::with_capacity(2)
+        .push(widget::text(label))
+        .push(
+            widget::text_input("", value)
+                .width(Length::Fill)
+                .on_input(move |v| Message::RollMetaDraftChange(field, v))
+                .on_submit(move |_| Message::RollMetaDraftSubmit(field)),
+        )
+        .spacing(cosmic::theme::spacing().space_xs)
+        .into()
+}
+
 /// Renders the roll metadata drawer: the editable roll name heading, its full
-/// path, frame count, and cover file, then the roll dates (start + optional
-/// end, committed on Enter), the film preset, and the removal action. The
-/// drawer pane supplies the width/padding.
+/// path, frame count, and cover file, then the film stock, the roll dates
+/// (start + optional end), the location, the camera and lens, and free-form
+/// developer notes, then the removal action. The drawer pane supplies the
+/// width/padding.
 pub(crate) fn roll_info_panel<'a>(
     roll: &'a Roll,
     name_draft: &'a str,
     start_draft: &'a str,
     end_draft: &'a str,
+    meta_draft: &'a edit_manifest::RollMeta,
 ) -> Element<'a, Message> {
     let space_xs = cosmic::theme::spacing().space_xs;
 
@@ -809,7 +828,7 @@ pub(crate) fn roll_info_panel<'a>(
     )
     .width(Length::Fill);
 
-    widget::column::with_capacity(12)
+    widget::column::with_capacity(20)
         .push(name)
         .push(widget::divider::horizontal::default())
         .push(widget::text::body(fl!(
@@ -825,7 +844,12 @@ pub(crate) fn roll_info_panel<'a>(
             cover = roll.cover.clone().unwrap_or_else(|| fl!("roll-no-cover"))
         )))
         .push(widget::divider::horizontal::default())
-        .push(widget::text(fl!("roll-dates-label")))
+        .push(roll_meta_field(
+            fl!("roll-meta-film-label"),
+            meta_draft.film.as_deref().unwrap_or(""),
+            RollMetaField::Film,
+        ))
+        .push(widget::divider::horizontal::default())
         .push(roll_date_field(
             fl!("roll-date-start-label"),
             start_draft,
@@ -835,6 +859,28 @@ pub(crate) fn roll_info_panel<'a>(
             fl!("roll-date-end-label"),
             end_draft,
             RollDateField::End,
+        ))
+        .push(roll_meta_field(
+            fl!("roll-meta-location-label"),
+            meta_draft.location.as_deref().unwrap_or(""),
+            RollMetaField::Location,
+        ))
+        .push(widget::divider::horizontal::default())
+        .push(roll_meta_field(
+            fl!("roll-meta-camera-label"),
+            meta_draft.camera.as_deref().unwrap_or(""),
+            RollMetaField::Camera,
+        ))
+        .push(roll_meta_field(
+            fl!("roll-meta-lens-label"),
+            meta_draft.lens.as_deref().unwrap_or(""),
+            RollMetaField::Lens,
+        ))
+        .push(widget::divider::horizontal::default())
+        .push(roll_meta_field(
+            fl!("roll-meta-developer-notes-label"),
+            meta_draft.developer_notes.as_deref().unwrap_or(""),
+            RollMetaField::DeveloperNotes,
         ))
         .push(widget::divider::horizontal::default())
         .push(remove)

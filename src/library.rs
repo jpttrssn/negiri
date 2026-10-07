@@ -39,6 +39,21 @@ pub(crate) fn record_roll_name(dir: &Path, name: Option<String>) {
     }
 }
 
+/// Persists a roll's free-form film metadata (film stock, location, camera,
+/// lens, developer notes) to its edit manifest, the on-disk source of truth
+/// across restarts. A write always happens, mirroring [`record_roll_dates`]:
+/// a cleared field must be recorded as absent.
+pub(crate) fn record_roll_meta(dir: &Path, meta: edit_manifest::RollMeta) {
+    let mut manifest = edit_manifest::load_roll_manifest(dir);
+    manifest.set_meta(meta);
+    if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
+        log::error!(
+            "failed to write roll manifest {}: {err}",
+            edit_manifest::manifest_path(dir).display()
+        );
+    }
+}
+
 /// Parses a zero-padded ISO date (`YYYY-MM-DD`) with a real calendar month and
 /// day (leap-year aware) into `(year, month, day)`. `None` for anything else —
 /// including a non-zero-padded shape like `2024-5-9`.
@@ -399,6 +414,7 @@ mod tests {
             frame_count: 0,
             start_date: None,
             end_date: None,
+            meta: edit_manifest::RollMeta::default(),
             thumb: Thumb::Loading,
         }
     }
