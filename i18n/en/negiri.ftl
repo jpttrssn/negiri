@@ -1,5 +1,5 @@
 app-title = Negiri
-app-comment = A keyboard-centric film roll library and non-destructive RAW editor focused on digital camera scans of black and white film rolls
+app-comment = A film roll library and non-destructive RAW editor focused on digital camera scans of black and white film rolls developed for the COSMIC desktop
 app-keywords = film, negative, RAW, editor, photo, library
 about = About...
 repository = Repository
