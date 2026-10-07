@@ -10,42 +10,27 @@ use std::path::Path;
 use crate::app::{LibrarySelection, MoveDir, Roll};
 use crate::edit_manifest;
 
-/// Persists a roll's start and optional end dates to its edit manifest, the
-/// on-disk source of truth across restarts. A write always happens: a cleared
-/// field must be recorded as absent, so there is no implicit-default shortcut
-/// here.
-pub(crate) fn record_roll_dates(dir: &Path, start: Option<String>, end: Option<String>) {
-    let mut manifest = edit_manifest::load_roll_manifest(dir);
-    manifest.set_dates(start, end);
-    if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
-        log::error!(
-            "failed to write roll manifest {}: {err}",
-            edit_manifest::manifest_path(dir).display()
-        );
-    }
+/// The roll-info drawer's editable values, written together in one manifest
+/// update. `name`/`start_date`/`end_date` are the *committed* forms (an empty
+/// name is `None`, so the label falls back to the directory leaf; an empty date
+/// is `None`), and `meta` carries the five free-form film-metadata fields.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct RollDrawer {
+    pub name: Option<String>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub meta: edit_manifest::RollMeta,
 }
 
-/// Persists a roll's display label to its edit manifest, the on-disk source of
-/// truth across restarts. `None` clears the label so the roll falls back to
-/// its directory leaf, mirroring [`record_roll_dates`]'s always-write rule.
-pub(crate) fn record_roll_name(dir: &Path, name: Option<String>) {
+/// Persists the roll-info drawer's values to the roll's edit manifest, the
+/// on-disk source of truth across restarts. All fields are written in one
+/// load+save so a debounced commit is a single atomic write; a cleared field is
+/// recorded as absent (there is no implicit-default shortcut here).
+pub(crate) fn record_roll_drawer(dir: &Path, drawer: RollDrawer) {
     let mut manifest = edit_manifest::load_roll_manifest(dir);
-    manifest.set_name(name);
-    if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
-        log::error!(
-            "failed to write roll manifest {}: {err}",
-            edit_manifest::manifest_path(dir).display()
-        );
-    }
-}
-
-/// Persists a roll's free-form film metadata (film stock, location, camera,
-/// lens, developer notes) to its edit manifest, the on-disk source of truth
-/// across restarts. A write always happens, mirroring [`record_roll_dates`]:
-/// a cleared field must be recorded as absent.
-pub(crate) fn record_roll_meta(dir: &Path, meta: edit_manifest::RollMeta) {
-    let mut manifest = edit_manifest::load_roll_manifest(dir);
-    manifest.set_meta(meta);
+    manifest.set_name(drawer.name);
+    manifest.set_dates(drawer.start_date, drawer.end_date);
+    manifest.set_meta(drawer.meta);
     if let Err(err) = edit_manifest::save_roll_manifest(dir, &manifest) {
         log::error!(
             "failed to write roll manifest {}: {err}",
@@ -93,6 +78,22 @@ pub(crate) fn parse_iso_date(s: &str) -> Option<(u32, u32, u32)> {
 /// the caller and never reaches this check.
 pub(crate) fn valid_iso_date(s: &str) -> bool {
     parse_iso_date(s).is_some()
+}
+
+/// Resolves a date field's draft text against the committed value for a
+/// debounced commit: an empty draft clears the date (`None`), a valid ISO
+/// `YYYY-MM-DD` draft becomes that date, and anything else (still-being-typed or
+/// malformed) keeps the committed value so a partial edit is never persisted.
+#[must_use]
+pub(crate) fn resolve_date_draft(draft: &str, committed: Option<&str>) -> Option<String> {
+    let trimmed = draft.trim();
+    if trimmed.is_empty() {
+        None
+    } else if valid_iso_date(trimmed) {
+        Some(trimmed.to_owned())
+    } else {
+        committed.map(str::to_owned)
+    }
 }
 
 /// Whether a roll's committed dates are coherent: either may be absent, but when
@@ -510,6 +511,29 @@ mod tests {
         assert!(!valid_iso_date("may 9 2024"));
         assert!(!valid_iso_date("2024-05-09-10")); // trailing noise
         assert!(!valid_iso_date(""));
+    }
+
+    #[test]
+    fn resolve_date_draft_clears_validates_or_keeps_committed() {
+        // An empty (or whitespace) draft clears the date.
+        assert_eq!(resolve_date_draft("", Some("2024-05-09")), None);
+        assert_eq!(resolve_date_draft("   ", Some("2024-05-09")), None);
+        // A valid ISO date is trimmed and adopted.
+        assert_eq!(
+            resolve_date_draft(" 2024-06-01 ", None),
+            Some("2024-06-01".to_owned())
+        );
+        // A partial or malformed draft keeps the committed value, so a
+        // mid-typing debounce never persists a bad date.
+        assert_eq!(
+            resolve_date_draft("2024-06", Some("2024-05-09")),
+            Some("2024-05-09".to_owned())
+        );
+        assert_eq!(resolve_date_draft("nope", None), None);
+        assert_eq!(
+            resolve_date_draft("2024-5-9", Some("2024-05-09")),
+            Some("2024-05-09".to_owned())
+        );
     }
 
     #[test]

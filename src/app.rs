@@ -10,8 +10,8 @@ use crate::export::{
 use crate::film::{MIN_PLAUSIBLE_BASE, measure_base};
 use crate::fl;
 use crate::library::{
-    LibraryCell, MonthAliases, library_cell_index, library_cells, nav_target, paginate,
-    record_roll_dates, record_roll_meta, record_roll_name, roll_dates_valid, valid_iso_date,
+    LibraryCell, MonthAliases, RollDrawer, library_cell_index, library_cells, nav_target, paginate,
+    record_roll_drawer, resolve_date_draft, roll_dates_valid,
 };
 use crate::pipeline::{
     DetailDecode, convert_thumbnail, decode_raw_detail, histogram_from_develop, resized_dims,
@@ -150,6 +150,12 @@ const MAX_TEXTURE_EDGE: u32 = 8192;
 /// library re-filter. The input text still updates instantly; only the
 /// applied filter (`search_filter`) waits for this quiet period.
 const SEARCH_DEBOUNCE_MS: u64 = 300;
+
+/// Debounce window (ms) between the last keystroke in a roll-info drawer text
+/// field and the manifest write. All drawer fields (name, dates, film metadata)
+/// share one timer and one atomic write; an invalid/partial date is simply not
+/// persisted until it becomes valid.
+const ROLL_DRAWER_DEBOUNCE_MS: u64 = 300;
 
 /// The application model stores app-specific state used to describe its interface and
 /// drive its logic.
@@ -357,17 +363,25 @@ pub(crate) struct AppModel {
     pub(crate) rotation: u8,
     /// Draft text for the two roll date fields in the roll-info drawer, seeded
     /// from the selected roll's committed dates on selection change and
-    /// committed back on submit.
+    /// debounce-committed back to the roll + manifest.
     roll_date_drafts: RollDateDrafts,
     /// Draft text for the roll-info drawer's editable name heading, seeded from
-    /// the selected roll's current name on selection change and committed on
-    /// submit.
+    /// the selected roll's current name on selection change and
+    /// debounce-committed back.
     roll_name_draft: String,
     /// Draft text for the roll-info drawer's free-form film metadata fields
     /// (film, location, camera, lens, developer notes), seeded from the
-    /// selected roll's committed metadata on selection change and committed
-    /// per-field on submit.
+    /// selected roll's committed metadata on selection change and
+    /// debounce-committed back.
     roll_meta_draft: edit_manifest::RollMeta,
+    /// Monotonic serial for the roll-info drawer's debounced commit: every
+    /// keystroke bumps it, and a `RollDraftsCommit` whose serial no longer
+    /// matches is dropped (the search input's `search_version` pattern).
+    roll_drafts_version: u64,
+    /// Whether the roll-info drawer's drafts differ from the committed roll and
+    /// a debounced commit is pending; gates the manifest write so an unchanged
+    /// selection switch never touches disk.
+    roll_drafts_dirty: bool,
     /// Whether the detail view is in crop mode — a focused, VIM-like modal
     /// state toggled by the bare `c` key or the View → Crop mode menu item.
     /// Only meaningfully on with a detail view open. While active the surround
@@ -439,19 +453,6 @@ pub(crate) enum RollMetaField {
 }
 
 impl RollMetaField {
-    /// The field's current value in `meta` (empty when unset), for seeding the
-    /// drawer's draft input.
-    fn get(self, meta: &edit_manifest::RollMeta) -> &str {
-        match self {
-            Self::Film => meta.film.as_deref(),
-            Self::Location => meta.location.as_deref(),
-            Self::Camera => meta.camera.as_deref(),
-            Self::Lens => meta.lens.as_deref(),
-            Self::DeveloperNotes => meta.developer_notes.as_deref(),
-        }
-        .unwrap_or("")
-    }
-
     /// Writes the field in `meta` (`None` clears it).
     fn set(self, meta: &mut edit_manifest::RollMeta, value: Option<String>) {
         match self {
@@ -466,7 +467,7 @@ impl RollMetaField {
 
 /// Draft ISO date text for the two roll-info drawer date fields (start and
 /// optional end). Seeded from the selected roll's committed dates; updated by
-/// typing; committed back to the roll and its manifest on submit. Holds plain
+/// typing; debounce-committed back to the roll and its manifest. Holds plain
 /// `String`s so an in-progress edit stays stable while the read-only view
 /// re-renders. `key` is the roll directory the drafts were seeded from, so a
 /// changed library selection (or a fresh drawer) reseeds on the next sync.
@@ -493,14 +494,6 @@ impl RollDateDrafts {
         match field {
             RollDateField::Start => self.start = value,
             RollDateField::End => self.end = value,
-        }
-    }
-
-    /// The draft for a given field.
-    fn get(&self, field: RollDateField) -> &str {
-        match field {
-            RollDateField::Start => &self.start,
-            RollDateField::End => &self.end,
         }
     }
 }
@@ -823,30 +816,23 @@ pub(crate) enum Message {
     /// exposure and tone edits untouched, and persist the reset.
     ResetCrop,
     /// The user typed into a roll date field in the roll-info drawer. Carries
-    /// the affected field and the new draft text (kept in RAM so typing
-    /// doesn't fight a read-only view); nothing is committed until submit.
+    /// the affected field and the new draft text (kept in RAM so typing doesn't
+    /// fight a read-only view); persisted by the debounced `RollDraftsCommit`.
     RollDateDraftChange(RollDateField, String),
-    /// A roll date field was submitted (Enter/return): validate the ISO
-    /// `YYYY-MM-DD` draft (empty clears the date), persist it to the roll's
-    /// manifest, and update the in-memory roll and card.
-    RollDateDraftSubmit(RollDateField),
     /// The user typed into the roll-info drawer's editable name heading.
     /// Carries the new draft text (kept in RAM so typing doesn't fight a
-    /// read-only view); nothing is committed until submit.
+    /// read-only view); persisted by the debounced `RollDraftsCommit`.
     RollNameDraftChange(String),
-    /// The editable name heading was submitted (Enter/return): persist the
-    /// trimmed draft (empty reverts to the directory leaf) to the roll's
-    /// manifest and update the in-memory roll and card.
-    RollNameDraftSubmit,
     /// The user typed into one of the roll-info drawer's free-form metadata
     /// fields (film, location, camera, lens, developer notes). Carries the
     /// affected field and the new draft text (kept in RAM so typing doesn't
-    /// fight a read-only view); nothing is committed until submit.
+    /// fight a read-only view); persisted by the debounced `RollDraftsCommit`.
     RollMetaDraftChange(RollMetaField, String),
-    /// A free-form roll metadata field was submitted (Enter/return): persist
-    /// the trimmed draft (empty clears the field) to the roll's manifest and
-    /// update the in-memory roll.
-    RollMetaDraftSubmit(RollMetaField),
+    /// The roll-info drawer's debounced commit: `ROLL_DRAWER_DEBOUNCE_MS` after
+    /// the last keystroke in any drawer text field, persist the whole draft
+    /// (name, dates, film metadata) in one manifest write. The inner serial
+    /// must match `roll_drafts_version`, so only the last of a burst lands.
+    RollDraftsCommit(u64),
     /// Toggle the detail view's crop mode: a focused modal state (bare `c` or
     /// View → Crop mode) in which the surround renders white and the shader
     /// dims everything outside the crop, frame paging is disabled, and only
@@ -1116,6 +1102,8 @@ impl cosmic::Application for AppModel {
             },
             roll_name_draft: String::new(),
             roll_meta_draft: edit_manifest::RollMeta::default(),
+            roll_drafts_version: 0,
+            roll_drafts_dirty: false,
             rotation: 0,
             crop_mode: false,
             help_visible: false,
@@ -1985,130 +1973,34 @@ impl cosmic::Application for AppModel {
                 self.commit_edit()
             }
 
-            // A roll date field in the roll-info drawer gained a keystroke:
-            // keep the draft text in RAM (never touching the committed date)
-            // so the read-only view can re-render it. Commit happens only on
-            // submit.
+            // The roll-info drawer's text fields all feed RAM drafts on each
+            // keystroke (never touching the committed roll) and schedule one
+            // shared debounced commit, so typing never fights the read-only view
+            // and the manifest is written once per quiet period.
             Message::RollDateDraftChange(field, value) => {
                 self.roll_date_drafts.set(field, value);
-                Task::none()
+                self.schedule_roll_draft_commit()
             }
 
-            // A roll date field was submitted (Enter/return): an empty draft
-            // clears the date, a valid ISO `YYYY-MM-DD` draft commits it
-            // (normalized), an invalid one is dropped by re-seeding the drafts
-            // from the committed dates. The in-memory roll (and thus the
-            // library card) is updated and the manifest is flushed.
-            Message::RollDateDraftSubmit(field) => {
-                let draft = self.roll_date_drafts.get(field).trim().to_owned();
-                if !draft.is_empty() && !valid_iso_date(&draft) {
-                    self.sync_roll_drafts();
-                    return Task::none();
-                }
-                let Some(LibrarySelection::Roll(dir)) = self.library_selection.clone() else {
-                    self.sync_roll_drafts();
-                    return Task::none();
-                };
-                let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) else {
-                    self.sync_roll_drafts();
-                    return Task::none();
-                };
-                let next = if draft.is_empty() { None } else { Some(draft) };
-                // A committed date must not contradict the other one: the roll
-                // may not end before it starts (ending the export-relevant
-                // start/end coherence). A conflicting submit is dropped by
-                // re-seeding the drafts, like a malformed date.
-                let coherent = match field {
-                    RollDateField::Start => {
-                        roll_dates_valid(next.as_deref(), roll.end_date.as_deref())
-                    }
-                    RollDateField::End => {
-                        roll_dates_valid(roll.start_date.as_deref(), next.as_deref())
-                    }
-                };
-                if !coherent {
-                    self.sync_roll_drafts();
-                    return Task::none();
-                }
-                match field {
-                    RollDateField::Start => roll.start_date = next,
-                    RollDateField::End => roll.end_date = next,
-                }
-                record_roll_dates(&roll.dir, roll.start_date.clone(), roll.end_date.clone());
-                self.roll_date_drafts = RollDateDrafts::from_dates(
-                    dir,
-                    roll.start_date.as_deref(),
-                    roll.end_date.as_deref(),
-                );
-                Task::none()
-            }
-
-            // The roll-info drawer's editable name heading gained a keystroke:
-            // keep the draft text in RAM (never touching the committed name) so
-            // the read-only view can re-render it. Commit happens only on submit.
             Message::RollNameDraftChange(value) => {
                 self.roll_name_draft = value;
-                Task::none()
+                self.schedule_roll_draft_commit()
             }
 
-            // The editable heading was submitted (Enter/return): the trimmed
-            // draft becomes the roll's display name — an empty draft clears
-            // the label so the roll falls back to its directory leaf. The
-            // in-memory roll (and thus the library card, search, and sort) is
-            // updated and the manifest is flushed.
-            Message::RollNameDraftSubmit => {
-                let draft = self.roll_name_draft.trim().to_owned();
-                let Some(LibrarySelection::Roll(dir)) = self.library_selection.clone() else {
-                    self.sync_roll_drafts();
-                    return Task::none();
-                };
-                let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) else {
-                    self.sync_roll_drafts();
-                    return Task::none();
-                };
-                roll.name = if draft.is_empty() {
-                    // Clear the label: the directory leaf is derived at load.
-                    record_roll_name(&roll.dir, None);
-                    dir.file_name()
-                        .and_then(|name| name.to_str())
-                        .map_or_else(|| roll.name.clone(), str::to_owned)
-                } else {
-                    record_roll_name(&roll.dir, Some(draft.clone()));
-                    draft
-                };
-                self.roll_name_draft = roll.name.clone();
-                Task::none()
-            }
-
-            // A free-form roll metadata field gained a keystroke: keep the draft
-            // text in RAM (never touching the committed value) so the read-only
-            // view can re-render it. Commit happens only on submit.
             Message::RollMetaDraftChange(field, value) => {
                 field.set(&mut self.roll_meta_draft, Some(value));
-                Task::none()
+                self.schedule_roll_draft_commit()
             }
 
-            // A free-form roll metadata field was submitted (Enter/return): the
-            // trimmed draft becomes the field's value — an empty draft clears
-            // it. The in-memory roll is updated and the manifest is flushed.
-            Message::RollMetaDraftSubmit(field) => {
-                let trimmed = field.get(&self.roll_meta_draft).trim().to_owned();
-                let Some(LibrarySelection::Roll(dir)) = self.library_selection.clone() else {
-                    self.sync_roll_drafts();
-                    return Task::none();
-                };
-                let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) else {
-                    self.sync_roll_drafts();
-                    return Task::none();
-                };
-                let value = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed)
-                };
-                field.set(&mut roll.meta, value);
-                record_roll_meta(&roll.dir, roll.meta.clone());
-                self.roll_meta_draft = roll.meta.clone();
+            // The drawer's debounced commit fired: drop it if a newer keystroke
+            // arrived, otherwise persist the whole draft to the roll it was
+            // seeded from.
+            Message::RollDraftsCommit(version) => {
+                if version == self.roll_drafts_version
+                    && let Some(dir) = self.roll_date_drafts.key.clone()
+                {
+                    self.commit_roll_drafts(&dir);
+                }
                 Task::none()
             }
 
@@ -2695,7 +2587,10 @@ impl cosmic::Application for AppModel {
                 // Slider release (and the close/flush points) commit the
                 // dragged edit: persist the manifest, then re-bake the active
                 // tile + roll cover through the shared commit path used by the
-                // keyboard-release commit too.
+                // keyboard-release commit too. Also flush any pending roll-info
+                // drawer drafts so a window close (which routes here via
+                // `on_close_requested`) never loses them.
+                self.flush_roll_drafts();
                 self.commit_edit()
             }
 
@@ -2710,6 +2605,7 @@ impl cosmic::Application for AppModel {
                 // Flush any in-progress edit to disk, then ask the window to
                 // close (the cosmic runtime runs our on_close_requested hook,
                 // which persists a final time before exiting).
+                self.flush_roll_drafts();
                 self.persist_roll();
                 self.persist_config();
                 Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Close))
@@ -3750,25 +3646,100 @@ impl AppModel {
 
     /// Reseeds the roll-info drawer's drafts (name, dates, and free-form film
     /// metadata) whenever the library roll selection no longer matches the key
-    /// the drafts were seeded from (a different roll always starts from its own
-    /// committed values; a stale selection such as the Add Roll tile clears the
-    /// key so the next roll reseeds). Cheap: a path comparison — it runs at the
-    /// top of `update` for every message.
+    /// the drafts were seeded from. Before reseeding it flushes the outgoing
+    /// roll's pending debounced commit, so switching rolls (or clearing the
+    /// selection) never drops an edit, and bumps the commit serial so any
+    /// in-flight debounce for the old roll is dropped. Cheap: a path comparison
+    /// — it runs at the top of `update` for every message.
     fn sync_roll_drafts(&mut self) {
-        let Some(LibrarySelection::Roll(dir)) = self.library_selection.clone() else {
+        let new_key = match &self.library_selection {
+            Some(LibrarySelection::Roll(dir)) => Some(dir.clone()),
+            _ => None,
+        };
+        if self.roll_date_drafts.key == new_key {
+            return;
+        }
+        // Flush the outgoing roll's dirty drafts before reseeding (a no-op when
+        // nothing changed), then invalidate any pending commit for it.
+        if let Some(old_dir) = self.roll_date_drafts.key.clone() {
+            self.commit_roll_drafts(&old_dir);
+        }
+        self.roll_drafts_version = self.roll_drafts_version.wrapping_add(1);
+        self.roll_drafts_dirty = false;
+
+        let Some(dir) = new_key else {
             self.roll_date_drafts.key = None;
             return;
         };
-        if self.roll_date_drafts.key.as_deref() == Some(dir.as_path()) {
-            return;
-        }
         let Some(roll) = self.rolls.iter().find(|roll| roll.dir == dir) else {
+            self.roll_date_drafts.key = None;
             return;
         };
         self.roll_date_drafts =
             RollDateDrafts::from_dates(dir, roll.start_date.as_deref(), roll.end_date.as_deref());
         self.roll_name_draft = roll.name.clone();
         self.roll_meta_draft = roll.meta.clone();
+    }
+
+    /// Records that the roll-info drawer's drafts changed and schedules the
+    /// shared debounced commit, bumping the serial so only the last keystroke of
+    /// a burst lands (the search input's debounce pattern).
+    fn schedule_roll_draft_commit(&mut self) -> Task<cosmic::Action<Message>> {
+        self.roll_drafts_dirty = true;
+        self.roll_drafts_version = self.roll_drafts_version.wrapping_add(1);
+        let version = self.roll_drafts_version;
+        cosmic::task::future(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(ROLL_DRAWER_DEBOUNCE_MS)).await;
+            Message::RollDraftsCommit(version)
+        })
+    }
+
+    /// Persists the roll-info drawer's drafts to `dir`'s roll and manifest in
+    /// one atomic write. Name and metadata commit unconditionally (an empty
+    /// value clears them); a date draft commits only when it is empty or a valid
+    /// ISO date and the resulting range is coherent — a partial/malformed date
+    /// keeps the committed value. No-op when nothing is dirty.
+    fn commit_roll_drafts(&mut self, dir: &Path) {
+        if !self.roll_drafts_dirty {
+            return;
+        }
+        self.roll_drafts_dirty = false;
+        let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) else {
+            return;
+        };
+
+        let name = {
+            let trimmed = self.roll_name_draft.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        };
+        roll.name = name.clone().unwrap_or_else(|| dir_leaf(&roll.dir));
+
+        let start = resolve_date_draft(&self.roll_date_drafts.start, roll.start_date.as_deref());
+        let end = resolve_date_draft(&self.roll_date_drafts.end, roll.end_date.as_deref());
+        if roll_dates_valid(start.as_deref(), end.as_deref()) {
+            roll.start_date = start;
+            roll.end_date = end;
+        }
+
+        roll.meta = self.roll_meta_draft.normalized();
+
+        record_roll_drawer(
+            &roll.dir,
+            RollDrawer {
+                name,
+                start_date: roll.start_date.clone(),
+                end_date: roll.end_date.clone(),
+                meta: roll.meta.clone(),
+            },
+        );
+    }
+
+    /// Flushes any pending roll-info drawer commit (selection change, quit, or
+    /// window close) so a debounced edit is never lost.
+    fn flush_roll_drafts(&mut self) {
+        if let Some(dir) = self.roll_date_drafts.key.clone() {
+            self.commit_roll_drafts(&dir);
+        }
     }
 
     /// Kicks off the lazy EXIF parse for the highlighted frame if the frame-info
@@ -4293,14 +4264,19 @@ fn rebake_trace(args: std::fmt::Arguments<'_>) {
     log::trace!("[rebake] {args}");
 }
 
+/// A roll directory's final path component, the fallback display name for a
+/// roll with no manifest label.
+fn dir_leaf(dir: &Path) -> String {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| dir.to_string_lossy().into_owned(), str::to_string)
+}
+
 /// Loads one roll's metadata: display name (manifest label, falling back to
 /// the directory leaf), cover file (first sorted non-dot file), the count of
 /// frame files, and the recorded dates — with nothing decoded yet.
 async fn load_roll(dir: PathBuf) -> Roll {
-    let leaf = dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map_or_else(|| dir.to_string_lossy().into_owned(), str::to_string);
+    let leaf = dir_leaf(&dir);
     let (cover, frame_count) = roll_cover_and_count(&dir).await;
     let manifest = edit_manifest::load_roll_manifest(&dir);
     let name = manifest.name().unwrap_or(&leaf).to_owned();

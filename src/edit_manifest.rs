@@ -500,6 +500,26 @@ pub struct RollMeta {
     pub developer_notes: Option<String>,
 }
 
+impl RollMeta {
+    /// The committed form of these fields: every value trimmed, with a
+    /// whitespace-only value becoming `None` (so a cleared field is recorded as
+    /// absent). Applied to the drawer's drafts on each debounced commit.
+    #[must_use]
+    pub fn normalized(&self) -> Self {
+        fn clean(value: Option<&str>) -> Option<String> {
+            let trimmed = value?.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        }
+        Self {
+            film: clean(self.film.as_deref()),
+            location: clean(self.location.as_deref()),
+            camera: clean(self.camera.as_deref()),
+            lens: clean(self.lens.as_deref()),
+            developer_notes: clean(self.developer_notes.as_deref()),
+        }
+    }
+}
+
 impl Default for RollManifest {
     fn default() -> Self {
         Self {
@@ -1220,6 +1240,27 @@ mod tests {
                 "default manifest unexpectedly contains `{key}`:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn roll_meta_normalized_trims_and_clears_whitespace() {
+        let draft = RollMeta {
+            film: Some("  Kodak Tri-X  ".to_owned()),
+            location: Some("   ".to_owned()),
+            camera: Some("Nikon FM2".to_owned()),
+            lens: None,
+            developer_notes: Some("\t HC-110 \n".to_owned()),
+        };
+        assert_eq!(
+            draft.normalized(),
+            RollMeta {
+                film: Some("Kodak Tri-X".to_owned()),
+                location: None,
+                camera: Some("Nikon FM2".to_owned()),
+                lens: None,
+                developer_notes: Some("HC-110".to_owned()),
+            }
+        );
     }
 
     #[test]

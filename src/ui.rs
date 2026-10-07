@@ -769,33 +769,32 @@ pub(crate) fn frame_info_panel<'a>(app: &'a AppModel, name: &str) -> Element<'a,
         .into()
 }
 
-/// A labeled ISO-date text field for the roll-info drawer, committed on Enter
-/// via [`Message::RollDateDraftSubmit`]. Seeded from the live draft so an
-/// in-progress edit survives view re-renders.
+/// A labeled ISO-date text field for the roll-info drawer. Persistence is
+/// debounced (`RollDateDraftChange`); there is no on-enter commit. Seeded from
+/// the live draft so an in-progress edit survives view re-renders.
 fn roll_date_field(label: String, value: &str, field: RollDateField) -> Element<'_, Message> {
     widget::column::with_capacity(2)
         .push(widget::text(label))
         .push(
             widget::text_input(fl!("roll-date-placeholder"), value)
                 .width(Length::Fill)
-                .on_input(move |v| Message::RollDateDraftChange(field, v))
-                .on_submit(move |_| Message::RollDateDraftSubmit(field)),
+                .on_input(move |v| Message::RollDateDraftChange(field, v)),
         )
         .spacing(cosmic::theme::spacing().space_xs)
         .into()
 }
 
-/// A labeled free-form text field for the roll-info drawer's film metadata,
-/// committed on Enter via [`Message::RollMetaDraftSubmit`]. Seeded from the live
-/// draft so an in-progress edit survives view re-renders.
+/// A labeled free-form text field for the roll-info drawer's film metadata.
+/// Persistence is debounced (`RollMetaDraftChange`); there is no on-enter
+/// commit. Seeded from the live draft so an in-progress edit survives view
+/// re-renders.
 fn roll_meta_field(label: String, value: &str, field: RollMetaField) -> Element<'_, Message> {
     widget::column::with_capacity(2)
         .push(widget::text(label))
         .push(
             widget::text_input("", value)
                 .width(Length::Fill)
-                .on_input(move |v| Message::RollMetaDraftChange(field, v))
-                .on_submit(move |_| Message::RollMetaDraftSubmit(field)),
+                .on_input(move |v| Message::RollMetaDraftChange(field, v)),
         )
         .spacing(cosmic::theme::spacing().space_xs)
         .into()
@@ -823,8 +822,7 @@ pub(crate) fn roll_info_panel<'a>(
     let name = widget::container(
         widget::text_input(fl!("roll-name-placeholder"), name_draft)
             .width(Length::Fill)
-            .on_input(Message::RollNameDraftChange)
-            .on_submit(|_| Message::RollNameDraftSubmit),
+            .on_input(Message::RollNameDraftChange),
     )
     .width(Length::Fill);
 
