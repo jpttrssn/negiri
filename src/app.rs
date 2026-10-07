@@ -26,8 +26,8 @@ use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::futures::SinkExt;
 use cosmic::iced::keyboard;
-use cosmic::iced::widget::scrollable::Viewport;
 use cosmic::iced::widget::Stack;
+use cosmic::iced::widget::scrollable::Viewport;
 use cosmic::iced::{Length, Point, Size, Subscription};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, image::Handle, menu, toaster};
@@ -1167,9 +1167,10 @@ impl cosmic::Application for AppModel {
         };
 
         // "Calibrate from this frame" designates the current frame as the
-        // roll's calibration frame; meaningful with an eligible frame open.
-        // The handler no-ops without one, so the menu gates on its presence.
-        let calibrate_enabled = self.active.is_some() && self.selected.is_some();
+        // roll's calibration frame; meaningful with an eligible frame selected.
+        // The handler no-ops without one, so the menu gates on its selection.
+        let calibrate_enabled =
+            self.active.is_some() && (self.selected.is_some() || self.frame_selected.is_some());
         let calibrate_items = if calibrate_enabled {
             vec![
                 menu::Item::Divider,
@@ -1894,7 +1895,8 @@ impl cosmic::Application for AppModel {
                 self.crop = self.reset_crop;
                 self.rotation = self.reset_rotation;
                 if let Some(selected) = &self.selected {
-                    self.roll.set_exposure(selected, self.reset_tone.exposure_ev);
+                    self.roll
+                        .set_exposure(selected, self.reset_tone.exposure_ev);
                     self.roll.set_develop(selected, self.reset_tone);
                     self.roll.set_crop(selected, self.reset_crop);
                     self.roll.set_rotation(selected, self.reset_rotation);
@@ -2816,7 +2818,13 @@ impl AppModel {
         // (when set) travels along to stamp DateTimeOriginal on the output.
         let start_date = self.roll.start_date().map(str::to_owned);
         let base = self.roll.base_or_default();
-        let frames: Vec<(String, crate::film::Develop, edit_manifest::CropMargins, u8, usize)> = names
+        let frames: Vec<(
+            String,
+            crate::film::Develop,
+            edit_manifest::CropMargins,
+            u8,
+            usize,
+        )> = names
             .into_iter()
             .map(|name| {
                 let develop = self.roll.tone(&name).to_develop(base);
@@ -2842,8 +2850,14 @@ impl AppModel {
             let mut tick = |done: usize, _total: usize| {
                 let _ = sender.try_send(Message::ExportProgress { done, total });
             };
-            let (ok, skipped, failed) =
-                export_frames(dir, dest.clone(), frames, options, start_date.clone(), &mut tick)
+            let (ok, skipped, failed) = export_frames(
+                dir,
+                dest.clone(),
+                frames,
+                options,
+                start_date.clone(),
+                &mut tick,
+            )
             .await;
             let _ = sender
                 .send(Message::ExportDone {
@@ -3263,9 +3277,10 @@ impl AppModel {
         // fraction of the cost of a full RAW decode.)
         if cap == HI_RES_SIZE
             && let Some(dir) = self.active.clone()
-            && let Some(cached) = self.detail_cache.get(&(dir, name.clone())).map(|c| {
-                (c.mono.clone(), c.width, c.height, c.src_long_edge)
-            })
+            && let Some(cached) = self
+                .detail_cache
+                .get(&(dir, name.clone()))
+                .map(|c| (c.mono.clone(), c.width, c.height, c.src_long_edge))
         {
             let (mono, width, height, src_long_edge) = cached;
             detail_trace(format_args!(
@@ -4230,7 +4245,6 @@ async fn load_rolls(rolls: Vec<String>) -> Vec<Roll> {
     loaded
 }
 
-
 /// Scans a roll directory once: returns the first regular non-dot frame file
 /// name in sorted order — the roll's cover, if it has any negatives yet —
 /// alongside the count of frame files (both `None`/0 for a missing or empty
@@ -4280,15 +4294,6 @@ async fn load_files_in(dir: PathBuf) -> Vec<String> {
     files
 }
 
-
-
-
-
-
-
-
-
-
 /// Opens the system folder picker, and on success emits [`Message::RollAdded`]
 /// for the chosen directory (a cancel or portal failure is a no-op). Shared by
 /// the double-click handler and Enter on a selected Add Roll tile.
@@ -4307,8 +4312,6 @@ fn open_roll_picker() -> Task<cosmic::Action<Message>> {
         }
     })
 }
-
-
 
 /// Updates the multi-selection after a frame tile is clicked, given the current
 /// modifier state and the visible (filtered) `order` of frames.
@@ -4418,7 +4421,6 @@ fn reveal_target_y(
     let max = (content_height - viewport_height).max(0.0);
     Some(target.clamp(0.0, max))
 }
-
 
 /// Converts a wheel scroll delta into a detail-view zoom change (in `log2`
 /// units, so +1 = double the rendered scale, −1 = halve it).
@@ -4937,7 +4939,7 @@ mod tests {
     use super::*;
     use crate::pipeline::{
         apply_exposure, bake_develop, class_gains, convert_thumbnail, crop_rgba, crop_samples,
-        display_source_dims, downsample_thumbnail, flatten_bayer, luma, resized_dims, resize_area,
+        display_source_dims, downsample_thumbnail, flatten_bayer, luma, resize_area, resized_dims,
         rotate_quarters, scale_crop, srgb_encode,
     };
 
@@ -4949,7 +4951,6 @@ mod tests {
             meta_failed: false,
         }
     }
-
 
     #[test]
     fn load_roll_prefers_the_manifest_label_over_the_directory_leaf() {
@@ -5504,7 +5505,13 @@ mod tests {
     fn apply_detail_zoom_clamps_at_both_ends() {
         let (zoom, _) = apply_detail_zoom(1.0, Point::default(), None, -1.0, MAX_DETAIL_ZOOM);
         assert_eq!(zoom, 1.0);
-        let (zoom, _) = apply_detail_zoom(MAX_DETAIL_ZOOM, Point::default(), None, 9.0, MAX_DETAIL_ZOOM);
+        let (zoom, _) = apply_detail_zoom(
+            MAX_DETAIL_ZOOM,
+            Point::default(),
+            None,
+            9.0,
+            MAX_DETAIL_ZOOM,
+        );
         assert_eq!(zoom, MAX_DETAIL_ZOOM);
     }
 
@@ -5530,8 +5537,13 @@ mod tests {
     #[test]
     fn apply_detail_zoom_recenters_when_back_to_contain_fit() {
         // Zooming all the way out must give the centered contain view.
-        let (zoom, pan) =
-            apply_detail_zoom(3.0, Point::new(50.0, -30.0), Some(Point::new(0.0, 0.0)), -2.0, 8.0);
+        let (zoom, pan) = apply_detail_zoom(
+            3.0,
+            Point::new(50.0, -30.0),
+            Some(Point::new(0.0, 0.0)),
+            -2.0,
+            8.0,
+        );
         assert_eq!(zoom, 1.0);
         assert_eq!(pan, Point::default());
     }
@@ -5540,7 +5552,10 @@ mod tests {
     fn native_level_up_zoom_fires_at_the_earlier_of_cap_and_threshold() {
         // A preview whose 1:1 cap sits above the fixed threshold keeps the
         // prefetch trigger: level up at 2× contain before reaching the cap.
-        assert_eq!(AppModel::native_level_up_zoom_for(5.0), NATIVE_ZOOM_THRESHOLD);
+        assert_eq!(
+            AppModel::native_level_up_zoom_for(5.0),
+            NATIVE_ZOOM_THRESHOLD
+        );
         // A large full-screen preview (drawer closed) can put the overview's
         // own 1:1 below 2.0; the trigger must fall back to that cap, otherwise
         // zooming (clamped at 1:1) could never reach the fixed threshold and
