@@ -1346,7 +1346,7 @@ impl cosmic::Application for AppModel {
                 vec![file_menu, edit_menu, view_menu],
             );
 
-        vec![menu_bar.into()]
+        vec![menu_bar]
     }
 
     /// Elements to pack at the end of the header bar.

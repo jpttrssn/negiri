@@ -191,7 +191,6 @@ pub(crate) fn frames_view(app: &AppModel) -> Element<'_, Message> {
 #[allow(clippy::too_many_lines)] // one linear push per control; no nested logic
 pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
-    let space_xs = cosmic::theme::spacing().space_xs;
 
     if app.detail_shader.is_none() {
         return widget::column::with_capacity(1)
@@ -225,7 +224,7 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
                 crate::pipeline::HistogramMode::Output
             })
         })
-        .spacing(space_xs);
+        .spacing(cosmic::theme::spacing().space_xs);
 
     let label = widget::text(fl!("exposure-label"));
     // Every slider below runs on the same two rungs: a coarse bare drag of
