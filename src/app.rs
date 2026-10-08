@@ -26,6 +26,7 @@ use cosmic::Application;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::futures::SinkExt;
+use cosmic::iced::futures::stream::{self, StreamExt};
 use cosmic::iced::keyboard;
 use cosmic::iced::widget::Stack;
 use cosmic::iced::widget::scrollable::Viewport;
@@ -58,13 +59,23 @@ const FADE_SPEED: f32 = 5.0;
 /// Aspect ratio (width / height) of the image area of a Page 1 tile.
 pub(crate) const TILE_ASPECT: f32 = 1.0;
 
-/// Maximum number of thumbnail decodes in flight at once.
-///
-/// Decodes run on the blocking thread pool, so several proceed in parallel on
-/// multicore machines. The bound keeps the transient footprint (each in-flight
-/// decode holds one full-resolution RAW buffer until it finishes downscaling)
-/// to a few dozen hundred MB, not the whole roll.
-const MAX_CONCURRENT_THUMBS: usize = 4;
+/// Bounds for the in-flight thumbnail-decode concurrency, derived from the
+/// machine's core count (see [`thumb_concurrency`]). The floor keeps today's
+/// fixed behaviour on small machines; the ceiling caps the transient footprint
+/// (each in-flight decode holds one full-resolution RAW buffer until it finishes
+/// downscaling) at ~8 buffers, not the whole roll.
+const THUMB_CONCURRENCY_MIN: usize = 4;
+const THUMB_CONCURRENCY_MAX: usize = 8;
+
+/// The number of thumbnail decodes to run in flight at once: the available
+/// parallelism, clamped to `[THUMB_CONCURRENCY_MIN, THUMB_CONCURRENCY_MAX]`.
+/// Decodes run on the blocking thread pool, so scaling with the cores fills a
+/// screenful of tiles in fewer batches; the clamp bounds the transient memory.
+fn thumb_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map_or(THUMB_CONCURRENCY_MIN, std::num::NonZeroUsize::get)
+        .clamp(THUMB_CONCURRENCY_MIN, THUMB_CONCURRENCY_MAX)
+}
 
 /// Extra grid rows beyond the visible viewport whose thumbnails are decoded
 /// eagerly, so a short scroll reveals finished tiles instead of loading icons.
@@ -72,6 +83,11 @@ const MAX_CONCURRENT_THUMBS: usize = 4;
 /// overscan; off-screen tiles stay `Thumb::Loading` (no decode, no RAM) until
 /// scrolled near.
 const GRID_OVERSCAN_ROWS: usize = 1;
+
+/// How many roll directories to scan + manifest-read concurrently while loading
+/// the library at startup. Bounds the open `read_dir` handles on a large
+/// library; the result is name-sorted afterward regardless of completion order.
+const MAX_CONCURRENT_ROLL_LOADS: usize = 8;
 
 /// Number of detail-view overview (2048px) mono buffers to cache most-recently
 /// used. Sized to cover a typical film roll (~40 frames). Each entry is the
@@ -296,6 +312,10 @@ pub(crate) struct AppModel {
     /// Names handed to the bounded in-flight thumbnail decodes, so re-baked
     /// tiles never double-spawn against the startup chain (memory bound).
     thumb_inflight: Vec<String>,
+    /// How many thumbnail decodes may run in flight at once (derived from the
+    /// machine's cores; see [`thumb_concurrency`]). Shared by the frame-tile and
+    /// cover chains, which never run concurrently (covers pause inside a roll).
+    thumb_concurrency: usize,
     /// The frame whose auto-calibration base measurement is in flight on a
     /// roll's first open. While set, `decode_next` is gated: decoding now would
     /// bake every tile with the default base and throw it away when the measured
@@ -1105,6 +1125,7 @@ impl cosmic::Application for AppModel {
             tiles: Vec::new(),
             selected: None,
             thumb_inflight: Vec::new(),
+            thumb_concurrency: thumb_concurrency(),
             calibration_inflight: None,
             frame_meta_inflight: None,
             roll: RollManifest::default(),
@@ -3068,7 +3089,7 @@ impl AppModel {
         }
     }
 
-    /// Spawns decoding of up to [`MAX_CONCURRENT_THUMBS`] pending thumbnails.
+    /// Spawns decoding of up to [`AppModel::thumb_concurrency`] pending thumbnails.
     ///
     /// Decoding is bounded rather than strictly sequential so several
     /// `spawn_blocking` RAW decodes overlap on multicore machines; the count
@@ -3089,7 +3110,7 @@ impl AppModel {
         let Some(dir) = self.active.clone() else {
             return Task::none();
         };
-        let capacity = MAX_CONCURRENT_THUMBS.saturating_sub(self.thumb_inflight.len());
+        let capacity = self.thumb_concurrency.saturating_sub(self.thumb_inflight.len());
         if capacity == 0 {
             rebake_trace(format_args!(
                 "decode_next: capacity 0 (inflight={})",
@@ -3169,7 +3190,7 @@ impl AppModel {
         ))
     }
 
-    /// Spawns decoding of up to [`MAX_CONCURRENT_THUMBS`] roll-cover
+    /// Spawns decoding of up to [`AppModel::thumb_concurrency`] roll-cover
     /// thumbnails, mirroring the frame chain's bounds and de-duplication.
     fn decode_covers(&mut self) -> Task<cosmic::Action<Message>> {
         // Covers belong to the library page: pause while a roll is open (they
@@ -3177,7 +3198,7 @@ impl AppModel {
         if self.active.is_some() {
             return Task::none();
         }
-        let capacity = MAX_CONCURRENT_THUMBS.saturating_sub(self.cover_inflight.len());
+        let capacity = self.thumb_concurrency.saturating_sub(self.cover_inflight.len());
         if capacity == 0 {
             return Task::none();
         }
@@ -4481,16 +4502,22 @@ async fn load_roll(dir: PathBuf) -> Roll {
 /// Loads roll metadata for each configured roll directory, de-duplicated and
 /// sorted by display name. Name order is the stable backing order: the library
 /// view derives its date-descending display order from it per render.
+///
+/// The per-roll scans run concurrently (bounded by [`MAX_CONCURRENT_ROLL_LOADS`],
+/// so a large library doesn't open hundreds of `read_dir` handles at once); the
+/// unordered results are name-sorted at the end, matching the sequential form.
 async fn load_rolls(rolls: Vec<String>) -> Vec<Roll> {
     let mut seen = HashSet::new();
-    let mut loaded = Vec::with_capacity(rolls.len());
-    for entry in rolls {
-        let dir = PathBuf::from(entry);
-        if !seen.insert(dir.clone()) {
-            continue;
-        }
-        loaded.push(load_roll(dir).await);
-    }
+    let dirs: Vec<PathBuf> = rolls
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|dir| seen.insert(dir.clone()))
+        .collect();
+    let mut loaded: Vec<Roll> = stream::iter(dirs)
+        .map(load_roll)
+        .buffer_unordered(MAX_CONCURRENT_ROLL_LOADS)
+        .collect()
+        .await;
     loaded.sort_by(|a, b| a.name.cmp(&b.name));
     loaded
 }
@@ -5314,6 +5341,14 @@ mod tests {
         assert_eq!(grid_num_cols(1200.0, 16.0), 4);
         // (400 + 16) / (384 + 16) = 1.04 → ceil 2
         assert_eq!(grid_num_cols(400.0, 16.0), 2);
+    }
+
+    #[test]
+    fn thumb_concurrency_stays_within_its_clamp() {
+        assert!(
+            (THUMB_CONCURRENCY_MIN..=THUMB_CONCURRENCY_MAX).contains(&thumb_concurrency()),
+            "thumb concurrency escaped its clamp"
+        );
     }
 
     #[test]
