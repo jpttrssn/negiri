@@ -65,6 +65,13 @@ pub(crate) const TILE_ASPECT: f32 = 1.0;
 /// to a few dozen hundred MB, not the whole roll.
 const MAX_CONCURRENT_THUMBS: usize = 4;
 
+/// Extra grid rows beyond the visible viewport whose thumbnails are decoded
+/// eagerly, so a short scroll reveals finished tiles instead of loading icons.
+/// The tile decode chain (`decode_next`) is gated on the visible range plus this
+/// overscan; off-screen tiles stay `Thumb::Loading` (no decode, no RAM) until
+/// scrolled near.
+const GRID_OVERSCAN_ROWS: usize = 1;
+
 /// Number of detail-view overview (2048px) mono buffers to cache most-recently
 /// used. Sized to cover a typical film roll (~40 frames). Each entry is the
 /// fixed 2048 overview decode (~12–17 MB), so the worst case is bounded at
@@ -798,6 +805,10 @@ pub(crate) enum Message {
     /// to recompute the 1:1 ("100%") zoom cap, which depends on the preview
     /// area's size (window resize, drawer open/close, …).
     DetailAreaResized(Size),
+    /// The window was resized; carries the new logical size. Updates the grid
+    /// column/height tracks and re-pumps thumbnail decoding for the rows the new
+    /// viewport exposes (via `cosmic::iced::window::resize_events`).
+    WindowResized(Size),
     /// The user pressed the mouse on the detail preview — grab-pan begins.
     DetailPanPress,
     /// The cursor moved over the detail preview; while panning this shifts
@@ -1133,11 +1144,8 @@ impl cosmic::Application for AppModel {
     /// mirror iced's `Grid::fluid` column count exactly
     /// (`ceil((width + spacing) / (max_width + spacing))`), and remember the
     /// window height for the pre-scroll viewport estimate.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn on_window_resize(&mut self, _id: cosmic::iced::window::Id, width: f32, height: f32) {
-        let spacing = f32::from(cosmic::theme::spacing().space_s);
-        self.grid_cols = grid_num_cols(width, spacing).max(1);
-        self.window_height = height;
+        self.set_window_size(Size::new(width, height));
     }
 
     /// Escape pressed outside any widget that captured it (routed here by
@@ -1634,6 +1642,11 @@ impl cosmic::Application for AppModel {
                 }
                 _ => None,
             }),
+            // Window resizes update the grid geometry and re-pump thumbnail
+            // decoding for the rows the new viewport exposes. (The
+            // `on_window_resize` hook still seeds the geometry at startup.)
+            cosmic::iced::window::resize_events()
+                .map(|(_id, size)| Message::WindowResized(size)),
             // Watch for application configuration changes.
             self.core()
                 .watch_config::<Config>(Self::APP_ID)
@@ -1689,6 +1702,7 @@ impl cosmic::Application for AppModel {
                     | Message::ModifiersChanged(_)
                     | Message::GridViewport(_)
                     | Message::DetailAreaResized(_)
+                    | Message::WindowResized(_)
                     | Message::ThumbReady(_, _)
                     | Message::RollOpened(_, _)
                     | Message::CoverReady(_, _)
@@ -1894,6 +1908,15 @@ impl cosmic::Application for AppModel {
                 self.detail_area_size = Some(size);
                 self.reclamp_detail_zoom();
                 Task::none()
+            }
+
+            Message::WindowResized(size) => {
+                // Update the grid column/height tracks, then re-pump thumbnails
+                // for any rows the resized viewport newly exposes. (The
+                // `on_window_resize` hook keeps the tracks fresh at startup; this
+                // message exists so the pump can run on a resize.)
+                self.set_window_size(size);
+                self.decode_next()
             }
 
             Message::DetailPanPress => {
@@ -2270,7 +2293,9 @@ impl cosmic::Application for AppModel {
 
             Message::GridViewport(viewport) => {
                 self.grid_viewport = Some(viewport);
-                Task::none()
+                // The visible rows moved: pump any newly-visible thumbnails
+                // (no-op on the library page, where `decode_next` has no roll).
+                self.decode_next()
             }
 
             Message::RollActivated(dir) => self.open_roll(dir),
@@ -2873,6 +2898,57 @@ impl AppModel {
         )
     }
 
+    /// Records the window size's grid-relevant tracks (column count + height).
+    /// Shared by the `on_window_resize` startup hook and the `WindowResized`
+    /// message (which additionally re-pumps thumbnail decoding).
+    fn set_window_size(&mut self, size: Size) {
+        let spacing = f32::from(cosmic::theme::spacing().space_s);
+        self.grid_cols = grid_num_cols(size.width, spacing).max(1);
+        self.window_height = size.height;
+    }
+
+    /// The tile-index range whose thumbnails should be decoded for the current
+    /// grid viewport: the visible rows plus [`GRID_OVERSCAN_ROWS`] on each side.
+    /// Uses the cached [`Viewport`] once the grid has scrolled; before the first
+    /// scroll it estimates from the last window size (the same fallback
+    /// `scroll_selection_into_view` uses). Empty when no roll is open.
+    #[allow(clippy::cast_precision_loss)] // column counts are far below f32's exact range
+    fn visible_tile_range(&self) -> std::ops::Range<usize> {
+        if self.tiles.is_empty() {
+            return 0..0;
+        }
+        let spacing = f32::from(cosmic::theme::spacing().space_s);
+        let padding = spacing;
+        let (cols, cell, viewport_height, offset_y) = if let Some(viewport) = &self.grid_viewport {
+            let available = viewport.bounds().width - 2.0 * padding;
+            let cols = grid_num_cols(available, spacing).max(1);
+            let cell = ((available - spacing * (cols as f32 - 1.0)) / cols as f32).max(1.0);
+            (
+                cols,
+                cell,
+                viewport.bounds().height,
+                viewport.absolute_offset().y,
+            )
+        } else {
+            (
+                self.grid_cols.max(1),
+                THUMB_SIZE,
+                (self.window_height - 80.0).max(1.0),
+                0.0,
+            )
+        };
+        visible_tile_range(
+            cols,
+            self.tiles.len(),
+            spacing,
+            padding,
+            cell,
+            viewport_height,
+            offset_y,
+            GRID_OVERSCAN_ROWS,
+        )
+    }
+
     /// Scrolls the mounted grid so the tile at `index` (within the matched set
     /// of `len`, laid out `cols`-wide) is fully visible, when it has moved
     /// beyond the viewport. Uses the cached [`Viewport`] for precise reveal;
@@ -2962,8 +3038,14 @@ impl AppModel {
         }
 
         let base = self.roll.base_or_default();
+        // Decode only tiles near the viewport (visible rows + overscan): a large
+        // roll no longer decodes every frame on open — off-screen tiles stay
+        // `Loading` until scrolled near, so they cost neither CPU nor RAM.
+        let visible = self.visible_tile_range();
         let pending: Vec<(String, crate::film::Develop, edit_manifest::CropMargins, u8)> = self
             .tiles
+            .get(visible)
+            .unwrap_or(&[])
             .iter()
             .filter(|tile| matches!(tile.thumb, Thumb::Loading))
             .filter(|tile| !self.thumb_inflight.iter().any(|name| name == &tile.name))
@@ -4488,6 +4570,41 @@ fn reveal_target_y(
     Some(target.clamp(0.0, max))
 }
 
+/// The half-open tile-index range whose grid rows intersect the viewport,
+/// expanded by `overscan_rows` rows on each side and clamped to `0..len`. Row
+/// geometry mirrors [`reveal_target_y`]: square `cell`-tall cells advancing by
+/// `cell + spacing`, inset by `padding` inside the scrollable content, with
+/// `offset_y` the scroll translation. Used to gate thumbnail decoding to what is
+/// near the viewport.
+#[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
+fn visible_tile_range(
+    cols: usize,
+    len: usize,
+    spacing: f32,
+    padding: f32,
+    cell: f32,
+    viewport_height: f32,
+    offset_y: f32,
+    overscan_rows: usize,
+) -> std::ops::Range<usize> {
+    if cols == 0 || len == 0 {
+        return 0..0;
+    }
+    let pitch = (cell + spacing).max(1.0);
+    let rows = len.div_ceil(cols);
+    // First row whose bottom edge is past the viewport top, and last row whose
+    // top edge is before the viewport bottom (row space), each widened by the
+    // overscan, floored at row 0, and capped to the row count so the index math
+    // below can never overflow.
+    let first_row = ((offset_y - padding - cell) / pitch).floor() as isize + 1;
+    let last_row = ((offset_y + viewport_height - padding) / pitch).ceil() as isize - 1;
+    let first_row = (first_row - overscan_rows.cast_signed()).clamp(0, rows.cast_signed());
+    let last_row = (last_row + overscan_rows.cast_signed()).clamp(0, rows.cast_signed());
+    let start = (first_row.cast_unsigned() * cols).min(len);
+    let end = ((last_row.cast_unsigned() + 1) * cols).min(len);
+    start..end
+}
+
 /// Converts a wheel scroll delta into a detail-view zoom change (in `log2`
 /// units, so +1 = double the rendered scale, −1 = halve it).
 ///
@@ -5112,6 +5229,61 @@ mod tests {
         assert_eq!(
             reveal_target_y(0, 0, 16.0, 16.0, 384.0, 900.0, 0.0, 3000.0),
             None
+        );
+    }
+
+    #[test]
+    fn visible_tile_range_covers_the_first_screen() {
+        // 3 columns, 384px cells, 16px spacing/padding, 520px viewport at the
+        // top: rows 0 (16..400) and 1 (416..800, partly visible) → tiles 0..6.
+        assert_eq!(
+            visible_tile_range(3, 100, 16.0, 16.0, 384.0, 520.0, 0.0, 0),
+            0..6
+        );
+    }
+
+    #[test]
+    fn visible_tile_range_tracks_a_scrolled_viewport() {
+        // Scrolled to 1000: rows 2 (816..1200) and 3 (1216..1600) intersect
+        // [1000, 1520] → tiles 6..12.
+        assert_eq!(
+            visible_tile_range(3, 100, 16.0, 16.0, 384.0, 520.0, 1000.0, 0),
+            6..12
+        );
+    }
+
+    #[test]
+    fn visible_tile_range_overscan_widens_both_edges() {
+        // Same scroll with one overscan row: rows 1..=4 → tiles 3..15.
+        assert_eq!(
+            visible_tile_range(3, 100, 16.0, 16.0, 384.0, 520.0, 1000.0, 1),
+            3..15
+        );
+    }
+
+    #[test]
+    fn visible_tile_range_clamps_to_the_tile_count() {
+        // The first screen wants 0..6, but only 4 tiles exist.
+        assert_eq!(
+            visible_tile_range(3, 4, 16.0, 16.0, 384.0, 520.0, 0.0, 0),
+            0..4
+        );
+        // A viewport scrolled past the content yields an empty range.
+        assert_eq!(
+            visible_tile_range(3, 4, 16.0, 16.0, 384.0, 520.0, 5000.0, 0),
+            4..4
+        );
+    }
+
+    #[test]
+    fn visible_tile_range_handles_degenerate_inputs() {
+        assert_eq!(
+            visible_tile_range(0, 10, 16.0, 16.0, 384.0, 520.0, 0.0, 0),
+            0..0
+        );
+        assert_eq!(
+            visible_tile_range(3, 0, 16.0, 16.0, 384.0, 520.0, 0.0, 0),
+            0..0
         );
     }
 
