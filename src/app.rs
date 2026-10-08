@@ -2786,7 +2786,7 @@ impl AppModel {
         // the frame-info panel; navigation never closes it.
         self.restore_drawer_for(DrawerView::Grid);
         cosmic::task::future(async move {
-            let files = load_files_in(dir.clone()).await;
+            let files = scan_frame_files(&dir).await;
             Message::RollOpened(dir, files)
         })
     }
@@ -4482,7 +4482,9 @@ fn dir_leaf(dir: &Path) -> String {
 /// frame files, and the recorded dates — with nothing decoded yet.
 async fn load_roll(dir: PathBuf) -> Roll {
     let leaf = dir_leaf(&dir);
-    let (cover, frame_count) = roll_cover_and_count(&dir).await;
+    let files = scan_frame_files(&dir).await;
+    let cover = files.first().cloned();
+    let frame_count = files.len();
     let manifest = edit_manifest::load_roll_manifest_async(&dir).await;
     let name = manifest.name().unwrap_or(&leaf).to_owned();
     let start_date = manifest.start_date().map(str::to_owned);
@@ -4522,36 +4524,12 @@ async fn load_rolls(rolls: Vec<String>) -> Vec<Roll> {
     loaded
 }
 
-/// Scans a roll directory once: returns the first regular non-dot frame file
-/// name in sorted order — the roll's cover, if it has any negatives yet —
-/// alongside the count of frame files (both `None`/0 for a missing or empty
-/// directory). A single pass covers the cover thumbnail and the
-/// metadata-drawer frame count. Export artifacts (JPEG/PNG) are not frames.
-async fn roll_cover_and_count(dir: &Path) -> (Option<String>, usize) {
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-        return (None, 0);
-    };
-
-    let mut files = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.file_type().await.is_ok_and(|ty| ty.is_file())
-            && let Some(name) = entry.file_name().into_string().ok()
-            && !name.starts_with('.')
-            && !is_export_artifact(&name)
-        {
-            files.push(name);
-        }
-    }
-
-    let count = files.len();
-    files.sort();
-    (files.into_iter().next(), count)
-}
-
-/// Scans a roll directory for its frame files and returns their sorted names.
-/// Dotfiles (including the edit manifest) and export artifacts (JPEG/PNG) are
-/// never shown as tiles.
-async fn load_files_in(dir: PathBuf) -> Vec<String> {
+/// Scans a roll directory for its frame files: regular non-dot files minus
+/// export artifacts (JPEG/PNG), sorted by name. Dotfiles (including the edit
+/// manifest and its temp) are never frames. A missing or unreadable directory
+/// yields an empty list. One pass serves both the library load (cover thumbnail
+/// + frame count) and the open roll's tile list.
+async fn scan_frame_files(dir: &Path) -> Vec<String> {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return Vec::new();
     };
