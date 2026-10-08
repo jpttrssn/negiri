@@ -289,6 +289,12 @@ pub(crate) struct AppModel {
     /// Names handed to the bounded in-flight thumbnail decodes, so re-baked
     /// tiles never double-spawn against the startup chain (memory bound).
     thumb_inflight: Vec<String>,
+    /// The frame whose auto-calibration base measurement is in flight on a
+    /// roll's first open. While set, `decode_next` is gated: decoding now would
+    /// bake every tile with the default base and throw it away when the measured
+    /// base lands (`reflow_base`). Cleared when the measurement lands or the
+    /// roll closes. Manual calibration never sets it.
+    calibration_inflight: Option<String>,
     /// The frame whose EXIF parse is currently in flight for the frame-info
     /// drawer, so a highlight change to the same frame does not double-spawn.
     frame_meta_inflight: Option<String>,
@@ -1084,6 +1090,7 @@ impl cosmic::Application for AppModel {
             tiles: Vec::new(),
             selected: None,
             thumb_inflight: Vec::new(),
+            calibration_inflight: None,
             frame_meta_inflight: None,
             roll: RollManifest::default(),
             detail_shader: None,
@@ -1765,6 +1772,7 @@ impl cosmic::Application for AppModel {
                 self.tiles = Vec::new();
                 self.frame_meta_inflight = None;
                 self.thumb_inflight.clear();
+                self.calibration_inflight = None;
                 self.detail_inflight = None;
                 self.detail_preload_inflight.clear();
                 // The RAM manifest is dropped with the roll; re-opened rolls
@@ -2315,6 +2323,7 @@ impl cosmic::Application for AppModel {
                 // it scrolls again.
                 self.grid_viewport = None;
                 self.thumb_inflight.clear();
+                self.calibration_inflight = None;
 
                 self.tiles = files
                     .into_iter()
@@ -2341,15 +2350,19 @@ impl cosmic::Application for AppModel {
                 self.restore_drawer_for(DrawerView::Grid);
                 // A roll with no designated calibration frame yet defaults it
                 // to the first frame and measures its base, so every frame has
-                // a black anchor out of the box.
+                // a black anchor out of the box. The measurement runs at the
+                // same HI_RES overview the manual "Calibrate from this frame"
+                // path uses, so both produce an identical base; while it is in
+                // flight `decode_next` is gated, and the landing `reflow_base`
+                // decodes every tile once under the measured base.
                 let mut tasks = vec![];
-                if self.roll.calibration_frame().is_none() {
-                    let first = self.tiles.first().map(|tile| tile.name.clone());
-                    if let Some(first) = first {
-                        self.roll.set_calibration_frame(&first);
-                        self.persist_roll();
-                        tasks.push(Self::measure_calibration_frame(dir.clone()));
-                    }
+                if self.roll.calibration_frame().is_none()
+                    && let Some(first) = self.tiles.first().map(|tile| tile.name.clone())
+                {
+                    self.roll.set_calibration_frame(&first);
+                    self.persist_roll();
+                    self.calibration_inflight = Some(first.clone());
+                    tasks.push(cosmic::task::future(measure_frame_base(dir.clone(), first)));
                 }
                 tasks.extend([
                     self.decode_next(),
@@ -3025,6 +3038,13 @@ impl AppModel {
     /// chain or re-bake) bakes in the version of the edit that is current when
     /// it actually decodes.
     fn decode_next(&mut self) -> Task<cosmic::Action<Message>> {
+        // Wait for a pending auto-calibration base: decoding now would bake every
+        // tile with the default base, only for `reflow_base` to throw it away
+        // when the measured base lands.
+        if self.calibration_inflight.is_some() {
+            rebake_trace(format_args!("decode_next: waiting on calibration base"));
+            return Task::none();
+        }
         let Some(dir) = self.active.clone() else {
             return Task::none();
         };
@@ -3205,19 +3225,6 @@ impl AppModel {
         self.reflow_base()
     }
 
-    /// Spawns a one-shot measurement of the roll's designated auto-calibration
-    /// frame, posting its measured clear-film transmission back as
-    /// [`Message::CalibrationBaseMeasured`].
-    fn measure_calibration_frame(dir: PathBuf) -> Task<cosmic::Action<Message>> {
-        // The designated frame lives on disk — the drawer is library-only and
-        // the RAM manifest may be for another roll or stale, so read it fresh.
-        let manifest = edit_manifest::load_roll_manifest(&dir);
-        let Some(name) = manifest.calibration_frame().map(str::to_owned) else {
-            return Task::none();
-        };
-        cosmic::task::future(measure_frame_base(dir, name))
-    }
-
     /// Applies a landed calibration-frame measurement to the roll's manifest:
     /// records the designated frame (already set on the defaulting path) and
     /// its measured base, then re-renders every rendering under the new black
@@ -3229,10 +3236,22 @@ impl AppModel {
         name: &str,
         base: Option<f32>,
     ) -> Task<cosmic::Action<Message>> {
+        // This landing releases the auto-calibration gate (whether or not the
+        // measurement is still current — the in-flight decode has finished).
+        if self.calibration_inflight.as_deref() == Some(name) {
+            self.calibration_inflight = None;
+        }
         let mut manifest = edit_manifest::load_roll_manifest(dir);
         let stale = manifest.calibration_frame() != Some(name);
         if stale {
-            return Task::none();
+            // The measurement was superseded (a newer calibration changed the
+            // designated frame). We just released the gate, so make sure the grid
+            // still decodes if this roll is the one on screen.
+            return if self.active.as_deref() == Some(dir) {
+                self.decode_next()
+            } else {
+                Task::none()
+            };
         }
         manifest.set_calibration_frame(name);
         match base {
@@ -3286,6 +3305,8 @@ impl AppModel {
             tile.thumb = Thumb::Loading;
         }
         self.thumb_inflight.clear();
+        // A reflow supersedes any pending auto-calibration measurement.
+        self.calibration_inflight = None;
         if let Some(active) = self.active.as_ref()
             && let Some(roll) = self.rolls.iter_mut().find(|roll| &roll.dir == active)
         {
@@ -4982,10 +5003,13 @@ async fn preload_detail(dir: PathBuf, name: String) -> Message {
 }
 
 /// Measures ONE frame's clear-film transmission at the overview scale, posting
-/// it back as [`Message::CalibrationBaseMeasured`]. The calibration path:
-/// designate a frame, decode it once, and pin the whole roll's black point to
-/// its measured plateau. Implausible or missing measurements arrive as `None`
-/// (the caller keeps the default fallback rather than recording a bad base).
+/// it back as [`Message::CalibrationBaseMeasured`]. The **single canonical
+/// calibration measurement**: the auto-default on a roll's first open and the
+/// manual "Calibrate from this frame" cold path both call it, so a frame
+/// calibrated either way yields an identical base. Designate a frame, decode it
+/// once at [`HI_RES_SIZE`], and pin the whole roll's black point to its measured
+/// plateau. Implausible or missing measurements arrive as `None` (the caller
+/// keeps the default fallback rather than recording a bad base).
 async fn measure_frame_base(dir: PathBuf, name: String) -> Message {
     let base = decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE)
         .await
