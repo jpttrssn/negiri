@@ -1740,7 +1740,8 @@ impl cosmic::Application for AppModel {
                     self.search = None;
                     self.search_filter = None;
                     self.search_version = self.search_version.wrapping_add(1);
-                    return Task::none();
+                    // Clearing the filter exposes every card; decode its covers.
+                    return self.decode_covers();
                 }
                 // Escape never closes a context drawer (only Space toggles it).
                 // On the library page it is a no-op beyond the search handling
@@ -1781,7 +1782,8 @@ impl cosmic::Application for AppModel {
                 self.roll = edit_manifest::RollManifest::default();
                 self.clear_detail();
                 self.restore_drawer_for(DrawerView::Library);
-                Task::none()
+                // The library page is visible again: decode the covers it shows.
+                self.decode_covers()
             }
 
             Message::DetailReady(name, result) => self.handle_detail_ready(&name, result),
@@ -1920,11 +1922,12 @@ impl cosmic::Application for AppModel {
 
             Message::WindowResized(size) => {
                 // Update the grid column/height tracks, then re-pump thumbnails
-                // for any rows the resized viewport newly exposes. (The
+                // for any rows the resized viewport newly exposes (frame tiles or
+                // library covers; each no-ops on the other page). (The
                 // `on_window_resize` hook keeps the tracks fresh at startup; this
                 // message exists so the pump can run on a resize.)
                 self.set_window_size(size);
-                self.decode_next()
+                Task::batch([self.decode_next(), self.decode_covers()])
             }
 
             Message::DetailPanPress => {
@@ -2301,9 +2304,9 @@ impl cosmic::Application for AppModel {
 
             Message::GridViewport(viewport) => {
                 self.grid_viewport = Some(viewport);
-                // The visible rows moved: pump any newly-visible thumbnails
-                // (no-op on the library page, where `decode_next` has no roll).
-                self.decode_next()
+                // The visible rows moved: pump newly-visible frame thumbnails or
+                // library covers (each no-ops on the other page).
+                Task::batch([self.decode_next(), self.decode_covers()])
             }
 
             Message::RollActivated(dir) => self.open_roll(dir),
@@ -2385,15 +2388,20 @@ impl cosmic::Application for AppModel {
                     self.search_filter = None;
                     self.search_version = self.search_version.wrapping_add(1);
                 }
-                // Focus the (now visible) input.
-                cosmic::widget::text_input::focus(search_input_id())
+                // Focus the (now visible) input; clearing the filter (when the
+                // input was hidden) can expose more cards, so re-pump covers.
+                Task::batch([
+                    cosmic::widget::text_input::focus(search_input_id()),
+                    self.decode_covers(),
+                ])
             }
 
             Message::SearchClear => {
                 self.search = None;
                 self.search_filter = None;
                 self.search_version = self.search_version.wrapping_add(1);
-                Task::none()
+                // Clearing the filter exposes every card; decode its covers.
+                self.decode_covers()
             }
 
             Message::SearchInput(term) => {
@@ -2414,7 +2422,8 @@ impl cosmic::Application for AppModel {
                 if version == self.search_version {
                     self.search_filter = Some(term);
                 }
-                Task::none()
+                // The visible set changed; decode the covers it now shows.
+                self.decode_covers()
             }
 
             Message::ThumbReady(name, result) => {
@@ -2920,14 +2929,15 @@ impl AppModel {
         self.window_height = size.height;
     }
 
-    /// The tile-index range whose thumbnails should be decoded for the current
-    /// grid viewport: the visible rows plus [`GRID_OVERSCAN_ROWS`] on each side.
+    /// The index range whose thumbnails should be decoded for the current grid
+    /// viewport: the visible rows plus [`GRID_OVERSCAN_ROWS`] on each side.
     /// Uses the cached [`Viewport`] once the grid has scrolled; before the first
     /// scroll it estimates from the last window size (the same fallback
-    /// `scroll_selection_into_view` uses). Empty when no roll is open.
+    /// `scroll_selection_into_view` uses). Empty when `len` is 0. Shared by the
+    /// frame grid and the library grid.
     #[allow(clippy::cast_precision_loss)] // column counts are far below f32's exact range
-    fn visible_tile_range(&self) -> std::ops::Range<usize> {
-        if self.tiles.is_empty() {
+    fn visible_range(&self, len: usize) -> std::ops::Range<usize> {
+        if len == 0 {
             return 0..0;
         }
         let spacing = f32::from(cosmic::theme::spacing().space_s);
@@ -2952,7 +2962,7 @@ impl AppModel {
         };
         visible_tile_range(
             cols,
-            self.tiles.len(),
+            len,
             spacing,
             padding,
             cell,
@@ -2960,6 +2970,12 @@ impl AppModel {
             offset_y,
             GRID_OVERSCAN_ROWS,
         )
+    }
+
+    /// The visible tile-index range of the open roll's frame grid (see
+    /// [`Self::visible_range`]). Empty when no roll is open.
+    fn visible_tile_range(&self) -> std::ops::Range<usize> {
+        self.visible_range(self.tiles.len())
     }
 
     /// Scrolls the mounted grid so the tile at `index` (within the matched set
@@ -3113,17 +3129,39 @@ impl AppModel {
     /// Spawns decoding of up to [`MAX_CONCURRENT_THUMBS`] roll-cover
     /// thumbnails, mirroring the frame chain's bounds and de-duplication.
     fn decode_covers(&mut self) -> Task<cosmic::Action<Message>> {
+        // Covers belong to the library page: pause while a roll is open (they
+        // resume when the library becomes visible again on back-out).
+        if self.active.is_some() {
+            return Task::none();
+        }
         let capacity = MAX_CONCURRENT_THUMBS.saturating_sub(self.cover_inflight.len());
         if capacity == 0 {
             return Task::none();
         }
 
-        let pending: Vec<(PathBuf, String)> = self
-            .rolls
+        // Decode only covers for the visible library cells (plus overscan), so a
+        // large library no longer decodes every cover up front; off-screen cards
+        // stay `Loading` until scrolled near. The Add Roll tile (cell 0) carries
+        // no cover and is skipped.
+        let cells = library_cells(
+            &self.rolls,
+            self.search_filter.as_deref().unwrap_or(""),
+            &self.month_aliases,
+        );
+        let visible = self.visible_range(cells.len());
+        let pending: Vec<(PathBuf, String)> = cells
+            .get(visible)
+            .unwrap_or(&[])
             .iter()
-            .filter(|roll| matches!(roll.thumb, Thumb::Loading))
-            .filter(|roll| !self.cover_inflight.iter().any(|dir| dir == &roll.dir))
-            .filter_map(|roll| roll.cover.clone().map(|name| (roll.dir.clone(), name)))
+            .filter_map(|cell| match cell {
+                LibraryCell::Roll(roll)
+                    if matches!(roll.thumb, Thumb::Loading)
+                        && !self.cover_inflight.iter().any(|dir| dir == &roll.dir) =>
+                {
+                    roll.cover.clone().map(|name| (roll.dir.clone(), name))
+                }
+                _ => None,
+            })
             .take(capacity)
             .collect();
 
