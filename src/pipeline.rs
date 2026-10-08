@@ -7,6 +7,7 @@
 //! detail shader shares the pointwise density develop via [`film::Develop`].
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use cosmic::widget::image::Handle;
 
@@ -789,22 +790,57 @@ pub(crate) fn histogram_from_develop(
     counts
 }
 
-/// Converts a decoded RAW image into a small oriented RGBA image, scaled so no
-/// dimension exceeds `max_size`, baking the resolved density develop and the
-/// display rotation into the pixels.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub(crate) fn convert_thumbnail(
+/// A decoded, edit-independent thumbnail: the sensor-linear downscale plus the
+/// geometry the CPU bake needs to later apply a develop, crop, and rotation.
+/// Cached per `(roll dir, file name)` and re-baked on use, so a re-opened roll,
+/// an edit, or a calibration change never re-decodes the RAW. The mono is shared
+/// via `Arc<[f32]>` so the owning `Message` clones cheaply.
+#[derive(Debug, Clone)]
+pub(crate) struct ThumbMono {
+    /// Sensor-linear mono (`[0,1]`), pre-develop and pre-geometry.
+    mono: Arc<[f32]>,
+    width: u32,
+    height: u32,
+    /// EXIF orientation to bake in (see [`convert_thumbnail`]).
+    orientation: rawloader::Orientation,
+    /// Masked sensor borders `[top, right, bottom, left]`, for the crop scaling.
+    crops: [usize; 4],
+    src_w: usize,
+    src_h: usize,
+}
+
+/// The expensive, edit-independent half of [`convert_thumbnail`]: one fused
+/// pass — normalize, discard masked borders, and phase-preserve downscale
+/// straight from the sensor samples into a small TRUE sensor-linear mono (the
+/// same domain the detail decode produces) — plus the geometry metadata the
+/// later [`bake_thumbnail`] needs.
+pub(crate) fn downsample_thumbnail_mono(
     image: &rawloader::RawImage,
-    max_size: f32,
+    max_size: u32,
+) -> Result<ThumbMono, FrameError> {
+    let (mono, width, height) =
+        downsample_thumbnail(image, max_size).ok_or(FrameError::ShortSamples)?;
+    Ok(ThumbMono {
+        mono: mono.into(),
+        width,
+        height,
+        orientation: image.orientation,
+        crops: image.crops,
+        src_w: image.width,
+        src_h: image.height,
+    })
+}
+
+/// The cheap, edit-dependent half of [`convert_thumbnail`]: bake the resolved
+/// density develop and the display crop/rotation into a cached [`ThumbMono`].
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub(crate) fn bake_thumbnail(
+    thumb: &ThumbMono,
     develop: Develop,
     crop: CropMargins,
     rotation: u8,
-) -> Result<Handle, crate::error::FrameError> {
-    // One fused pass: normalize, discard masked borders, and phase-preserve
-    // downscale straight from the sensor samples into a small TRUE sensor-linear
-    // mono (the same domain the detail decode produces).
-    let (mut mono, width, height) =
-        downsample_thumbnail(image, max_size as u32).ok_or(crate::error::FrameError::ShortSamples)?;
+) -> Handle {
+    let mut mono = thumb.mono.to_vec();
 
     // The one shared tone tail: the pointwise density develop then sRGB — the
     // same math the detail shader runs per fragment, so grid == detail ==
@@ -817,7 +853,7 @@ pub(crate) fn convert_thumbnail(
         rgba.extend_from_slice(&[level, level, level, 255]);
     }
 
-    let (rgba, width, height) = orient(&rgba, width, height, image.orientation);
+    let (rgba, width, height) = orient(&rgba, thumb.width, thumb.height, thumb.orientation);
 
     // Bake the live crop into the print. The persisted margins are authored in
     // full-resolution DISPLAY source pixels (matching the detail shader's
@@ -826,12 +862,12 @@ pub(crate) fn convert_thumbnail(
     let (rgba, width, height) = if crop == CropMargins::default() {
         (rgba, width, height)
     } else {
-        let src_w = usize::max(image.width, 1);
-        let src_h = usize::max(image.height, 1);
-        let [ct, cr, cb, cl] = image.crops;
+        let src_w = usize::max(thumb.src_w, 1);
+        let src_h = usize::max(thumb.src_h, 1);
+        let [ct, cr, cb, cl] = thumb.crops;
         let cw = src_w.saturating_sub(cr.saturating_add(cl)).max(1) as u32;
         let ch = src_h.saturating_sub(ct.saturating_add(cb)).max(1) as u32;
-        let (disp_w, disp_h) = display_source_dims(cw, ch, image.orientation);
+        let (disp_w, disp_h) = display_source_dims(cw, ch, thumb.orientation);
         let scaled = scale_crop(crop, disp_w, disp_h, width, height);
         crop_rgba(rgba, width, height, scaled)
     };
@@ -843,7 +879,23 @@ pub(crate) fn convert_thumbnail(
     // as the detail shader's uniform rotate (`rotate_ccw(crop(orient(EXIF)))`).
     let (rgba, width, height) = rotate_quarters(rgba, width, height, rotation);
 
-    Ok(Handle::from_rgba(width, height, rgba))
+    Handle::from_rgba(width, height, rgba)
+}
+
+/// Converts a decoded RAW image into a small oriented RGBA image, scaled so no
+/// dimension exceeds `max_size`, baking the resolved density develop and the
+/// display rotation into the pixels. Composition of [`downsample_thumbnail_mono`]
+/// and [`bake_thumbnail`].
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub(crate) fn convert_thumbnail(
+    image: &rawloader::RawImage,
+    max_size: f32,
+    develop: Develop,
+    crop: CropMargins,
+    rotation: u8,
+) -> Result<Handle, FrameError> {
+    let thumb = downsample_thumbnail_mono(image, max_size as u32)?;
+    Ok(bake_thumbnail(&thumb, develop, crop, rotation))
 }
 
 /// Output dimensions a downscale of `src_w` × `src_h` to a `max_edge` long-edge

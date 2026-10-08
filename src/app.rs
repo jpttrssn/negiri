@@ -14,7 +14,8 @@ use crate::library::{
     record_roll_drawer, resolve_date_draft, roll_dates_valid,
 };
 use crate::pipeline::{
-    DetailDecode, convert_thumbnail, decode_raw_detail, histogram_from_develop, resized_dims,
+    DetailDecode, ThumbMono, bake_thumbnail, convert_thumbnail, decode_raw_detail,
+    downsample_thumbnail_mono, histogram_from_develop, resized_dims,
 };
 use crate::shader;
 use crate::ui::{
@@ -77,6 +78,12 @@ const GRID_OVERSCAN_ROWS: usize = 1;
 /// fixed 2048 overview decode (~12–17 MB), so the worst case is bounded at
 /// ~600 MB; native zoom level-up decodes are never cached.
 const DETAIL_CACHE_CAPACITY: usize = 40;
+
+/// Number of decoded frame thumbnails (their edit-independent [`ThumbMono`],
+/// ~576 KiB each) to cache most-recently used. Bounds the session cache so
+/// re-opening a roll — or re-baking an edit — reuses the sensor downscale
+/// instead of re-decoding the RAW. 128 ≈ 72 MiB.
+const THUMB_CACHE_CAPACITY: usize = 128;
 
 /// Maximum number of neighbor detail preload decodes in flight at once.
 /// Preloads run on their own bounded channel, separate from the single
@@ -429,6 +436,11 @@ pub(crate) struct AppModel {
     /// roll switches and detail close; eviction is global (see
     /// [`DETAIL_CACHE_CAPACITY`]). Only overview (2048px) buffers are stored.
     detail_cache: LruCache<(PathBuf, String), DetailMono>,
+    /// LRU of decoded frame thumbnails keyed by (roll dir, file name), storing
+    /// the edit-independent [`ThumbMono`] so re-opening a roll (or re-baking an
+    /// edit / calibration change) re-bakes without re-decoding the RAW. Eviction
+    /// is global (see [`THUMB_CACHE_CAPACITY`]).
+    thumb_cache: LruCache<(PathBuf, String), ThumbMono>,
     /// (roll dir, file name) handed to the bounded neighbor preload decodes,
     /// so a frame already being preloaded (or already cached) is never spawned
     /// twice. Independent of the single critical detail slot.
@@ -789,7 +801,10 @@ pub(crate) enum Message {
     /// A surface action from a menu popup (Wayland): forwarded to the cosmic
     /// runtime, which creates/destroys the popup surface backing the menus.
     Surface(cosmic::surface::Action),
-    ThumbReady(String, Result<Handle, FrameError>),
+    /// A frame thumbnail decode landed: `(dir, name, result)`. The result
+    /// carries the baked `Handle` plus the edit-independent [`ThumbMono`] for
+    /// the session cache.
+    ThumbReady(PathBuf, String, Result<(Handle, ThumbMono), FrameError>),
     /// A thumbnail was double-clicked, opening it in the detail view.
     ThumbnailActivated(String),
     /// Animation tick driving the hi-res crossfade.
@@ -1131,6 +1146,7 @@ impl cosmic::Application for AppModel {
             clipboard: None,
             next_image_id: 0,
             detail_cache: LruCache::new(DETAIL_CACHE_CAPACITY),
+            thumb_cache: LruCache::new(THUMB_CACHE_CAPACITY),
             detail_preload_inflight: Vec::new(),
             toasts: toaster::Toasts::new(Message::ToastClose),
             export_pending: false,
@@ -1710,7 +1726,7 @@ impl cosmic::Application for AppModel {
                     | Message::GridViewport(_)
                     | Message::DetailAreaResized(_)
                     | Message::WindowResized(_)
-                    | Message::ThumbReady(_, _)
+                    | Message::ThumbReady(_, _, _)
                     | Message::RollOpened(_, _)
                     | Message::CoverReady(_, _)
                     | Message::DetailReady(_, _)
@@ -2426,20 +2442,29 @@ impl cosmic::Application for AppModel {
                 self.decode_covers()
             }
 
-            Message::ThumbReady(name, result) => {
+            Message::ThumbReady(dir, name, result) => {
+                // Trace and split the result: the baked handle for the tile, the
+                // edit-independent mono for the session cache.
+                let (ready, thumb) = if let Ok((handle, thumb)) = result {
+                    rebake_trace(format_args!("ThumbReady: {name} -> Ready"));
+                    (Some(handle), Some(thumb))
+                } else {
+                    rebake_trace(format_args!("ThumbReady: {name} -> Failed"));
+                    (None, None)
+                };
                 if let Some(tile) = self.tiles.iter_mut().find(|tile| tile.name == name) {
-                    match &result {
-                        Ok(_) => rebake_trace(format_args!("ThumbReady: {name} -> Ready")),
-                        Err(_) => rebake_trace(format_args!("ThumbReady: {name} -> Failed")),
-                    }
-                    tile.thumb = match result {
-                        Ok(handle) => Thumb::Ready(handle),
-                        Err(_) => Thumb::Failed,
+                    tile.thumb = match ready {
+                        Some(handle) => Thumb::Ready(handle),
+                        None => Thumb::Failed,
                     };
                 } else {
                     rebake_trace(format_args!("ThumbReady: {name} NOT FOUND in tiles"));
                 }
-
+                // Seed the session cache so a re-opened roll (or a re-bake) can
+                // skip the RAW decode.
+                if let Some(thumb) = thumb {
+                    self.thumb_cache.insert((dir, name.clone()), thumb);
+                }
                 self.thumb_inflight.retain(|pending| pending != &name);
                 self.decode_next()
             }
@@ -3078,7 +3103,17 @@ impl AppModel {
         // roll no longer decodes every frame on open — off-screen tiles stay
         // `Loading` until scrolled near, so they cost neither CPU nor RAM.
         let visible = self.visible_tile_range();
-        let pending: Vec<(String, crate::film::Develop, edit_manifest::CropMargins, u8)> = self
+        // Plan the visible, not-in-flight `Loading` tiles: a cached mono means a
+        // re-bake (no RAW decode); otherwise a full decode. Both run off-thread,
+        // so a re-opened roll, an edit, or a calibration change reuses the cached
+        // sensor downscale without blocking the UI.
+        let planned: Vec<(
+            String,
+            crate::film::Develop,
+            edit_manifest::CropMargins,
+            u8,
+            Option<ThumbMono>,
+        )> = self
             .tiles
             .get(visible)
             .unwrap_or(&[])
@@ -3087,14 +3122,16 @@ impl AppModel {
             .filter(|tile| !self.thumb_inflight.iter().any(|name| name == &tile.name))
             .take(capacity)
             .map(|tile| {
-                let develop = self.roll.tone(&tile.name).to_develop(base);
-                let crop = self.roll.crop(&tile.name);
-                let rotation = self.roll.rotation(&tile.name) & 3;
-                (tile.name.clone(), develop, crop, rotation)
+                let name = tile.name.clone();
+                let develop = self.roll.tone(&name).to_develop(base);
+                let crop = self.roll.crop(&name);
+                let rotation = self.roll.rotation(&name) & 3;
+                let cached = self.thumb_cache.get(&(dir.clone(), name.clone())).cloned();
+                (name, develop, crop, rotation, cached)
             })
             .collect();
 
-        if pending.is_empty() {
+        if planned.is_empty() {
             rebake_trace(format_args!(
                 "decode_next: no loading tiles (tiles={}, inflight={})",
                 self.tiles.len(),
@@ -3104,26 +3141,32 @@ impl AppModel {
         }
         rebake_trace(format_args!(
             "decode_next: spawning {} [{:?}]",
-            pending.len(),
-            pending.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>()
+            planned.len(),
+            planned.iter().map(|(n, ..)| n.as_str()).collect::<Vec<_>>()
         ));
 
         self.thumb_inflight
-            .extend(pending.iter().map(|(name, ..)| name.clone()));
+            .extend(planned.iter().map(|(name, ..)| name.clone()));
 
-        Task::batch(
-            pending
-                .into_iter()
-                .map(move |(name, develop, crop, rotation)| {
-                    cosmic::task::future(decode_thumbnail(
-                        dir.clone(),
-                        name,
-                        develop,
-                        crop,
-                        rotation,
-                    ))
-                }),
-        )
+        Task::batch(planned.into_iter().map(
+            move |(name, develop, crop, rotation, cached)| match cached {
+                Some(thumb) => cosmic::task::future(rebake_thumbnail(
+                    dir.clone(),
+                    name,
+                    thumb,
+                    develop,
+                    crop,
+                    rotation,
+                )),
+                None => cosmic::task::future(decode_thumbnail(
+                    dir.clone(),
+                    name,
+                    develop,
+                    crop,
+                    rotation,
+                )),
+            },
+        ))
     }
 
     /// Spawns decoding of up to [`MAX_CONCURRENT_THUMBS`] roll-cover
@@ -4986,7 +5029,9 @@ fn edit_adjust_for(key: &str, _alt: bool, shift: bool) -> Option<EditAdjust> {
 
 /// Decodes a RAW frame from the open roll into a thumbnail message, baking in
 /// the given exposure, tone curve and display rotation so the grid tile reflects
-/// the stored edits (grid == detail).
+/// the stored edits (grid == detail). Also returns the edit-independent
+/// [`ThumbMono`] so the caller can seed the session cache.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // THUMB_SIZE is a small positive const
 async fn decode_thumbnail(
     dir: PathBuf,
     name: String,
@@ -4994,12 +5039,35 @@ async fn decode_thumbnail(
     crop: edit_manifest::CropMargins,
     rotation: u8,
 ) -> Message {
-    let result = decode_raw(dir, name.clone(), move |image| {
-        convert_thumbnail(image, THUMB_SIZE, develop, crop, rotation)
+    let result = decode_raw(dir.clone(), name.clone(), move |image| {
+        let thumb = downsample_thumbnail_mono(image, THUMB_SIZE as u32)?;
+        let handle = bake_thumbnail(&thumb, develop, crop, rotation);
+        Ok((handle, thumb))
     })
     .await;
 
-    Message::ThumbReady(name, result)
+    Message::ThumbReady(dir, name, result)
+}
+
+/// Re-bakes a cached edit-independent [`ThumbMono`] under the current
+/// develop/crop/rotation, off the UI thread. Posts the same
+/// [`Message::ThumbReady`] as a decode, so the session cache round-trips and the
+/// visible-tile concurrency budget covers re-bakes too.
+async fn rebake_thumbnail(
+    dir: PathBuf,
+    name: String,
+    thumb: ThumbMono,
+    develop: crate::film::Develop,
+    crop: edit_manifest::CropMargins,
+    rotation: u8,
+) -> Message {
+    let result = tokio::task::spawn_blocking(move || {
+        let handle = bake_thumbnail(&thumb, develop, crop, rotation);
+        (handle, thumb)
+    })
+    .await
+    .map_err(|_| FrameError::ThreadPanic);
+    Message::ThumbReady(dir, name, result)
 }
 
 /// Decodes a roll's cover file into a thumbnail message, baking in the cover
@@ -5057,10 +5125,12 @@ async fn measure_frame_base(dir: PathBuf, name: String) -> Message {
 }
 
 /// Runs a RAW decode plus conversion on a blocking worker thread so the UI
-/// never stalls on CPU-heavy work.
-async fn decode_raw<F>(dir: PathBuf, name: String, convert: F) -> Result<Handle, FrameError>
+/// never stalls on CPU-heavy work. Generic over the conversion's output `T` (a
+/// `Handle` for covers, `(Handle, ThumbMono)` for frame thumbnails).
+async fn decode_raw<T, F>(dir: PathBuf, name: String, convert: F) -> Result<T, FrameError>
 where
-    F: Fn(&rawloader::RawImage) -> Result<Handle, FrameError> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(&rawloader::RawImage) -> Result<T, FrameError> + Send + 'static,
 {
     let path = dir.join(name);
 
@@ -5201,9 +5271,9 @@ impl menu::action::MenuAction for MenuAction {
 mod tests {
     use super::*;
     use crate::pipeline::{
-        apply_exposure, bake_develop, class_gains, convert_thumbnail, crop_rgba, crop_samples,
-        display_source_dims, downsample_thumbnail, flatten_bayer, luma, resize_area, resized_dims,
-        rotate_quarters, scale_crop, srgb_encode,
+        apply_exposure, bake_develop, bake_thumbnail, class_gains, convert_thumbnail, crop_rgba,
+        crop_samples, display_source_dims, downsample_thumbnail, downsample_thumbnail_mono,
+        flatten_bayer, luma, resize_area, resized_dims, rotate_quarters, scale_crop, srgb_encode,
     };
 
     fn tile(name: &str) -> Tile {
@@ -5817,6 +5887,46 @@ mod tests {
             bake(brighter) > bake(base) + 20.0,
             "+1EV must brighten the positive"
         );
+    }
+
+    #[test]
+    fn bake_thumbnail_matches_convert_thumbnail() {
+        // The split halves must compose to the same pixels as the one-shot
+        // `convert_thumbnail`, so a cached `ThumbMono` re-baked later is identical.
+        let values: Vec<u16> = (0..10 * 10 * 3).map(|i| (200 + (i * 7) % 700) as u16).collect();
+        let image = rawloader::RawImage {
+            make: String::new(),
+            model: String::new(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: 10,
+            height: 10,
+            cpp: 3,
+            wb_coeffs: [1.0; 4],
+            whitelevels: [1000; 4],
+            blacklevels: [0; 4],
+            xyz_to_cam: [[0.0; 3]; 4],
+            cfa: rawloader::CFA::new("RGGB"),
+            crops: [0, 0, 0, 0],
+            blackareas: Vec::new(),
+            orientation: rawloader::Orientation::Normal,
+            data: rawloader::RawImageData::Integer(values),
+        };
+        let develop = crate::film::Develop::with_base(0.8);
+        let crop = edit_manifest::CropMargins {
+            top: 1,
+            right: 1,
+            bottom: 1,
+            left: 1,
+        };
+        let direct = convert_thumbnail(&image, 10.0, develop, crop, 1).expect("decode succeeds");
+        let thumb = downsample_thumbnail_mono(&image, 10).expect("downsample succeeds");
+        let rebaked = bake_thumbnail(&thumb, develop, crop, 1);
+        let pixels = |handle: &cosmic::widget::image::Handle| match handle {
+            cosmic::widget::image::Handle::Rgba { pixels, .. } => pixels.clone(),
+            _ => panic!("expected an RGBA handle"),
+        };
+        assert_eq!(pixels(&direct), pixels(&rebaked));
     }
 
     #[test]
