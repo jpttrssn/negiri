@@ -811,17 +811,20 @@ pub fn manifest_path(dir: &Path) -> PathBuf {
     dir.join(ROLL_MANIFEST_FILE)
 }
 
-/// Loads the roll manifest for `dir`.
-///
-/// A missing manifest maps to a default roll. An unreadable or malformed
-/// manifest likewise falls back to a default roll and is reported to stderr,
-/// so a broken file never blocks scanning the library.
-#[must_use]
-pub fn load_roll_manifest(dir: &Path) -> RollManifest {
-    let path = manifest_path(dir);
-    match std::fs::read(&path) {
+/// Parses a manifest from its TOML text. `Err` carries the TOML error; the
+/// caller reports it (with the path) and falls back to a default.
+fn parse_manifest(text: &str) -> Result<RollManifest, toml::de::Error> {
+    toml::from_str(text)
+}
+
+/// Builds a manifest from a raw file read, applying the fallback policy: a
+/// missing manifest maps to a default roll, and an unreadable, non-UTF-8, or
+/// malformed one likewise logs and yields a default, so a broken file never
+/// blocks scanning the library. Shared by the sync and async loaders.
+fn manifest_from_read(read: std::io::Result<Vec<u8>>, path: &Path) -> RollManifest {
+    match read {
         Ok(bytes) => match std::str::from_utf8(&bytes) {
-            Ok(text) => match toml::from_str(text) {
+            Ok(text) => match parse_manifest(text) {
                 Ok(manifest) => manifest,
                 Err(err) => {
                     log::error!("malformed edit manifest {}: {err}", path.display());
@@ -839,6 +842,23 @@ pub fn load_roll_manifest(dir: &Path) -> RollManifest {
             RollManifest::default()
         }
     }
+}
+
+/// Loads the roll manifest for `dir` synchronously. Callers on the async runtime
+/// should prefer [`load_roll_manifest_async`] so the read doesn't block the
+/// executor.
+#[must_use]
+pub fn load_roll_manifest(dir: &Path) -> RollManifest {
+    let path = manifest_path(dir);
+    manifest_from_read(std::fs::read(&path), &path)
+}
+
+/// Loads the roll manifest for `dir` without blocking the async executor: the
+/// read runs on the blocking pool via [`tokio::fs`]. Same fallback policy as
+/// [`load_roll_manifest`].
+pub async fn load_roll_manifest_async(dir: &Path) -> RollManifest {
+    let path = manifest_path(dir);
+    manifest_from_read(tokio::fs::read(&path).await, &path)
 }
 
 /// Writes the roll manifest to `dir` atomically via a temp file and rename.
@@ -1295,6 +1315,25 @@ curve_shadows_ticks = -3
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(loaded, RollManifest::default());
+    }
+
+    #[test]
+    fn parse_manifest_accepts_valid_and_rejects_malformed_toml() {
+        assert!(parse_manifest("version = 1").is_ok());
+        assert!(parse_manifest("not = [valid toml").is_err());
+    }
+
+    #[tokio::test]
+    async fn async_load_matches_the_sync_loader() {
+        let dir = temp_dir("async-load");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = RollManifest::default();
+        manifest.set_name(Some("Async Roll".to_owned()));
+        manifest.set_exposure("a.DNG", 0.5);
+        save_roll_manifest(&dir, &manifest).unwrap();
+        let loaded = load_roll_manifest_async(&dir).await;
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(loaded, manifest);
     }
 
     #[test]

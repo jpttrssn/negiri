@@ -4483,7 +4483,7 @@ fn dir_leaf(dir: &Path) -> String {
 async fn load_roll(dir: PathBuf) -> Roll {
     let leaf = dir_leaf(&dir);
     let (cover, frame_count) = roll_cover_and_count(&dir).await;
-    let manifest = edit_manifest::load_roll_manifest(&dir);
+    let manifest = edit_manifest::load_roll_manifest_async(&dir).await;
     let name = manifest.name().unwrap_or(&leaf).to_owned();
     let start_date = manifest.start_date().map(str::to_owned);
     let end_date = manifest.end_date().map(str::to_owned);
@@ -5105,7 +5105,7 @@ async fn rebake_thumbnail(
 /// so a library-page cover reflects a calibration recorded from the open roll
 /// without extra plumbing.
 async fn decode_cover(dir: PathBuf, name: String) -> Message {
-    let manifest = edit_manifest::load_roll_manifest(&dir);
+    let manifest = edit_manifest::load_roll_manifest_async(&dir).await;
     let develop = manifest.tone(&name).to_develop(manifest.base_or_default());
     let crop = manifest.crop(&name);
     let rotation = manifest.rotation(&name) & 3;
