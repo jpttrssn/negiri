@@ -36,7 +36,7 @@ use cosmic::theme;
 use cosmic::widget::responsive_menu_bar;
 use cosmic::widget::{self, about::About, icon, image::Handle, menu, toaster};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -1174,8 +1174,15 @@ impl cosmic::Application for AppModel {
             export_progress: None,
         };
 
-        // Set the window title and scan the configured roll directories.
-        let rolls = app.config.rolls.clone();
+        // Set the window title and scan the configured roll directories. The
+        // config stores Pictures-relative paths; resolve them to absolute dirs
+        // (dropping anything that no longer resolves inside Pictures).
+        let rolls: Vec<PathBuf> = app
+            .config
+            .rolls
+            .iter()
+            .filter_map(|rel| resolve_relative_roll(rel))
+            .collect();
         let command = Task::batch([
             app.update_title(),
             cosmic::task::future(async { Message::RollsLoaded(load_rolls(rolls).await) }),
@@ -2157,10 +2164,21 @@ impl cosmic::Application for AppModel {
             Message::AddRoll => open_roll_picker(),
 
             Message::RollAdded(dir) => {
+                // Rolls must live inside the Pictures library root. A folder
+                // picked outside it (or a document-portal path from the portal)
+                // is refused rather than persisted, so the rule holds whether the
+                // app is sandboxed or not.
+                let Some((rel, dir)) = pictures_relative(&dir) else {
+                    return self.push_toast(fl!("roll-outside-pictures"));
+                };
+                // The Pictures root itself is not a roll.
+                if rel.is_empty() {
+                    return self.push_toast(fl!("roll-outside-pictures"));
+                }
                 // The library list is app-wide: persist the new roll no matter
                 // where the folder picker was invoked from.
                 if !self.rolls.iter().any(|roll| roll.dir == dir) {
-                    self.config.rolls.push(dir.to_string_lossy().into_owned());
+                    self.config.rolls.push(rel);
                     self.persist_config();
                 }
                 if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
@@ -2627,7 +2645,14 @@ impl cosmic::Application for AppModel {
             Message::ExportChosen(result) => {
                 self.export_pending = false;
                 match result {
-                    Some((dest, options)) => self.begin_export(dest, options),
+                    Some((dest, options)) => {
+                        // Exports are confined to Pictures too, matching the
+                        // sandbox grant (the Pictures root itself is allowed).
+                        if !is_within_pictures(&dest) {
+                            return self.push_toast(fl!("export-outside-pictures"));
+                        }
+                        self.begin_export(dest, options)
+                    }
                     None => Task::none(),
                 }
             }
@@ -3997,6 +4022,13 @@ impl AppModel {
         }
     }
 
+    /// Shows a short informational toast (e.g. a rejected folder).
+    fn push_toast(&mut self, message: String) -> Task<cosmic::Action<Message>> {
+        self.toasts
+            .push(toaster::Toast::new(message))
+            .map(cosmic::Action::App)
+    }
+
     /// Writes the open frame's exposure live: the RAM roll edit and the GPU
     /// shader uniform. The slider (`ExposureChanged`) and a keyboard step
     /// (`EditAdjust::Exposure`) both route here; committing (persist + re-bake)
@@ -4265,7 +4297,7 @@ impl AppModel {
 
         self.config
             .rolls
-            .retain(|candidate| Path::new(candidate) != dir);
+            .retain(|candidate| resolve_relative_roll(candidate).as_deref() != Some(dir));
         self.persist_config();
         self.rolls.retain(|roll| roll.dir != dir);
 
@@ -4477,6 +4509,68 @@ fn dir_leaf(dir: &Path) -> String {
         .map_or_else(|| dir.to_string_lossy().into_owned(), str::to_string)
 }
 
+/// The user's Pictures directory — the roll library root — canonicalized once
+/// per session. `None` when the platform has no Pictures dir or it can't be
+/// resolved.
+fn pictures_dir() -> Option<PathBuf> {
+    static PICTURES: LazyLock<Option<PathBuf>> =
+        LazyLock::new(|| dirs::picture_dir().and_then(|dir| dir.canonicalize().ok()));
+    PICTURES.clone()
+}
+
+/// Whether `dir` is the Pictures root or inside it (canonicalized, so a symlink
+/// out of Pictures is rejected). Gates the export destination.
+fn is_within_pictures(dir: &Path) -> bool {
+    pictures_dir().is_some_and(|root| is_within(&root, dir))
+}
+
+/// The Pictures-relative path (for storing in `Config::rolls`) and canonical
+/// absolute dir of `dir`, or `None` when `dir` is outside Pictures. `dir` is
+/// the root itself → `Some(("", root))`; callers that require a subdirectory
+/// reject the empty relative path.
+fn pictures_relative(dir: &Path) -> Option<(String, PathBuf)> {
+    relative_under(&pictures_dir()?, dir)
+}
+
+/// Resolves a stored Pictures-relative roll path back to an absolute dir,
+/// rejecting absolute / `.` / `..` escapes so a hand-edited config can't point
+/// outside Pictures. An existing dir is canonicalized and re-checked, so a
+/// symlink out of Pictures is rejected too; a missing dir is kept (it may be a
+/// temporarily unmounted volume) since its lexical path is already escape-free.
+fn resolve_relative_roll(rel: &str) -> Option<PathBuf> {
+    let root = pictures_dir()?;
+    let path = resolve_under(&root, rel)?;
+    match path.canonicalize() {
+        Ok(canonical) if !canonical.starts_with(&root) => None,
+        Ok(canonical) => Some(canonical),
+        Err(_) => Some(path),
+    }
+}
+
+/// Whether canonicalized `dir` is `root` or inside it. `root` must already be
+/// canonical (see [`pictures_dir`]).
+fn is_within(root: &Path, dir: &Path) -> bool {
+    dir.canonicalize().is_ok_and(|dir| dir.starts_with(root))
+}
+
+/// The `root`-relative path of `dir` and its canonical absolute form, or `None`
+/// when `dir` canonicalizes outside `root`. `root` must already be canonical.
+fn relative_under(root: &Path, dir: &Path) -> Option<(String, PathBuf)> {
+    let dir = dir.canonicalize().ok()?;
+    let rel = dir.strip_prefix(root).ok()?;
+    Some((rel.to_string_lossy().into_owned(), dir))
+}
+
+/// Joins a stored relative path onto `root`, rejecting empty and any non-normal
+/// component (absolute, `.`, `..`, Windows prefixes) so it can never escape.
+fn resolve_under(root: &Path, rel: &str) -> Option<PathBuf> {
+    let rel = Path::new(rel);
+    if rel.as_os_str().is_empty() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    Some(root.join(rel))
+}
+
 /// Loads one roll's metadata: display name (manifest label, falling back to
 /// the directory leaf), cover file (first sorted non-dot file), the count of
 /// frame files, and the recorded dates — with nothing decoded yet.
@@ -4508,11 +4602,10 @@ async fn load_roll(dir: PathBuf) -> Roll {
 /// The per-roll scans run concurrently (bounded by [`MAX_CONCURRENT_ROLL_LOADS`],
 /// so a large library doesn't open hundreds of `read_dir` handles at once); the
 /// unordered results are name-sorted at the end, matching the sequential form.
-async fn load_rolls(rolls: Vec<String>) -> Vec<Roll> {
+async fn load_rolls(rolls: Vec<PathBuf>) -> Vec<Roll> {
     let mut seen = HashSet::new();
     let dirs: Vec<PathBuf> = rolls
         .into_iter()
-        .map(PathBuf::from)
         .filter(|dir| seen.insert(dir.clone()))
         .collect();
     let mut loaded: Vec<Roll> = stream::iter(dirs)
@@ -5327,6 +5420,64 @@ mod tests {
             (THUMB_CONCURRENCY_MIN..=THUMB_CONCURRENCY_MAX).contains(&thumb_concurrency()),
             "thumb concurrency escaped its clamp"
         );
+    }
+
+    /// A unique scratch directory under the OS temp dir, canonicalized so it is
+    /// a valid `is_within`/`relative_under` root; the caller cleans it up.
+    fn scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("negiri-path-{}-{label}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn relative_under_keeps_rolls_inside_pictures() {
+        let root = scratch_dir("relative");
+        std::fs::create_dir_all(root.join("trips/2026")).unwrap();
+        // A nested roll keeps its Pictures-relative path.
+        let (rel, dir) = relative_under(&root, &root.join("trips/2026")).unwrap();
+        assert_eq!(rel, "trips/2026");
+        assert_eq!(dir, root.join("trips/2026"));
+        // The root itself is an (empty) relative path; callers reject it.
+        assert_eq!(relative_under(&root, &root).unwrap().0, "");
+        // A sibling whose name shares the root's prefix is NOT inside it.
+        let sibling = root
+            .parent()
+            .unwrap()
+            .join(format!("{}-sibling", root.file_name().unwrap().to_string_lossy()));
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert!(relative_under(&root, &sibling).is_none());
+        // A parent directory is not inside the root.
+        assert!(relative_under(&root, &root.join("..")).is_none());
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&sibling).ok();
+    }
+
+    #[test]
+    fn is_within_allows_root_and_subdirs_only() {
+        let root = scratch_dir("within");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        assert!(is_within(&root, &root));
+        assert!(is_within(&root, &root.join("a")));
+        assert!(!is_within(&root, &root.join("..")));
+        // A path that can't be canonicalized (missing) is rejected.
+        assert!(!is_within(&root, &root.join("missing")));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn resolve_under_rejects_escapes() {
+        let root = Path::new("/pictures");
+        assert_eq!(
+            resolve_under(root, "trips/2026"),
+            Some(PathBuf::from("/pictures/trips/2026"))
+        );
+        // Empty, `.`, `..`, absolute, and embedded `..` are all rejected.
+        assert!(resolve_under(root, "").is_none());
+        assert!(resolve_under(root, ".").is_none());
+        assert!(resolve_under(root, "../secret").is_none());
+        assert!(resolve_under(root, "/etc").is_none());
+        assert!(resolve_under(root, "a/../b").is_none());
     }
 
     #[test]

@@ -3149,6 +3149,7 @@ name = "negiri"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "dirs",
  "i18n-embed",
  "i18n-embed-fl",
  "image",
