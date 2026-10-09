@@ -3,7 +3,9 @@
 </p>
 
 # Negiri
-A film roll library and non-destructive RAW editor focused on digital camera scans of black and white film rolls developed for the COSMIC desktop.
+A film roll library and non-destructive RAW editor for digital camera scans of film negatives.
+
+Currently in Beta and only supports black and white negatives. Config and roll manifest/edits may change.
 
 - Manage your film rolls
 - Non-destructive per-frame edits, stored in a hand-editable `.film-roll.toml` sidecar
