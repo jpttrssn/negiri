@@ -14,10 +14,18 @@ Currently in Beta and only supports black and white negatives. Config and roll m
 - Histogram with an output/input axis toggle, plus a classic `T(p)` curve overlay
 - Crop mode tuned for removing edges, plus quarter-turn display rotation
 - Post-gain 2×2 CFA averaging for lower read noise on monochrome negatives
-- Keyboard-centric: VIM navigation, a `?` shortcut overlay, Shift for fine steps
+- Keyboard-centric controls
 - Set and export original roll date with chronological frame order
 - Search by roll metadata
 - Export to JPEG or 16-bit PNG with EXIF capture-time stamping
+
+<p align="center">
+  <img src="resources/screenshots/library.png" alt="Library">
+</p>
+
+<p align="center">
+  <img src="resources/screenshots/details.png" alt="Details">
+</p>
 
 ## Installation
 
