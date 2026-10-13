@@ -309,27 +309,9 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     .step(edit_manifest::TONE_STEP)
     .shift_step(edit_manifest::TONE_TICK)
     .on_release(Message::EditSave);
-    // Keyboard crop readout + arm hint. The four values are the live margins
-    // removed from each edge in source pixels (top/right/bottom/left).
-    let crop_readout = widget::text(fl!(
-        "crop-readout",
-        top = app.crop.top,
-        right = app.crop.right,
-        bottom = app.crop.bottom,
-        left = app.crop.left
-    ));
-    // Display rotation readout: a cumulative counter-clockwise quarter-turn
-    // value (0° / 90° / 180° / 270°) on top of the EXIF orientation. The
-    // keyboard (`r`) routes the step through the edit-key machinery.
-    let rotation_degrees = u32::from(app.rotation) * 90_u32;
-    let rotation_readout = widget::text(fl!("rotation-readout", degrees = rotation_degrees));
+
     let reset_all = widget::button::standard(fl!("reset-all")).on_press(Message::ResetAll);
     let reset_crop = widget::button::standard(fl!("reset-crop")).on_press(Message::ResetCrop);
-
-    let crop_row = widget::row::with_capacity(2)
-        .push(crop_readout)
-        .push(reset_crop)
-        .spacing(space_s);
 
     widget::column::with_capacity(24)
         .push(histogram)
@@ -346,8 +328,7 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .push(pivot_slider)
         .push(reset_all)
         .push(widget::divider::horizontal::default())
-        .push(rotation_readout)
-        .push(crop_row)
+        .push(reset_crop)
         .spacing(space_s)
         .width(Length::Fill)
         .into()
