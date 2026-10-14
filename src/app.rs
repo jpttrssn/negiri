@@ -746,8 +746,8 @@ pub(crate) enum Message {
     RollInfoLoaded(Roll),
     /// A roll cover decode finished.
     CoverReady(PathBuf, Result<Handle, FrameError>),
-    /// The folder picker returned a roll directory to add.
-    RollAdded(PathBuf),
+    /// The folder picker returned roll directories to add.
+    RollsAdded(Vec<PathBuf>),
     /// The user asked to make the currently viewed frame the roll's
     /// calibration frame: its clear-film plateau is measured once and recorded
     /// in the roll manifest as the base every frame's develop anchors against.
@@ -1696,8 +1696,7 @@ impl cosmic::Application for AppModel {
             // Window resizes update the grid geometry and re-pump thumbnail
             // decoding for the rows the new viewport exposes. (The
             // `on_window_resize` hook still seeds the geometry at startup.)
-            cosmic::iced::window::resize_events()
-                .map(|(_id, size)| Message::WindowResized(size)),
+            cosmic::iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size)),
             // Watch for application configuration changes.
             self.core()
                 .watch_config::<Config>(Self::APP_ID)
@@ -2145,9 +2144,7 @@ impl cosmic::Application for AppModel {
                 }
                 self.rolls.push(roll);
                 self.rolls.sort_by(|a, b| a.name.cmp(&b.name));
-                // The selection already points at the new roll (`RollAdded`),
-                // so the card just lands alongside the others.
-                self.decode_covers()
+                Task::none()
             }
 
             Message::CoverReady(dir, result) => {
@@ -2163,39 +2160,34 @@ impl cosmic::Application for AppModel {
 
             Message::AddRoll => open_roll_picker(),
 
-            Message::RollAdded(dir) => {
-                // Rolls must live inside the Pictures library root. A folder
-                // picked outside it (or a document-portal path from the portal)
-                // is refused rather than persisted, so the rule holds whether the
-                // app is sandboxed or not.
-                let Some((rel, dir)) = pictures_relative(&dir) else {
-                    return self.push_toast(fl!("roll-outside-pictures"));
-                };
-                // The Pictures root itself is not a roll.
-                if rel.is_empty() {
-                    return self.push_toast(fl!("roll-outside-pictures"));
-                }
-                // The library list is app-wide: persist the new roll no matter
-                // where the folder picker was invoked from.
-                if !self.rolls.iter().any(|roll| roll.dir == dir) {
-                    self.config.rolls.push(rel);
-                    self.persist_config();
-                }
-                if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
-                    roll.thumb = Thumb::Loading;
-                }
-                // Mark the new roll selected (the selection survives roll exit,
-                // so backing out lands on it). The cover scan for the card
-                // continues in parallel.
-                self.set_library_selection(LibrarySelection::Roll(dir.clone()));
-                let scan_dir = dir.clone();
-                let card = cosmic::task::future(async move {
-                    Message::RollInfoLoaded(load_roll(scan_dir).await)
+            Message::RollsAdded(dirs) => {
+                let load_cards = dirs.iter().map(|dir| {
+                    // Rolls must live inside the Pictures library root. A folder
+                    // picked outside it (or a document-portal path from the portal)
+                    // is refused rather than persisted, so the rule holds whether the
+                    // app is sandboxed or not.
+                    let Some((rel, dir)) = pictures_relative(dir) else {
+                        return self.push_toast(fl!("roll-outside-pictures"));
+                    };
+                    // The Pictures root itself is not a roll.
+                    if rel.is_empty() {
+                        return self.push_toast(fl!("roll-outside-pictures"));
+                    }
+                    // The library list is app-wide: persist the new roll no matter
+                    // where the folder picker was invoked from.
+                    if !self.rolls.iter().any(|roll| roll.dir == dir) {
+                        self.config.rolls.push(rel);
+                        self.persist_config();
+                    }
+                    if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
+                        roll.thumb = Thumb::Loading;
+                    }
+                    let scan_dir = dir.clone();
+                    cosmic::task::future(async move {
+                        Message::RollInfoLoaded(load_roll(scan_dir).await)
+                    })
                 });
-                // Drill straight into the new roll's frame grid, from wherever
-                // the app was when the roller was chosen.
-                let open = self.open_roll(dir);
-                Task::batch([card, open, self.decode_covers()])
+                Task::batch(load_cards).chain(self.decode_covers())
             }
 
             Message::CalibrateBaseFromFrame => self.calibrate_base_from_frame(),
@@ -3135,7 +3127,9 @@ impl AppModel {
         let Some(dir) = self.active.clone() else {
             return Task::none();
         };
-        let capacity = self.thumb_concurrency.saturating_sub(self.thumb_inflight.len());
+        let capacity = self
+            .thumb_concurrency
+            .saturating_sub(self.thumb_inflight.len());
         if capacity == 0 {
             rebake_trace(format_args!(
                 "decode_next: capacity 0 (inflight={})",
@@ -3194,25 +3188,27 @@ impl AppModel {
         self.thumb_inflight
             .extend(planned.iter().map(|(name, ..)| name.clone()));
 
-        Task::batch(planned.into_iter().map(
-            move |(name, develop, crop, rotation, cached)| match cached {
-                Some(thumb) => cosmic::task::future(rebake_thumbnail(
-                    dir.clone(),
-                    name,
-                    thumb,
-                    develop,
-                    crop,
-                    rotation,
-                )),
-                None => cosmic::task::future(decode_thumbnail(
-                    dir.clone(),
-                    name,
-                    develop,
-                    crop,
-                    rotation,
-                )),
-            },
-        ))
+        Task::batch(
+            planned.into_iter().map(
+                move |(name, develop, crop, rotation, cached)| match cached {
+                    Some(thumb) => cosmic::task::future(rebake_thumbnail(
+                        dir.clone(),
+                        name,
+                        thumb,
+                        develop,
+                        crop,
+                        rotation,
+                    )),
+                    None => cosmic::task::future(decode_thumbnail(
+                        dir.clone(),
+                        name,
+                        develop,
+                        crop,
+                        rotation,
+                    )),
+                },
+            ),
+        )
     }
 
     /// Spawns decoding of up to [`AppModel::thumb_concurrency`] roll-cover
@@ -3223,7 +3219,9 @@ impl AppModel {
         if self.active.is_some() {
             return Task::none();
         }
-        let capacity = self.thumb_concurrency.saturating_sub(self.cover_inflight.len());
+        let capacity = self
+            .thumb_concurrency
+            .saturating_sub(self.cover_inflight.len());
         if capacity == 0 {
             return Task::none();
         }
@@ -4647,13 +4645,19 @@ async fn scan_frame_files(dir: &Path) -> Vec<String> {
 /// the double-click handler and Enter on a selected Add Roll tile.
 fn open_roll_picker() -> Task<cosmic::Action<Message>> {
     cosmic::task::future(async {
-        let dialog = cosmic::dialog::file_chooser::open::Dialog::new().open_folder();
+        let dialog = cosmic::dialog::file_chooser::open::Dialog::new().open_folders();
         match dialog.await {
             Ok(response) => {
-                let Ok(dir) = response.url().to_file_path() else {
-                    return Message::Ignore;
-                };
-                Message::RollAdded(dir)
+                let dirs: Vec<PathBuf> = response
+                    .urls()
+                    .iter()
+                    .filter_map(|url| url.to_file_path().ok())
+                    .collect();
+                if dirs.is_empty() {
+                    Message::Ignore
+                } else {
+                    Message::RollsAdded(dirs)
+                }
             }
             // Cancelled (or a portal failure) is a no-op.
             Err(_) => Message::Ignore,
@@ -5441,10 +5445,10 @@ mod tests {
         // The root itself is an (empty) relative path; callers reject it.
         assert_eq!(relative_under(&root, &root).unwrap().0, "");
         // A sibling whose name shares the root's prefix is NOT inside it.
-        let sibling = root
-            .parent()
-            .unwrap()
-            .join(format!("{}-sibling", root.file_name().unwrap().to_string_lossy()));
+        let sibling = root.parent().unwrap().join(format!(
+            "{}-sibling",
+            root.file_name().unwrap().to_string_lossy()
+        ));
         std::fs::create_dir_all(&sibling).unwrap();
         assert!(relative_under(&root, &sibling).is_none());
         // A parent directory is not inside the root.
@@ -6057,7 +6061,9 @@ mod tests {
     fn bake_thumbnail_matches_convert_thumbnail() {
         // The split halves must compose to the same pixels as the one-shot
         // `convert_thumbnail`, so a cached `ThumbMono` re-baked later is identical.
-        let values: Vec<u16> = (0..10 * 10 * 3).map(|i| (200 + (i * 7) % 700) as u16).collect();
+        let values: Vec<u16> = (0..10 * 10 * 3)
+            .map(|i| (200 + (i * 7) % 700) as u16)
+            .collect();
         let image = rawloader::RawImage {
             make: String::new(),
             model: String::new(),
@@ -6390,7 +6396,10 @@ mod tests {
         // A positive keyboard step (`.`), interpreted in the UI axis, lowers the
         // density too — so the increase key matches the slider's rightward drag.
         let stepped = white_density_from_ui(white_ui_from_density(2.4) + EDIT_STEP_CURVE);
-        assert!(stepped < 2.4, "`.` should brighten, density went to {stepped}");
+        assert!(
+            stepped < 2.4,
+            "`.` should brighten, density went to {stepped}"
+        );
     }
 
     #[test]
