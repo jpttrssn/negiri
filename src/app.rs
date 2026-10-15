@@ -111,22 +111,23 @@ const MAX_CONCURRENT_PRELOADS: usize = 2;
 const DETAIL_PRELOAD_DISTANCE: usize = 1;
 
 /// Coarse drag steps one bare edit key advances, per control. Integers, so a
-/// bare key always lands on the storage lattice and can never desynchronize from
-/// the bare drag it is derived from (pinned by `bare_key_steps_are_whole_coarse_steps`).
+/// bare key can never desynchronize from the bare drag it is derived from
+/// (pinned by `bare_key_steps_are_whole_coarse_steps`).
 const KEY_COARSE_STEPS_EV: i16 = 1;
 const KEY_COARSE_STEPS_TONE: i16 = 1;
 
-/// Keyboard shortcut step for exposure (EV) with a bare key: `0.25 EV`.
+/// Keyboard shortcut step for exposure (EV) with a bare key: one coarse step,
+/// `0.05 EV`.
 const EDIT_STEP_EV: f32 = edit_manifest::EV_STEP * KEY_COARSE_STEPS_EV as f32;
-/// Keyboard shortcut nudge step for exposure (EV) with the Shift modifier: one
-/// stored tick, the same fine grid a Shift-held slider drag uses, so both land
-/// on the manifest's storage lattice.
+/// Keyboard shortcut nudge step for exposure (EV) with the Shift modifier: the
+/// fine step a Shift-held slider drag uses, so both land on the storage grid.
 const EDIT_NUDGE_EV: f32 = edit_manifest::EV_TICK;
 /// Keyboard shortcut step for a develop control's lift (contrast, black, white,
-/// midtone pivot) with a bare key, in that control's own domain: `0.20`.
+/// midtone pivot) with a bare key, in that control's own domain: one coarse
+/// step, `0.05`.
 const EDIT_STEP_CURVE: f32 = edit_manifest::TONE_STEP * KEY_COARSE_STEPS_TONE as f32;
 /// Keyboard shortcut nudge step for a develop control with the Shift modifier:
-/// one stored tick, matching the Shift-held slider drag.
+/// the fine step, matching the Shift-held slider drag.
 const EDIT_NUDGE_CURVE: f32 = edit_manifest::TONE_TICK;
 /// Keyboard shortcut step for a crop-window move: a bare move key (`h`/`j`/`k`/`l`
 /// or an arrow) translates the crop window by this many source pixels.
@@ -4870,8 +4871,8 @@ fn zoom_about_anchor(zoom_old: f32, zoom_new: f32, pan: Point, cursor: Point) ->
     )
 }
 
-/// Clamps an exposure adjustment in EV to the exposure slider's range
-/// (`−3.0..=+4.0`, from the stored tick bounds).
+/// Clamps an exposure adjustment in EV to the exposure slider's real range
+/// (`−3.0..=+4.0`).
 fn clamp_ev(ev: f32) -> f32 {
     edit_manifest::clamp_to(ev, edit_manifest::exposure_range())
 }
@@ -4879,14 +4880,14 @@ fn clamp_ev(ev: f32) -> f32 {
 /// Clamps the Contrast power (a mid-pivoted power) to the contrast control's
 /// range `0.125..=8.0` so a keyboard shortcut and the slider agree on bounds.
 /// The range is a symmetric reciprocal pair around the `1.0` identity (both
-/// ends derived from the stored lift bounds), so the stop-based lift scale spans
-/// an even ±3 stops.
+/// ends mapped from the lift bounds), so the stop-based lift scale spans an
+/// even ±3 stops.
 fn clamp_contrast_power(power: f32) -> f32 {
     edit_manifest::clamp_to(power, edit_manifest::contrast_power_range())
 }
 
-/// Clamps the Black density anchor to its slider/manifest range `-1.0..=1.0`
-/// (±200 stored ticks), so a keyboard shortcut and the slider agree on bounds.
+/// Clamps the Black density anchor to its slider range `-2.0..=2.0`, so a
+/// keyboard shortcut and the slider agree on bounds.
 fn clamp_black(black: f32) -> f32 {
     edit_manifest::clamp_to(black, edit_manifest::black_range())
 }
@@ -4924,7 +4925,7 @@ pub(crate) fn contrast_power_for_lift(value: f32) -> f32 {
 /// clips highlights) — matching every other control's rightward "increase"
 /// convention. The develop's `white` density does the opposite (a higher anchor
 /// darkens), so White is the one control whose UI axis is inverted. The mirror
-/// is its own inverse and maps the tick lattice onto itself.
+/// is its own inverse and maps the storage grid onto itself.
 pub(crate) fn white_ui_from_density(density: f32) -> f32 {
     let range = edit_manifest::white_range();
     *range.start() + *range.end() - density
@@ -6312,10 +6313,9 @@ mod tests {
     #[test]
     fn bare_key_steps_are_whole_coarse_steps() {
         // A bare key must advance a whole number of coarse drag steps, so the
-        // keyboard shares the slider's ladder and always lands on the storage
-        // lattice; Shift+key is exactly one stored tick. Both hold by
-        // construction (`EDIT_STEP_*` is derived from `*_STEP`), so this is the
-        // guard that keeps the derivation honest.
+        // keyboard shares the slider's ladder; Shift+key is exactly the fine
+        // step. Both hold by construction (`EDIT_STEP_*` is derived from
+        // `*_STEP`), so this is the guard that keeps the derivation honest.
         for (key_step, coarse_step) in [
             (EDIT_STEP_EV, edit_manifest::EV_STEP),
             (EDIT_STEP_CURVE, edit_manifest::TONE_STEP),
@@ -6330,9 +6330,9 @@ mod tests {
             (EDIT_NUDGE_EV, edit_manifest::EV_TICK),
             (EDIT_NUDGE_CURVE, edit_manifest::TONE_TICK),
         ] {
-            assert_eq!(nudge, fine, "the Shift nudge must be one stored tick");
+            assert_eq!(nudge, fine, "the Shift nudge must be the fine step");
         }
-        // The exposure keys move a quarter EV per press (five coarse steps).
+        // The exposure keys move one coarse step (0.05 EV) per press.
         assert_eq!(EDIT_STEP_EV, 0.05);
     }
 
@@ -6340,7 +6340,7 @@ mod tests {
     fn white_ui_axis_inverts_the_density_anchor() {
         // The White slider runs on a mirrored density axis so right = brighter:
         // the range endpoints swap, and the mirror is an involution that keeps
-        // the tick lattice.
+        // the storage grid.
         let range = edit_manifest::white_range();
         assert!((white_ui_from_density(*range.start()) - *range.end()).abs() < 1e-6);
         assert!((white_ui_from_density(*range.end()) - *range.start()).abs() < 1e-6);

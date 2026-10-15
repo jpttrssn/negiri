@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::film::{self, Develop};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -27,106 +27,60 @@ pub const DEFAULT_WHITE: f32 = film::DEFAULT_D_MAX;
 /// Midtone pivot offset applied until an edit records otherwise (identity `0`).
 pub const DEFAULT_PIVOT: f32 = 0.0;
 
-/// Stored ticks in one fine control step (a Shift-held slider drag or Shift+key)
-/// — exactly one tick, so a fine edit is stored without rounding.
-pub const FINE_TICKS: i16 = 1;
-
-/// Stored ticks in one coarse control step (a bare slider drag or bare shortcut
-/// key).
+/// The storage grid's scale: values are stored to the nearest `1 / SCALE`
+/// (one millistop / milli-EV, one milli-density, one milli-fraction), in each
+/// control's own domain.
 ///
-/// Both rungs are integer tick counts, so the control ladder is a refinement of
-/// the storage lattice: re-tuning either one can never reinterpret a stored
-/// count, only change which stored values a drag can *reach*. A coarse step is a
-/// whole number of ticks, so it always lands on the fine grid without rounding.
-pub const COARSE_TICKS: i16 = 5;
+/// The manifest stores the *real* control value rounded onto this grid, not a
+/// count on a UI grid, so retuning a control's slider range or steps can never
+/// reinterpret a stored value. Changing this scale only changes the precision of
+/// future writes; it never changes what an existing value means. It is stated as
+/// an exact integer divisor so a rounded value re-rounds to the same `f32` (a
+/// clean `0.7` stays `0.7`, not `0.70000005`). The UI steps below are whole
+/// multiples of the grid (pinned by `steps_are_whole_multiples_of_the_storage_grid`),
+/// so a drag or keypress always persists exactly with no rounding jump.
+pub const STORAGE_SCALE: f32 = 1000.0;
 
-/// Stored ticks per 1 EV — the exposure storage grid, stated as an exact integer
-/// count rather than a float quantum (so a decoded value is correctly rounded:
-/// `40` ticks is exactly `f32(0.4)`).
-///
-/// **This is a data contract, frozen.** It defines the meaning of every stored
-/// integer and must never move because a control's UX changed; the UI derives
-/// its ranges and steps from it instead (see [`exposure_range`], [`EV_STEP`]).
-/// `i16` leaves ±327 EV of headroom, so there is no pressure to ever coarsen it:
-/// one tick is ~1/100 EV, still ~330 codes of the 16-bit export.
-pub const EV_TICKS_PER_EV: i16 = 100;
+/// The exposure one-tick (Shift) step, in EV — a UI concern, free to retune.
+pub const EV_TICK: f32 = 0.01;
 
-/// Stored ticks per unit of the develop tone controls' own domains — the contrast
-/// lift (stops), the black desnity anchor (density), the white density anchor (density),
-/// and the midtone pivot (window fraction) all share one grid.
-pub const TONE_TICKS_PER_UNIT: i16 = 100;
+/// The exposure coarse drag step, in EV — a UI concern, free to retune.
+pub const EV_STEP: f32 = 0.05;
 
-/// Converts a tick count in any control's domain to that domain's value.
-///
-/// The one place a tick becomes a float. Dividing by an exact integer count is
-/// correctly rounded, so decoding is exact (`70` ticks is `f32(0.7)`, not
-/// `0.69999999`), and both `i16 → f32` operands fit the f32 mantissa, so the
-/// conversion is lossless and needs no rounding allowance.
-const fn step_value(ticks: i16, ticks_per_unit: i16) -> f32 {
-    ticks as f32 / ticks_per_unit as f32
-}
+/// The contrast / black / white / pivot one-tick (Shift) step — a UI concern,
+/// free to retune.
+pub const TONE_TICK: f32 = 0.01;
 
-/// Converts a control-domain value to the nearest whole tick.
-const fn ticks_of(value: f32, ticks_per_unit: i16) -> f32 {
-    value * ticks_per_unit as f32
-}
+/// The contrast / black / white / pivot coarse drag step — a UI concern, free to
+/// retune.
+pub const TONE_STEP: f32 = 0.05;
 
-/// The exposure's one-tick (Shift) step, in EV.
-pub const EV_TICK: f32 = step_value(FINE_TICKS, EV_TICKS_PER_EV);
+/// The exposure control's whole domain in EV: both the slider's range (see
+/// [`exposure_range`]) and the write clamp. A UI concern, free to retune.
+const EXPOSURE_EV_MIN: f32 = -3.0;
+const EXPOSURE_EV_MAX: f32 = 4.0;
+/// The contrast lift control's domain in stops (the centered `−3..=3` stop
+/// track, power `0.125..=8.0`).
+const CONTRAST_LIFT_MIN: f32 = -3.0;
+const CONTRAST_LIFT_MAX: f32 = 3.0;
+/// The black density anchor's domain (±2.0 density).
+const BLACK_MIN: f32 = -2.0;
+const BLACK_MAX: f32 = 2.0;
+/// The white density anchor's domain (`0.5..5.0` density).
+const WHITE_MIN: f32 = 0.5;
+const WHITE_MAX: f32 = 5.0;
+/// The midtone pivot offset's domain (the `−0.5..=0.5` window-fraction range).
+const PIVOT_MIN: f32 = -0.5;
+const PIVOT_MAX: f32 = 0.5;
 
-/// The exposure coarse drag step, in EV.
-pub const EV_STEP: f32 = step_value(COARSE_TICKS, EV_TICKS_PER_EV);
-
-/// The contrast / white / pivot one-tick (Shift) step.
-pub const TONE_TICK: f32 = step_value(FINE_TICKS, TONE_TICKS_PER_UNIT);
-
-/// The contrast / white / pivot coarse drag step.
-pub const TONE_STEP: f32 = step_value(COARSE_TICKS, TONE_TICKS_PER_UNIT);
-
-/// Stored exposure tick bounds: the control's whole domain, so they are both the
-/// slider's range (see [`exposure_range`]) and the encode clamp.
-const EXPOSURE_TICK_MIN: i16 = -300;
-const EXPOSURE_TICK_MAX: i16 = 400;
-/// Stored contrast lift-tick bounds (the centered `−3..=3` stop track, power
-/// `0.125..=8.0`).
-const CONTRAST_TICK_MIN: i16 = -300;
-const CONTRAST_TICK_MAX: i16 = 300;
-/// Stored black density anchor bounds (±1.0 density, on the [`BLACK_TICK`] grid).
-const BLACK_TICK_MIN: i16 = -200;
-const BLACK_TICK_MAX: i16 = 200;
-/// Stored white density anchor bounds (`0.5..5.0` density).
-const WHITE_TICK_MIN: i16 = 50;
-const WHITE_TICK_MAX: i16 = 500;
-/// Stored midtone pivot offset bounds (the `−1..=1` window-fraction range).
-const PIVOT_TICK_MIN: i16 = -50;
-const PIVOT_TICK_MAX: i16 = 50;
-
-/// Default EV in ticks.
-const DEFAULT_EXPOSURE_TICKS: i16 = 70;
-/// Identity contrast lift in ticks.
-const DEFAULT_CONTRAST_LIFT_TICKS: i16 = 0;
-/// Default white density in ticks
-const DEFAULT_WHITE_TICKS: i16 = 240;
-
-/// A control's whole range, derived from its stored tick bounds.
-///
-/// The bounds are the single source of truth: they set the slider's range *and*
-/// the encode clamp below, so the widget can never produce a value off the
-/// storage lattice, and the two uses of a control's domain cannot drift apart.
-fn value_range(min: i16, max: i16, ticks_per_unit: i16) -> RangeInclusive<f32> {
-    step_value(min, ticks_per_unit)..=step_value(max, ticks_per_unit)
-}
-
-/// The exposure slider's range in EV (`−3.0..=4.0`), from the
-/// [`EXPOSURE_TICK_MIN`]..=[`EXPOSURE_TICK_MAX`] tick bounds.
+/// The exposure slider's range in EV (`−3.0..=4.0`).
 pub fn exposure_range() -> RangeInclusive<f32> {
-    value_range(EXPOSURE_TICK_MIN, EXPOSURE_TICK_MAX, EV_TICKS_PER_EV)
+    EXPOSURE_EV_MIN..=EXPOSURE_EV_MAX
 }
 
-/// The contrast slider's range in stop-lift (`−3.0..=3.0`), from the
-/// [`CONTRAST_TICK_MIN`]..=[`CONTRAST_TICK_MAX`] lift-tick bounds.
+/// The contrast slider's range in stop-lift (`−3.0..=3.0`).
 pub fn contrast_lift_range() -> RangeInclusive<f32> {
-    value_range(CONTRAST_TICK_MIN, CONTRAST_TICK_MAX, TONE_TICKS_PER_UNIT)
+    CONTRAST_LIFT_MIN..=CONTRAST_LIFT_MAX
 }
 
 /// The same contrast domain in the raw power the develop functions take
@@ -134,22 +88,22 @@ pub fn contrast_lift_range() -> RangeInclusive<f32> {
 /// lift bounds are symmetric, the result is a reciprocal pair around the `1.0`
 /// identity, so the stop-lift track spans an even ±3 stops.
 pub fn contrast_power_range() -> RangeInclusive<f32> {
-    contrast_power(CONTRAST_TICK_MIN)..=contrast_power(CONTRAST_TICK_MAX)
+    CONTRAST_LIFT_MIN.exp2()..=CONTRAST_LIFT_MAX.exp2()
 }
 
-/// The black anchor slider's range in density (`−1.0..=1.0`).
+/// The black anchor slider's range in density (`−2.0..=2.0`).
 pub fn black_range() -> RangeInclusive<f32> {
-    value_range(BLACK_TICK_MIN, BLACK_TICK_MAX, TONE_TICKS_PER_UNIT)
+    BLACK_MIN..=BLACK_MAX
 }
 
 /// The white anchor slider's range in density (`0.5..=5.0`).
 pub fn white_range() -> RangeInclusive<f32> {
-    value_range(WHITE_TICK_MIN, WHITE_TICK_MAX, TONE_TICKS_PER_UNIT)
+    WHITE_MIN..=WHITE_MAX
 }
 
 /// The midtone pivot slider's range in window fraction (`−0.5..=0.5`).
 pub fn pivot_range() -> RangeInclusive<f32> {
-    value_range(PIVOT_TICK_MIN, PIVOT_TICK_MAX, TONE_TICKS_PER_UNIT)
+    PIVOT_MIN..=PIVOT_MAX
 }
 
 /// Clamps `value` into a control's `range()`.
@@ -160,97 +114,63 @@ pub fn clamp_to(value: f32, range: RangeInclusive<f32>) -> f32 {
     value.clamp(*range.start(), *range.end())
 }
 
-/// Rounds `value` to the nearest whole tick and clamps to `[min, max]`, so every
-/// stored edit lands on the fine (Shift) grid.
+/// Rounds `value` onto the real-unit storage grid (the nearest step of the
+/// [`STORAGE_SCALE`] grid).
 ///
-/// The clamp is the control's own range: `min`/`max` are its tick bounds, so a
-/// stored value outside the domain cannot exist after a write. Narrowing a
-/// control's range is therefore a data change for any edit already stored past
-/// the new bound (it would be clamped on this frame's next exposure/develop
-/// write, paste, or reset), which is why range changes are widen-only while
-/// manifests exist.
-#[allow(clippy::cast_possible_truncation)]
-fn quantize_ticks(value: f32, ticks_per_unit: i16, min: i16, max: i16) -> i16 {
-    (ticks_of(value, ticks_per_unit).round() as i32).clamp(i32::from(min), i32::from(max)) as i16
+/// This is the only quantization the manifest applies. It keeps writes clean and
+/// hand-editable (`0.4`, not `0.40000001`) and stops float drift accumulating
+/// across repeated steps. Because the stored number is the control's real value,
+/// a later change to a range or UI step cannot reinterpret it.
+fn quantize(value: f32) -> f32 {
+    (value * STORAGE_SCALE).round() / STORAGE_SCALE
 }
 
-/// The stored exposure tick for an EV value.
-fn exposure_ticks(ev: f32) -> i16 {
-    quantize_ticks(ev, EV_TICKS_PER_EV, EXPOSURE_TICK_MIN, EXPOSURE_TICK_MAX)
+/// Serializes an `f32` control value as an `f64` rounded onto the storage grid.
+///
+/// `toml` widens an `f32` to `f64` before formatting (`2.4f32` becomes
+/// `2.4000000953674316`), so a raw `f32` field would leak the full binary value
+/// into a hand-edited file. Rounding at `f64` precision first keeps the text a
+/// clean decimal (`2.4`) while the value still decodes to the same grid `f32`.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `serialize_with` signature mandates `&f32`
+fn serialize_grid<S: Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+    let scale = f64::from(STORAGE_SCALE);
+    serializer.serialize_f64((f64::from(*value) * scale).round() / scale)
 }
 
-/// The exposure EV a stored tick decodes to.
-fn exposure_ev(ticks: i16) -> f32 {
-    step_value(ticks, EV_TICKS_PER_EV)
+/// The `Option<f32>` twin of [`serialize_grid`] for an optional field (the roll
+/// `base`); `skip_serializing_if` already excludes `None`.
+// serde's `serialize_with` signature mandates `&Option<f32>`.
+#[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
+fn serialize_grid_opt<S: Serializer>(
+    value: &Option<f32>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => serialize_grid(value, serializer),
+        None => serializer.serialize_none(),
+    }
 }
 
-/// The stored contrast lift tick for a mid-pivoted power. The lift is
-/// `+log2(power)` (a rightward drag raises contrast), stored in the lift domain
-/// so the fine (Shift) grid is exact through the integer round-trip.
-fn contrast_lift_ticks(power: f32) -> i16 {
-    quantize_ticks(
-        clamp_to(power, contrast_power_range()).log2(),
-        TONE_TICKS_PER_UNIT,
-        CONTRAST_TICK_MIN,
-        CONTRAST_TICK_MAX,
-    )
-}
-
-/// The contrast power a stored lift tick decodes to.
-fn contrast_power(ticks: i16) -> f32 {
-    step_value(ticks, TONE_TICKS_PER_UNIT).exp2()
-}
-
-/// The stored black density anchor tick.
-fn black_ticks(black: f32) -> i16 {
-    quantize_ticks(black, TONE_TICKS_PER_UNIT, BLACK_TICK_MIN, BLACK_TICK_MAX)
-}
-
-/// The black density anchor a stored tick decodes to.
-fn black_density(ticks: i16) -> f32 {
-    step_value(ticks, TONE_TICKS_PER_UNIT)
-}
-
-/// The stored white density anchor tick.
-fn white_ticks(white: f32) -> i16 {
-    quantize_ticks(white, TONE_TICKS_PER_UNIT, WHITE_TICK_MIN, WHITE_TICK_MAX)
-}
-
-/// The white density anchor a stored tick decodes to.
-fn white_density(ticks: i16) -> f32 {
-    step_value(ticks, TONE_TICKS_PER_UNIT)
-}
-
-/// The stored midtone pivot offset tick.
-fn pivot_ticks(pivot: f32) -> i16 {
-    quantize_ticks(pivot, TONE_TICKS_PER_UNIT, PIVOT_TICK_MIN, PIVOT_TICK_MAX)
-}
-
-/// The midtone pivot offset a stored tick decodes to.
-fn pivot_offset(ticks: i16) -> f32 {
-    step_value(ticks, TONE_TICKS_PER_UNIT)
-}
-
-/// Serializable per-file edits, stored as exact integer ticks (see
-/// [`EV_TICKS_PER_EV`]) rather than f32.
+/// Serializable per-file edits, stored as the controls' real domain values
+/// (f32) on the [`STORAGE_SCALE`] grid rather than as UI ticks.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EditData {
-    /// Exposure compensation in [`EV_TICK`] ticks (`70` = `+0.70 EV`).
-    #[serde(default = "default_exposure_ticks")]
-    pub exposure_ticks: i16,
-    /// Contrast lift in stop ticks (about the midtone pivot, `+log2`), `0` =
-    /// identity.
-    #[serde(default = "default_contrast_lift_ticks")]
-    pub contrast_lift_ticks: i16,
-    /// Black density anchor in [`BLACK_TICK`] ticks, `0` = identity.
-    #[serde(default = "default_identity_tone_ticks")]
-    pub black_ticks: i16,
-    /// White density anchor in [`TONE_TICK`] ticks ([`DEFAULT_WHITE`] default).
-    #[serde(default = "default_white_ticks")]
-    pub white_ticks: i16,
-    /// Midtone pivot offset in [`TONE_TICK`] ticks, `0` = identity.
-    #[serde(default = "default_identity_tone_ticks")]
-    pub pivot_ticks: i16,
+    /// Exposure compensation in EV (`0.7` = `+0.70 EV`).
+    #[serde(default = "default_exposure_ev", serialize_with = "serialize_grid")]
+    pub exposure_ev: f32,
+    /// Contrast lift in stops about the midtone pivot (`+log2` of the develop
+    /// power), `0.0` = identity.
+    #[serde(default = "default_contrast_lift", serialize_with = "serialize_grid")]
+    pub contrast_lift: f32,
+    /// Black density anchor, `0.0` = identity.
+    #[serde(default = "default_black", serialize_with = "serialize_grid")]
+    pub black: f32,
+    /// White density anchor ([`DEFAULT_WHITE`] default).
+    #[serde(default = "default_white", serialize_with = "serialize_grid")]
+    pub white: f32,
+    /// Midtone pivot offset in window fraction, `0.0` = identity.
+    #[serde(default = "default_pivot_offset", serialize_with = "serialize_grid")]
+    pub pivot_offset: f32,
     /// Source-pixel crop margins removed from each edge. Missing in older
     /// manifests stays the all-zero (no-crop) [`CropMargins::default`].
     ///
@@ -272,49 +192,50 @@ impl Default for EditData {
     /// A fresh, un-edited entry: default exposure, identity tone curve, no crop.
     fn default() -> Self {
         Self {
-            exposure_ticks: DEFAULT_EXPOSURE_TICKS,
-            contrast_lift_ticks: DEFAULT_CONTRAST_LIFT_TICKS,
-            black_ticks: 0,
-            white_ticks: DEFAULT_WHITE_TICKS,
-            pivot_ticks: 0,
+            exposure_ev: DEFAULT_EXPOSURE_EV,
+            contrast_lift: 0.0,
+            black: 0.0,
+            white: DEFAULT_WHITE,
+            pivot_offset: 0.0,
             crop: CropMargins::default(),
             rotation: 0,
         }
     }
 }
 
-/// `#[serde(default)]` target so a legacy manifest entry without the exposure
-/// field loads the current base exposure rather than a raw `0`.
-#[allow(clippy::unnecessary_wraps)]
-fn default_exposure_ticks() -> i16 {
-    DEFAULT_EXPOSURE_TICKS
+/// `#[serde(default)]` target so a manifest entry without the exposure field (or
+/// carrying only a legacy `_ticks` key) loads the current base exposure rather
+/// than a raw `0`.
+fn default_exposure_ev() -> f32 {
+    DEFAULT_EXPOSURE_EV
 }
 
-/// `#[serde(default)]` target so a legacy manifest entry without the contrast
-/// field loads the identity contrast lift.
-#[allow(clippy::unnecessary_wraps)]
-fn default_contrast_lift_ticks() -> i16 {
-    DEFAULT_CONTRAST_LIFT_TICKS
+/// `#[serde(default)]` target for the identity contrast lift.
+fn default_contrast_lift() -> f32 {
+    0.0
 }
 
-/// `#[serde(default)]` target for an identity develop tick (black / pivot).
-#[allow(clippy::unnecessary_wraps)]
-fn default_identity_tone_ticks() -> i16 {
-    0
+/// `#[serde(default)]` target for the identity black density anchor.
+fn default_black() -> f32 {
+    0.0
 }
 
-/// `#[serde(default)]` target so a legacy manifest entry without the white
-/// field loads the default white density anchor.
-#[allow(clippy::unnecessary_wraps)]
-fn default_white_ticks() -> i16 {
-    DEFAULT_WHITE_TICKS
+/// `#[serde(default)]` target so a manifest entry without the white field loads
+/// the default white density anchor.
+fn default_white() -> f32 {
+    DEFAULT_WHITE
+}
+
+/// `#[serde(default)]` target for the identity midtone pivot offset.
+fn default_pivot_offset() -> f32 {
+    0.0
 }
 
 /// A per-file edit aggregated into one value the decode/thumbnail pipelines
 /// can thread through without a tuple or per-field reads.
 ///
-/// This is the runtime `f32` view decoded from the manifest's exact integer
-/// ticks ([`EditData`]): the four develop shape controls plus exposure. The
+/// This is the runtime `f32` view read from [`EditData`]'s stored real values:
+/// the four develop shape controls plus exposure. The
 /// clear-film `base` is roll-level (the designated calibration frame), so
 /// building a [`Develop`] takes it alongside this type via
 /// [`ToneEdit::to_develop`]. All fields are identities at `Default`, so a
@@ -416,11 +337,11 @@ pub enum CropDirection {
 pub struct RollManifest {
     /// Manifest format revision; bumped when the on-disk schema changes.
     ///
-    /// Pre-release, so a tick-grid change is NOT versioned: the integer grids
-    /// above (`*_TICKS_PER_*`) were refined in place — 5× for EV / contrast /
-    /// white / pivot, and Black's a further 5× on a 5× wider range — which
-    /// silently reinterprets every tick count a current build wrote (earlier
-    /// fine work reads back near identity).
+    /// Pre-release, so a storage change is NOT versioned: the fields moved from
+    /// `*_ticks` counts to real values (`exposure_ev`, `contrast_lift`, `black`,
+    /// `white`, `pivot_offset`) in place, and a legacy `*_ticks` key is simply
+    /// unknown and loads its field default (earlier work reads back near
+    /// identity).
     /// The schema has never shipped, so there is nothing to migrate; a released
     /// build must bump this instead.
     pub version: u32,
@@ -434,7 +355,11 @@ pub struct RollManifest {
     /// [`Self::calibration_frame`]. Every frame's density develop anchors on
     /// this same base. Absent falls back to [`crate::film::DEFAULT_FILM_BASE`]
     /// until a calibration frame is measured.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_grid_opt"
+    )]
     pub base: Option<f32>,
     /// The frame name whose measured clear-film plateau pins the roll's base.
     /// Defaults to the roll's first sorted frame; `None` until one is
@@ -525,14 +450,14 @@ impl RollManifest {
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn set_exposure(&mut self, name: &str, exposure_ev: f32) {
-        let ticks = exposure_ticks(exposure_ev);
+        let value = quantize(clamp_to(exposure_ev, exposure_range()));
         if let Some(edit) = self.edits.get_mut(name) {
-            edit.exposure_ticks = ticks;
+            edit.exposure_ev = value;
         } else {
             self.edits.insert(
                 name.to_owned(),
                 EditData {
-                    exposure_ticks: ticks,
+                    exposure_ev: value,
                     ..Default::default()
                 },
             );
@@ -540,38 +465,44 @@ impl RollManifest {
     }
 
     /// Records the develop shape for `name` (contrast, black, white, midtone
-    /// pivot), updating an existing entry in place. Values are quantized to
-    /// [`TONE_TICK`] ([`BLACK_TICK`] for the black anchor); the identities are
-    /// contrast `1.0`, black `0.0`, white [`DEFAULT_WHITE`], pivot `0.0`.
+    /// pivot), updating an existing entry in place. The contrast power is
+    /// converted to its stored stop-lift (`+log2`), then every value is clamped
+    /// to its control range and quantized onto the [`STORAGE_SCALE`] grid; the identities
+    /// are contrast `1.0`, black `0.0`, white [`DEFAULT_WHITE`], pivot `0.0`.
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn set_develop(&mut self, name: &str, tone: ToneEdit) {
-        let contrast = contrast_lift_ticks(tone.contrast);
-        let black = black_ticks(tone.black);
-        let white = white_ticks(tone.white);
-        let pivot = pivot_ticks(tone.pivot_offset);
+        let contrast_lift = quantize(clamp_to(tone.contrast, contrast_power_range()).log2());
+        let black = quantize(clamp_to(tone.black, black_range()));
+        let white = quantize(clamp_to(tone.white, white_range()));
+        let pivot_offset = quantize(clamp_to(tone.pivot_offset, pivot_range()));
         if let Some(edit) = self.edits.get_mut(name) {
-            edit.contrast_lift_ticks = contrast;
-            edit.black_ticks = black;
-            edit.white_ticks = white;
-            edit.pivot_ticks = pivot;
+            edit.contrast_lift = contrast_lift;
+            edit.black = black;
+            edit.white = white;
+            edit.pivot_offset = pivot_offset;
         } else {
             self.edits.insert(
                 name.to_owned(),
                 EditData {
-                    contrast_lift_ticks: contrast,
-                    black_ticks: black,
-                    white_ticks: white,
-                    pivot_ticks: pivot,
+                    contrast_lift,
+                    black,
+                    white,
+                    pivot_offset,
                     ..EditData::default()
                 },
             );
         }
     }
 
-    /// The full edit for `name` as a single [`ToneEdit`], merging exposure and
-    /// the develop shape (decoded from their stored ticks). Files (or manifest
-    /// fields) never touched fall back to their identities.
+    /// The full edit for `name` as a single [`ToneEdit`], reading the stored
+    /// real values (with the stored contrast lift converted back to a power).
+    /// Files (or manifest fields) never touched fall back to their identities.
+    ///
+    /// Each value is clamped to its current control range in RAM only — nothing
+    /// is written back. A stored value left out of range by a narrowed control
+    /// therefore reads as its clamped bound, and the untouched value on disk is
+    /// preserved until the next edit write (so widening the control restores it).
     ///
     /// The crop margins are intentionally NOT part of this aggregate: it is
     /// the copy/paste payload, and a crop must never be copied/pasted.
@@ -580,11 +511,11 @@ impl RollManifest {
         self.edits
             .get(name)
             .map_or_else(ToneEdit::identity, |edit| ToneEdit {
-                exposure_ev: exposure_ev(edit.exposure_ticks),
-                contrast: contrast_power(edit.contrast_lift_ticks),
-                black: black_density(edit.black_ticks),
-                white: white_density(edit.white_ticks),
-                pivot_offset: pivot_offset(edit.pivot_ticks),
+                exposure_ev: clamp_to(edit.exposure_ev, exposure_range()),
+                contrast: clamp_to(edit.contrast_lift, contrast_lift_range()).exp2(),
+                black: clamp_to(edit.black, black_range()),
+                white: clamp_to(edit.white, white_range()),
+                pivot_offset: clamp_to(edit.pivot_offset, pivot_range()),
             })
     }
 
@@ -593,8 +524,8 @@ impl RollManifest {
     ///
     /// A paste never touches the target's crop or rotation: the crop margins
     /// and the user rotation survive [`Self::set_tone`] unchanged (or stay
-    /// default on a fresh file). Values are quantized to [`TONE_TICK`]
-    /// ([`BLACK_TICK`] for the black anchor).
+    /// default on a fresh file). Values are clamped to their control ranges and
+    /// quantized onto the [`STORAGE_SCALE`] grid.
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn set_tone(&mut self, name: &str, tone: ToneEdit) {
@@ -606,11 +537,11 @@ impl RollManifest {
         self.edits.insert(
             name.to_owned(),
             EditData {
-                exposure_ticks: exposure_ticks(tone.exposure_ev),
-                contrast_lift_ticks: contrast_lift_ticks(tone.contrast),
-                black_ticks: black_ticks(tone.black),
-                white_ticks: white_ticks(tone.white),
-                pivot_ticks: pivot_ticks(tone.pivot_offset),
+                exposure_ev: quantize(clamp_to(tone.exposure_ev, exposure_range())),
+                contrast_lift: quantize(clamp_to(tone.contrast, contrast_power_range()).log2()),
+                black: quantize(clamp_to(tone.black, black_range())),
+                white: quantize(clamp_to(tone.white, white_range())),
+                pivot_offset: quantize(clamp_to(tone.pivot_offset, pivot_range())),
                 crop: existing,
                 rotation,
             },
@@ -772,7 +703,7 @@ impl RollManifest {
     ///
     /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
     pub fn set_calibrated_base(&mut self, base: f32) {
-        self.base = Some(base);
+        self.base = Some(quantize(base));
     }
 
     /// Clears the calibration reference: both the designated frame and its
@@ -867,11 +798,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// A Contrast power on the stored lift-tick grid (mid-pivoted, `+log2`).
-    fn cpow(tick: i16) -> f32 {
-        contrast_power(tick)
-    }
-
     /// A unique scratch directory under the OS temp dir, caller-created and
     /// caller-cleaned.
     fn temp_dir(label: &str) -> PathBuf {
@@ -935,7 +861,7 @@ mod tests {
             "IMG_0001.DNG",
             ToneEdit {
                 exposure_ev: 0.40,
-                contrast: cpow(-4),
+                contrast: 0.5,
                 black: -0.2,
                 white: 3.0,
                 pivot_offset: 0.15,
@@ -949,15 +875,14 @@ mod tests {
 
         assert_eq!(loaded, manifest);
         assert_eq!(loaded.name(), Some("My Roll"));
-        // Decoding is exact: a tick divides by an exact integer tick count, so
-        // these equal the requested values bit for bit.
-        assert_eq!(loaded.tone("IMG_0001.DNG").exposure_ev, 0.40);
-        assert_eq!(loaded.tone("IMG_0002.RAW").exposure_ev, -0.75);
+        // The stored real values round-trip exactly through the storage grid.
+        assert_eq!(loaded.tone("IMG_0001.DNG").exposure_ev, quantize(0.40));
+        assert_eq!(loaded.tone("IMG_0002.RAW").exposure_ev, quantize(-0.75));
         let tone = loaded.tone("IMG_0001.DNG");
-        assert_eq!(tone.contrast, cpow(-4));
-        assert_eq!(tone.black, black_density(black_ticks(-0.2)));
-        assert_eq!(tone.white, white_density(white_ticks(3.0)));
-        assert_eq!(tone.pivot_offset, pivot_offset(pivot_ticks(0.15)));
+        assert_eq!(tone.contrast, 0.5);
+        assert_eq!(tone.black, quantize(-0.2));
+        assert_eq!(tone.white, quantize(3.0));
+        assert_eq!(tone.pivot_offset, quantize(0.15));
         assert_eq!(loaded.rotation("IMG_0001.DNG"), 1);
         // The second image carried only an exposure edit → shape identity.
         assert_eq!(
@@ -970,8 +895,8 @@ mod tests {
     }
 
     #[test]
-    fn manifest_stores_integer_ticks() {
-        let dir = temp_dir("ticks");
+    fn manifest_stores_real_values() {
+        let dir = temp_dir("real");
         std::fs::create_dir_all(&dir).unwrap();
         let mut manifest = RollManifest::default();
         manifest.set_exposure("a.DNG", 0.4);
@@ -979,7 +904,7 @@ mod tests {
             "a.DNG",
             ToneEdit {
                 exposure_ev: 0.4,
-                contrast: (8.0_f32).powf(1.0 / 3.0),
+                contrast: 2.0,
                 black: 0.25,
                 white: 2.0,
                 pivot_offset: -0.1,
@@ -989,95 +914,96 @@ mod tests {
         let text = std::fs::read_to_string(manifest_path(&dir)).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert!(text.contains("exposure_ticks = 40"), "{text}");
-        assert!(text.contains("contrast_lift_ticks ="), "{text}");
-        assert!(text.contains("black_ticks = 25"), "{text}");
-        assert!(text.contains("white_ticks = 200"), "{text}");
-        assert!(text.contains("pivot_ticks = -10"), "{text}");
+        // Stored as the clean real control values, not tick counts. The
+        // newline-terminated match is deliberate: a prefix match would also
+        // accept the full-precision form (`0.4000000059604645`).
+        assert!(text.contains("exposure_ev = 0.4\n"), "{text}");
+        assert!(text.contains("contrast_lift = 1.0\n"), "{text}");
+        assert!(text.contains("black = 0.25\n"), "{text}");
+        assert!(text.contains("white = 2.0\n"), "{text}");
+        assert!(text.contains("pivot_offset = -0.1\n"), "{text}");
+        assert!(!text.contains("_ticks"), "legacy tick keys leaked: {text}");
     }
 
     #[test]
-    fn coarse_and_fine_steps_are_whole_numbers_of_stored_ticks() {
-        // The control ladder rests on this: both rungs are integer tick counts,
-        // so a bare drag / bare key can never land between ticks and the Shift
-        // rung stays a pure refinement of the coarse one. Exact integer
-        // arithmetic — no epsilon, because both sides are integers.
-        for (coarse, fine, ticks_per_unit, min, max) in [
-            (
-                EV_STEP,
-                EV_TICK,
-                EV_TICKS_PER_EV,
-                EXPOSURE_TICK_MIN,
-                EXPOSURE_TICK_MAX,
-            ),
-            (
-                TONE_STEP,
-                TONE_TICK,
-                TONE_TICKS_PER_UNIT,
-                CONTRAST_TICK_MIN,
-                CONTRAST_TICK_MAX,
-            ),
-            (
-                TONE_STEP,
-                TONE_TICK,
-                TONE_TICKS_PER_UNIT,
-                BLACK_TICK_MIN,
-                BLACK_TICK_MAX,
-            ),
+    fn f32_values_serialize_as_clean_decimals() {
+        // `toml` widens f32 to f64, so without rounding a stored value would
+        // leak its full binary form; these are the exact strings that bug
+        // produced for the defaults and a calibration base.
+        let dir = temp_dir("decimals");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = RollManifest::default();
+        // A fresh entry carrying the field defaults (white = 2.4).
+        manifest
+            .edits
+            .insert("a.DNG".to_owned(), EditData::default());
+        manifest.set_calibrated_base(0.71);
+        save_roll_manifest(&dir, &manifest).unwrap();
+        let text = std::fs::read_to_string(manifest_path(&dir)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(text.contains("exposure_ev = 0.7\n"), "{text}");
+        assert!(text.contains("contrast_lift = 0.0\n"), "{text}");
+        assert!(text.contains("black = 0.0\n"), "{text}");
+        assert!(text.contains("white = 2.4\n"), "{text}");
+        assert!(text.contains("pivot_offset = 0.0\n"), "{text}");
+        assert!(text.contains("base = 0.71\n"), "{text}");
+        for widened in [
+            "2.4000000953674316",
+            "0.699999988079071",
+            "0.7099999785423279",
         ] {
-            assert_eq!(
-                quantize_ticks(coarse, ticks_per_unit, min, max),
-                COARSE_TICKS
-            );
-            assert_eq!(quantize_ticks(fine, ticks_per_unit, min, max), FINE_TICKS);
+            assert!(!text.contains(widened), "leaked full precision: {text}");
         }
     }
 
     #[test]
-    fn control_ranges_are_on_lattice_and_match_their_bounds() {
-        // (b): the widget range is derived from the stored tick bounds, so its
-        // end points are always whole ticks — the slider can never hand an edit
-        // a value the manifest would have to round.
-        for (range, ticks_per_unit, min, max) in [
-            (
-                exposure_range(),
-                EV_TICKS_PER_EV,
-                EXPOSURE_TICK_MIN,
-                EXPOSURE_TICK_MAX,
-            ),
-            (
-                contrast_lift_range(),
-                TONE_TICKS_PER_UNIT,
-                CONTRAST_TICK_MIN,
-                CONTRAST_TICK_MAX,
-            ),
-            (
-                black_range(),
-                TONE_TICKS_PER_UNIT,
-                BLACK_TICK_MIN,
-                BLACK_TICK_MAX,
-            ),
-            (
-                white_range(),
-                TONE_TICKS_PER_UNIT,
-                WHITE_TICK_MIN,
-                WHITE_TICK_MAX,
-            ),
-            (
-                pivot_range(),
-                TONE_TICKS_PER_UNIT,
-                PIVOT_TICK_MIN,
-                PIVOT_TICK_MAX,
-            ),
-        ] {
-            assert_eq!(
-                quantize_ticks(*range.start(), ticks_per_unit, min, max),
-                min
+    fn steps_are_whole_multiples_of_the_storage_grid() {
+        // The control ladder rests on this: every UI step lands exactly on the
+        // storage grid, so a drag or key can never persist a value that the
+        // manifest would round (a fine step is never lost). Coarse is a whole
+        // number of fine steps, so the Shift rung is a pure refinement of the
+        // coarse one.
+        for (coarse, fine) in [(EV_STEP, EV_TICK), (TONE_STEP, TONE_TICK)] {
+            for step in [coarse, fine] {
+                let grid = step * STORAGE_SCALE;
+                assert!(
+                    (grid - grid.round()).abs() < 1e-3,
+                    "step {step} is not a whole number of storage-grid units"
+                );
+            }
+            let rungs = coarse / fine;
+            assert!(
+                (rungs - rungs.round()).abs() < 1e-6 && rungs >= 1.0,
+                "coarse step {coarse} is not a whole number of fine steps {fine}"
             );
-            assert_eq!(quantize_ticks(*range.end(), ticks_per_unit, min, max), max);
+        }
+    }
+
+    #[test]
+    fn control_ranges_match_their_bounds_and_the_storage_grid() {
+        // Each slider's range is exactly the control's real domain, and its end
+        // points sit on the storage grid, so the slider can never hand an edit a
+        // value the manifest would have to round.
+        for (range, min, max) in [
+            (exposure_range(), EXPOSURE_EV_MIN, EXPOSURE_EV_MAX),
+            (contrast_lift_range(), CONTRAST_LIFT_MIN, CONTRAST_LIFT_MAX),
+            (black_range(), BLACK_MIN, BLACK_MAX),
+            (white_range(), WHITE_MIN, WHITE_MAX),
+            (pivot_range(), PIVOT_MIN, PIVOT_MAX),
+        ] {
+            assert_eq!(*range.start(), min);
+            assert_eq!(*range.end(), max);
+            for bound in [min, max] {
+                let grid = bound * STORAGE_SCALE;
+                assert!(
+                    (grid - grid.round()).abs() < 1e-3,
+                    "bound {bound} is off the storage grid"
+                );
+            }
         }
         // The contrast slider shows stops, the develop functions take a power;
-        // both come from one symmetric pair of lift-tick bounds.
+        // both come from one symmetric pair of lift bounds.
         let power = contrast_power_range();
         assert_eq!(*power.start(), 0.125);
         assert_eq!(*power.end(), 8.0);
@@ -1285,8 +1211,9 @@ curve_shadows_ticks = -3
         std::fs::write(manifest_path(&dir), text).unwrap();
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
-        // Unknown key ignored; legacy curve_* keys are ignored and load identity.
-        assert!((loaded.tone("a.DNG").exposure_ev - 1.5).abs() < 1e-6);
+        // Unknown key ignored; the legacy `*_ticks` keys are unknown now and load
+        // the field defaults (no migration), so exposure falls back to 0.7.
+        assert_eq!(loaded.tone("a.DNG").exposure_ev, DEFAULT_EXPOSURE_EV);
         assert!((loaded.tone("a.DNG").contrast - 1.0).abs() < 1e-6);
         assert_eq!(loaded.calibrated_base(), Some(0.66));
     }
@@ -1331,32 +1258,66 @@ curve_shadows_ticks = -3
     }
 
     #[test]
-    fn tick_conversions_round_trip_on_the_grid() {
-        for ev in [-3.0_f32, 0.0, 0.7, 2.0, 4.0] {
-            assert!((exposure_ev(exposure_ticks(ev)) - ev).abs() < 1e-5);
-        }
-        // Coarse multiples (5, 20, 250) and single ticks (-4, -1, 4) alike
-        // round-trip through the lift↔power map.
-        for tick in [-300_i16, -50, -4, 0, 5, 20, 250, 300] {
-            assert_eq!(contrast_lift_ticks(contrast_power(tick)), tick);
-        }
-        for tick in [-200_i16, -20, -1, 0, 1, 20, 180, 200] {
-            assert_eq!(black_ticks(black_density(tick)), tick);
-        }
-        for tick in [50_i16, 120, 240, 475, 500] {
-            assert_eq!(white_ticks(white_density(tick)), tick);
-        }
-        for tick in [-50_i16, -4, -1, 0, 1, 4, 45, 50] {
-            assert_eq!(pivot_ticks(pivot_offset(tick)), tick);
+    fn values_round_trip_through_storage_quantization() {
+        // Values that already sit on the storage grid survive quantize()
+        // unchanged (a clean `0.7` stays `0.7`, never `0.70000005`), and
+        // quantize is idempotent.
+        for value in [
+            -3.0_f32, -0.75, -0.5, -0.2, -0.1, 0.0, 0.1, 0.15, 0.25, 0.4, 0.5, 0.7, 1.0, 2.0, 2.4,
+            3.0, 4.0, 5.0,
+        ] {
+            assert_eq!(quantize(value), value, "quantize({value}) is not fixed");
+            assert_eq!(quantize(quantize(value)), quantize(value));
         }
     }
 
     #[test]
     fn off_grid_values_snap_and_clamp() {
-        assert_eq!(exposure_ticks(100.0), EXPOSURE_TICK_MAX);
-        assert_eq!(exposure_ticks(-100.0), EXPOSURE_TICK_MIN);
-        assert_eq!(black_ticks(100.0), BLACK_TICK_MAX);
-        assert_eq!(white_ticks(0.0), WHITE_TICK_MIN);
-        assert_eq!(pivot_ticks(100.0), PIVOT_TICK_MAX);
+        // Off-grid values round to the nearest storage-grid step.
+        assert_eq!(quantize(0.4004), 0.4);
+        assert_eq!(quantize(-0.4004), -0.4);
+
+        // A write clamps into the control range (the develop contrast is first
+        // converted to its stop lift).
+        let mut manifest = RollManifest::default();
+        manifest.set_exposure("a.DNG", 100.0);
+        assert_eq!(manifest.edits["a.DNG"].exposure_ev, EXPOSURE_EV_MAX);
+        manifest.set_exposure("b.DNG", -100.0);
+        assert_eq!(manifest.edits["b.DNG"].exposure_ev, EXPOSURE_EV_MIN);
+        manifest.set_develop(
+            "c.DNG",
+            ToneEdit {
+                black: 100.0,
+                white: 0.0,
+                ..ToneEdit::identity()
+            },
+        );
+        assert_eq!(manifest.edits["c.DNG"].black, BLACK_MAX);
+        assert_eq!(manifest.edits["c.DNG"].white, WHITE_MIN);
+
+        // A non-positive contrast power is clamped before the log, so it can
+        // never store NaN/-inf (power 0 clamps to 0.125 -> -3 stops).
+        for power in [0.0_f32, -1.0] {
+            manifest.set_develop(
+                "e.DNG",
+                ToneEdit {
+                    contrast: power,
+                    ..ToneEdit::identity()
+                },
+            );
+            assert_eq!(manifest.edits["e.DNG"].contrast_lift, CONTRAST_LIFT_MIN);
+        }
+
+        // Reading clamps to the current range in RAM without touching the stored
+        // value, so widening the control later restores it.
+        manifest.edits.insert(
+            "d.DNG".to_owned(),
+            EditData {
+                exposure_ev: 4.5,
+                ..EditData::default()
+            },
+        );
+        assert_eq!(manifest.tone("d.DNG").exposure_ev, EXPOSURE_EV_MAX);
+        assert_eq!(manifest.edits["d.DNG"].exposure_ev, 4.5);
     }
 }

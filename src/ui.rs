@@ -228,12 +228,13 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
 
     let label = widget::text(fl!("exposure-label"));
     // Every slider below runs on the same two rungs: a coarse bare drag of
-    // `*_STEP` and, while Shift is held, a fine one-tick drag of `*_TICK` —
-    // which is exactly the manifest's storage tick, so a fine drag is stored
-    // without rounding and cannot jump back on release.
+    // `*_STEP` and, while Shift is held, a fine drag of `*_TICK` — a whole
+    // multiple of the manifest's storage grid, so a step is stored without
+    // rounding and cannot jump back on release.
     //
-    // The ranges are `edit_manifest`'s, derived from the stored tick bounds, so a
-    // slider can only ever hand an edit a value the manifest stores exactly.
+    // The ranges are `edit_manifest`'s, and their end points sit on the storage
+    // grid, so a slider can only ever hand an edit a value the manifest stores
+    // exactly.
     let slider = widget::slider(
         edit_manifest::exposure_range(),
         app.tone.exposure_ev,

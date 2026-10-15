@@ -126,13 +126,16 @@ same performance class as what already ships. **Decision: no tone LUT** — eval
 - **`pipeline.rs`** drops `unsharp_mask`/`blur_121`/`UNSHARP_AMOUNT`, the pivot
   machinery, and the two-path `render_tail`; `bake_develop` is the one CPU tail.
   `decode_raw_detail` returns only the true sensor-linear mono + geometry.
-- **`edit_manifest.rs`** stores `{exposure_ticks, contrast_lift_ticks, black_ticks,
-  white_ticks, pivot_ticks}` (schema v1, legacy keys re-edited, no migration) plus
-  the roll-level `base` + `calibration_frame`. Black uses a dedicated half-density
-  quantum `BLACK_TICK = 0.005` (half of `TONE_STEP`): the black anchor shifts the
-  develop numerator additively, so its per-tick effect is ~2× the other density
-  anchors; the finer grid gives Black a feel comparable to White and matches the
-  black slider/keyboard steps.
+- **`edit_manifest.rs`** stores the five edit scalars as their real control
+  values — `{exposure_ev, contrast_lift, black, white, pivot_offset}` (schema v1,
+  legacy `*_ticks` keys ignored, no migration) on a `1/1000` storage grid
+  (`STORAGE_SCALE`) — plus the roll-level `base` + `calibration_frame`. The
+  manifest no longer stores tick counts: the slider ranges and steps
+  (`edit_manifest::{*_range, EV_STEP/EV_TICK, TONE_STEP/TONE_TICK}`) are UI
+  concerns, free to retune without reinterpreting a stored value, and
+  `contrast_lift` is the develop contrast's `log2(power)`. Values are written to
+  3 decimals (a `serialize_with` rounding helper, since `toml` widens an `f32` to
+  `f64` and would otherwise print `2.4000000953674316`).
 - **UI**: the editing panel is Exposure / Contrast / Black / White / Midtone;
   the roll-info drawer's film-preset and base-mode dropdowns are gone. A roll's
   calibration frame defaults to its first frame and is measured on roll open;
