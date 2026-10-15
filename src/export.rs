@@ -178,18 +178,6 @@ pub(crate) fn export_overwrite_choice() -> cosmic::dialog::file_chooser::Choice 
     cosmic::dialog::file_chooser::Choice::boolean("overwrite", &fl!("export-overwrite"), false)
 }
 
-/// Whether `name` looks like an output of this app's exporter (JPEG or PNG)
-/// rather than a source negative. Negatives are RAW files (none of them use
-/// these extensions), while exporting a roll into its own folder would
-/// otherwise make every shipped file show back up as a fake frame — and,
-/// without this, even become the roll's cover, which no scan ever searches
-/// this directory for.
-#[must_use]
-pub(crate) fn is_export_artifact(name: &str) -> bool {
-    name.rsplit_once('.')
-        .is_some_and(|(_, ext)| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png"))
-}
-
 /// The exported file name for a frame: the source file name with its extension
 /// replaced by the format's (e.g. `img_0001.cr2` → `img_0001.jpg` or
 /// `img_0001.png`). A file name with no extension simply gains the extension; a
@@ -730,19 +718,6 @@ mod tests {
         assert_eq!(web.ppi, 72);
         // Overwriting is off by default (the dialog checkbox defaults to "no").
         assert!(!cloud.overwrite && !master.overwrite && !web.overwrite);
-    }
-
-    #[test]
-    fn export_artifacts_are_identified_by_extension() {
-        // Outputs of this app's exporter must never be mistaken for negatives.
-        assert!(is_export_artifact("img_0001.jpg"));
-        assert!(is_export_artifact("IMG_0002.JPEG"));
-        assert!(is_export_artifact("scan.png"));
-        assert!(!is_export_artifact("img_0001.cr2"));
-        assert!(!is_export_artifact("IMG_0002.nef"));
-        assert!(!is_export_artifact("scan.dng"));
-        assert!(!is_export_artifact(".hidden"));
-        assert!(!is_export_artifact("no_extension"));
     }
 
     #[test]

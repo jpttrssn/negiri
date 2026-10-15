@@ -5,7 +5,7 @@ use crate::edit_manifest::{self, RollManifest};
 use crate::error::FrameError;
 use crate::export::{
     ExportOptions, export_format_choice, export_fraction, export_frames, export_overwrite_choice,
-    is_export_artifact, options_for_choice,
+    options_for_choice,
 };
 use crate::film::{MIN_PLAUSIBLE_BASE, measure_base};
 use crate::fl;
@@ -15,7 +15,7 @@ use crate::library::{
 };
 use crate::pipeline::{
     DetailDecode, ThumbMono, bake_thumbnail, convert_thumbnail, decode_raw_detail,
-    downsample_thumbnail_mono, histogram_from_develop, resized_dims,
+    downsample_thumbnail_mono, histogram_from_develop, is_supported_raw, resized_dims,
 };
 use crate::shader;
 use crate::ui::{
@@ -562,9 +562,9 @@ pub(crate) struct Roll {
     /// Display name: the manifest's human-readable label when set, otherwise
     /// the directory's final component.
     pub name: String,
-    /// The roll's cover file name (first sorted non-dot file), if any.
+    /// The roll's cover file name (first sorted RAW file), if any.
     pub cover: Option<String>,
-    /// Number of regular non-dot files in the roll directory, surfaced in the
+    /// Number of RAW frame files in the roll directory, surfaced in the
     /// roll-info metadata drawer.
     pub frame_count: usize,
     /// The roll's start date (ISO `YYYY-MM-DD`), if already set. Mirrors the
@@ -4564,8 +4564,8 @@ fn resolve_under(root: &Path, rel: &str) -> Option<PathBuf> {
 }
 
 /// Loads one roll's metadata: display name (manifest label, falling back to
-/// the directory leaf), cover file (first sorted non-dot file), the count of
-/// frame files, and the recorded dates — with nothing decoded yet.
+/// the directory leaf), cover file (first sorted RAW file), the count of RAW
+/// frames, and the recorded dates — with nothing decoded yet.
 async fn load_roll(dir: PathBuf) -> Roll {
     let leaf = dir_leaf(&dir);
     let files = scan_frame_files(&dir).await;
@@ -4609,11 +4609,12 @@ async fn load_rolls(rolls: Vec<PathBuf>) -> Vec<Roll> {
     loaded
 }
 
-/// Scans a roll directory for its frame files: regular non-dot files minus
-/// export artifacts (JPEG/PNG), sorted by name. Dotfiles (including the edit
-/// manifest and its temp) are never frames. A missing or unreadable directory
-/// yields an empty list. One pass serves both the library load (cover thumbnail
-/// + frame count) and the open roll's tile list.
+/// Scans a roll directory for its frame files: regular non-dot files carrying a
+/// rawloader-decodable RAW extension ([`is_supported_raw`]), sorted by name.
+/// Dotfiles (including the edit manifest and its temp) and non-RAW files
+/// (exports, sidecars, scans) are never frames. A missing or unreadable
+/// directory yields an empty list. One pass serves both the library load (cover
+/// thumbnail + frame count) and the open roll's tile list.
 async fn scan_frame_files(dir: &Path) -> Vec<String> {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return Vec::new();
@@ -4624,7 +4625,7 @@ async fn scan_frame_files(dir: &Path) -> Vec<String> {
         if entry.file_type().await.is_ok_and(|ty| ty.is_file())
             && let Some(name) = entry.file_name().into_string().ok()
             && !name.starts_with('.')
-            && !is_export_artifact(&name)
+            && is_supported_raw(&name)
         {
             files.push(name);
         }

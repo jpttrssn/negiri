@@ -14,6 +14,29 @@ use cosmic::widget::image::Handle;
 use crate::edit_manifest::CropMargins;
 use crate::error::FrameError;
 use crate::film::{self, Develop, MIN_PLAUSIBLE_BASE, measure_base};
+
+/// File extensions rawloader decodes, lowercased.
+///
+/// Mirrors rawloader's decoder set (MRW, ARW/SRF/SR2, MEF, ORF, SRW, ERF,
+/// KDC/DCS/DCR, RW2, RAF, DNG, PEF, CRW/CR2, IIQ, MOS, 3FR, NEF/NRW, ARI, X3F).
+/// rawloader actually dispatches on file *content* (magic bytes), not the
+/// extension, and exposes no cheap probe — [`rawloader::decode_file`] decodes
+/// the whole image — so the extension is the scan-time proxy for "is this a
+/// RAW". A RAW saved under another extension is missed; a non-RAW carrying one
+/// still lists and then shows the decode-failure icon.
+const RAW_EXTENSIONS: &[&str] = &[
+    "3fr", "ari", "arw", "cr2", "crw", "dcr", "dcs", "dng", "erf", "iiq", "kdc", "mef", "mos",
+    "mrw", "nef", "nrw", "orf", "pef", "raf", "rw2", "sr2", "srf", "srw", "x3f",
+];
+
+/// Whether `name` looks like a RAW file rawloader can decode, by extension
+/// (case-insensitive). See [`RAW_EXTENSIONS`] for why this is extension-based.
+#[must_use]
+pub(crate) fn is_supported_raw(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, ext)| RAW_EXTENSIONS.iter().any(|raw| ext.eq_ignore_ascii_case(raw)))
+}
+
 fn normalize_samples(image: &rawloader::RawImage) -> Vec<f32> {
     let width = usize::max(image.width, 1);
 
@@ -1177,6 +1200,36 @@ mod tests {
             .enumerate()
             .map(|(i, c)| i as f32 * c)
             .sum::<f32>()
+    }
+
+    #[test]
+    fn raw_extensions_are_recognized_case_insensitively() {
+        for name in [
+            "IMG_0001.CR2",
+            "a.cr2",
+            "b.DNG",
+            "c.nef",
+            "d.ARW",
+            "e.raf",
+            "f.orf",
+            "hero.3FR",
+        ] {
+            assert!(is_supported_raw(name), "{name} should be a RAW");
+        }
+        for name in [
+            "img_0001.jpg",
+            "IMG_0002.JPEG",
+            "scan.png",
+            "scan.tif",
+            "scan.tiff",
+            "notes.txt",
+            "no_extension",
+            ".hidden",
+            "trailing.",
+            "portfolio",
+        ] {
+            assert!(!is_supported_raw(name), "{name} should not be a RAW");
+        }
     }
 
     #[test]
