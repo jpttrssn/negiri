@@ -276,8 +276,8 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
             app.tone.pivot_offset,
         )
     })
-    .step(edit_manifest::BLACK_STEP)
-    .shift_step(edit_manifest::BLACK_TICK)
+    .step(edit_manifest::TONE_STEP)
+    .shift_step(edit_manifest::TONE_TICK)
     .on_release(Message::EditSave);
     let white_label = widget::text(fl!("white-label"));
     // The White slider runs on an INVERTED axis (right = brighter): the develop's

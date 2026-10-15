@@ -113,9 +113,8 @@ const DETAIL_PRELOAD_DISTANCE: usize = 1;
 /// Coarse drag steps one bare edit key advances, per control. Integers, so a
 /// bare key always lands on the storage lattice and can never desynchronize from
 /// the bare drag it is derived from (pinned by `bare_key_steps_are_whole_coarse_steps`).
-const KEY_COARSE_STEPS_EV: i16 = 5;
-const KEY_COARSE_STEPS_TONE: i16 = 4;
-const KEY_COARSE_STEPS_BLACK: i16 = 4;
+const KEY_COARSE_STEPS_EV: i16 = 1;
+const KEY_COARSE_STEPS_TONE: i16 = 1;
 
 /// Keyboard shortcut step for exposure (EV) with a bare key: `0.25 EV`.
 const EDIT_STEP_EV: f32 = edit_manifest::EV_STEP * KEY_COARSE_STEPS_EV as f32;
@@ -123,18 +122,12 @@ const EDIT_STEP_EV: f32 = edit_manifest::EV_STEP * KEY_COARSE_STEPS_EV as f32;
 /// stored tick, the same fine grid a Shift-held slider drag uses, so both land
 /// on the manifest's storage lattice.
 const EDIT_NUDGE_EV: f32 = edit_manifest::EV_TICK;
-/// Keyboard shortcut step for a develop control's lift (contrast, white,
+/// Keyboard shortcut step for a develop control's lift (contrast, black, white,
 /// midtone pivot) with a bare key, in that control's own domain: `0.20`.
 const EDIT_STEP_CURVE: f32 = edit_manifest::TONE_STEP * KEY_COARSE_STEPS_TONE as f32;
 /// Keyboard shortcut nudge step for a develop control with the Shift modifier:
 /// one stored tick, matching the Shift-held slider drag.
 const EDIT_NUDGE_CURVE: f32 = edit_manifest::TONE_TICK;
-/// Keyboard shortcut step for the Black density anchor with a bare key: `0.10`,
-/// half of `EDIT_STEP_CURVE` — see [`edit_manifest::BLACK_TICKS_PER_UNIT`].
-const EDIT_STEP_BLACK: f32 = edit_manifest::BLACK_STEP * KEY_COARSE_STEPS_BLACK as f32;
-/// Keyboard shortcut nudge step for the Black density anchor with Shift: one
-/// stored tick, matching the Shift-held slider drag.
-const EDIT_NUDGE_BLACK: f32 = edit_manifest::BLACK_TICK;
 /// Keyboard shortcut step for a crop-window move: a bare move key (`h`/`j`/`k`/`l`
 /// or an arrow) translates the crop window by this many source pixels.
 const CROP_STEP_PX: i32 = 5;
@@ -5104,18 +5097,13 @@ fn edit_adjust_for(key: &str, _alt: bool, shift: bool) -> Option<EditAdjust> {
     } else {
         EDIT_STEP_CURVE
     };
-    let black = if shift {
-        EDIT_NUDGE_BLACK
-    } else {
-        EDIT_STEP_BLACK
-    };
     match key {
         "-" => Some(EditAdjust::Exposure(-ev)),
         "=" => Some(EditAdjust::Exposure(ev)),
         "[" => Some(EditAdjust::Contrast(-curve)),
         "]" => Some(EditAdjust::Contrast(curve)),
-        ";" => Some(EditAdjust::Black(-black)),
-        "'" => Some(EditAdjust::Black(black)),
+        ";" => Some(EditAdjust::Black(-curve)),
+        "'" => Some(EditAdjust::Black(curve)),
         "," => Some(EditAdjust::White(-curve)),
         "." => Some(EditAdjust::White(curve)),
         "u" => Some(EditAdjust::Pivot(-curve)),
@@ -6313,8 +6301,8 @@ mod tests {
         assert_eq!(clamp_ev(99.0), 4.0);
         assert_eq!(clamp_contrast_power(0.0), 0.125);
         assert_eq!(clamp_contrast_power(99.0), 8.0);
-        assert_eq!(clamp_black(-99.0), -1.0);
-        assert_eq!(clamp_black(99.0), 1.0);
+        assert_eq!(clamp_black(-99.0), -2.0);
+        assert_eq!(clamp_black(99.0), 2.0);
         assert_eq!(clamp_white(-99.0), 0.5);
         assert_eq!(clamp_white(99.0), 5.0);
         assert_eq!(clamp_pivot(-9.0), -0.5);
@@ -6331,7 +6319,6 @@ mod tests {
         for (key_step, coarse_step) in [
             (EDIT_STEP_EV, edit_manifest::EV_STEP),
             (EDIT_STEP_CURVE, edit_manifest::TONE_STEP),
-            (EDIT_STEP_BLACK, edit_manifest::BLACK_STEP),
         ] {
             let steps = key_step / coarse_step;
             assert!(
@@ -6342,37 +6329,11 @@ mod tests {
         for (nudge, fine) in [
             (EDIT_NUDGE_EV, edit_manifest::EV_TICK),
             (EDIT_NUDGE_CURVE, edit_manifest::TONE_TICK),
-            (EDIT_NUDGE_BLACK, edit_manifest::BLACK_TICK),
         ] {
             assert_eq!(nudge, fine, "the Shift nudge must be one stored tick");
         }
         // The exposure keys move a quarter EV per press (five coarse steps).
-        assert_eq!(EDIT_STEP_EV, 0.25);
-    }
-
-    #[test]
-    fn black_tick_matches_the_white_tick_feel() {
-        // In the normalized window `x = (density - black)/(white - black)`, the
-        // black anchor shifts the numerator additively (Δx = Δblack/span) while
-        // the white anchor only changes the denominator
-        // (Δx = density·Δwhite/span²). Black's grid is twice as fine (200 ticks
-        // per density vs 100), so at the default anchors a black tick lands
-        // within a few percent of a white tick at mid density.
-        let span = edit_manifest::DEFAULT_WHITE - edit_manifest::DEFAULT_BLACK;
-        let one_black_tick = 1.0 / f32::from(edit_manifest::BLACK_TICKS_PER_UNIT);
-        let one_tone_tick = 1.0 / f32::from(edit_manifest::TONE_TICKS_PER_UNIT);
-        let black_dx = one_black_tick / span;
-        let mid_density = span / 2.0;
-        let white_dx = mid_density * one_tone_tick / (span * span);
-        assert!(
-            (black_dx - white_dx).abs() < 5e-4,
-            "black dx {black_dx} vs white dx {white_dx}"
-        );
-        assert!(
-            edit_manifest::BLACK_TICKS_PER_UNIT > edit_manifest::TONE_TICKS_PER_UNIT,
-            "black's grid must be the finer of the two"
-        );
-        assert!(edit_manifest::BLACK_TICK < edit_manifest::TONE_TICK);
+        assert_eq!(EDIT_STEP_EV, 0.05);
     }
 
     #[test]
@@ -6464,23 +6425,21 @@ mod tests {
             edit_adjust_for("]", false, true),
             Some(EditAdjust::Contrast(EDIT_NUDGE_CURVE))
         );
-        // Black pair: `;`/`'` coarse, Shift nudge. Halved from the other curve
-        // steps because the black anchor's per-tick effect is ~2× theirs.
         assert_eq!(
             edit_adjust_for(";", false, false),
-            Some(EditAdjust::Black(-EDIT_STEP_BLACK))
+            Some(EditAdjust::Black(-EDIT_STEP_CURVE))
         );
         assert_eq!(
             edit_adjust_for("'", false, false),
-            Some(EditAdjust::Black(EDIT_STEP_BLACK))
+            Some(EditAdjust::Black(EDIT_STEP_CURVE))
         );
         assert_eq!(
             edit_adjust_for(";", false, true),
-            Some(EditAdjust::Black(-EDIT_NUDGE_BLACK))
+            Some(EditAdjust::Black(-EDIT_NUDGE_CURVE))
         );
         assert_eq!(
             edit_adjust_for("'", false, true),
-            Some(EditAdjust::Black(EDIT_NUDGE_BLACK))
+            Some(EditAdjust::Black(EDIT_NUDGE_CURVE))
         );
         // White pair: `,`/`.` coarse, Shift nudge.
         assert_eq!(

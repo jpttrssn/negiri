@@ -14,8 +14,7 @@ pub const MIN_TRANSMISSION_DEV: f32 = 1e-6;
 pub const DEFAULT_FILM_BASE: f32 = 0.8;
 
 /// Default usable density range above the clear-film base (the positive's white
-/// point) until a frame records its own. The value mirrors the old HP5+
-/// `d_max` used for visual calibration.
+/// point) until a frame records its own.
 pub const DEFAULT_D_MAX: f32 = 2.4;
 
 /// The pointwise develop function for a film negative: a monotone map from a
@@ -205,10 +204,7 @@ mod tests {
             // Compare against the plain normalized density (the reference).
             let density = f32::log10(d.base / t);
             let expected = (density / d.white).clamp(0.0, 1.0);
-            assert!(
-                (out - expected).abs() < 1e-5,
-                "t={t}: {out} vs {expected}"
-            );
+            assert!((out - expected).abs() < 1e-5, "t={t}: {out} vs {expected}");
         }
     }
 
@@ -324,25 +320,31 @@ mod tests {
             contrast: 2.0,
             ..base
         };
-        assert!(more.apply_density(d_dark) < base.apply_density(d_dark), "contrast dark");
-        assert!(more.apply_density(d_bright) > base.apply_density(d_bright), "contrast bright");
+        assert!(
+            more.apply_density(d_dark) < base.apply_density(d_dark),
+            "contrast dark"
+        );
+        assert!(
+            more.apply_density(d_bright) > base.apply_density(d_bright),
+            "contrast bright"
+        );
 
         // White point: moving the white anchor DOWN (toward the data) brightens
         // (the same density now sits closer to white). The UI maps "White right
         // = brighten" onto this.
-        let white_in = Develop {
-            white: 1.8,
-            ..base
-        };
-        assert!(white_in.apply_density(d_mid) > base.apply_density(d_mid), "white");
+        let white_in = Develop { white: 1.8, ..base };
+        assert!(
+            white_in.apply_density(d_mid) > base.apply_density(d_mid),
+            "white"
+        );
 
         // Black point: moving the black anchor UP (toward the data) darkens.
         // The UI maps "Black right = darken/clip darks" onto this.
-        let black_up = Develop {
-            black: 0.4,
-            ..base
-        };
-        assert!(black_up.apply_density(d_mid) < base.apply_density(d_mid), "black");
+        let black_up = Develop { black: 0.4, ..base };
+        assert!(
+            black_up.apply_density(d_mid) < base.apply_density(d_mid),
+            "black"
+        );
 
         // Pivot shifts WHERE the contrast acts: the curve always passes through
         // the pivot point (pivot_density -> pivot_fraction), and moving the
@@ -364,8 +366,16 @@ mod tests {
             );
         }
         // The pivot actually changes the curve shape elsewhere.
-        let low = Develop { contrast, pivot_offset: -0.3, ..base };
-        let high = Develop { contrast, pivot_offset: 0.3, ..base };
+        let low = Develop {
+            contrast,
+            pivot_offset: -0.3,
+            ..base
+        };
+        let high = Develop {
+            contrast,
+            pivot_offset: 0.3,
+            ..base
+        };
         assert!(
             (low.apply_density(d_bright) - high.apply_density(d_bright)).abs() > 1e-3,
             "pivot did not change the curve"

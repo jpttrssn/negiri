@@ -13,11 +13,6 @@ use std::path::{Path, PathBuf};
 pub const ROLL_MANIFEST_FILE: &str = ".film-roll.toml";
 
 /// Exposure applied to an image until an edit records otherwise.
-///
-/// Matches Darktable's default +0.7 EV starting point: with the auto-expose
-/// (`normalize_positive`) removed, EV 0 is true sensor exposure and untouched
-/// frames open at this visible base rather than black. The slider spans
-/// −3..+4 so the user can drag down to honest sensor exposure.
 pub const DEFAULT_EXPOSURE_EV: f32 = 0.7;
 
 /// Contrast power applied until an edit records otherwise (identity `1.0`).
@@ -26,8 +21,7 @@ pub const DEFAULT_CONTRAST: f32 = 1.0;
 /// Black density anchor applied until an edit records otherwise (identity `0`).
 pub const DEFAULT_BLACK: f32 = 0.0;
 
-/// White density anchor applied until an edit records otherwise
-/// ([`film::DEFAULT_D_MAX`]).
+/// White density anchor applied until an edit records otherwise.
 pub const DEFAULT_WHITE: f32 = film::DEFAULT_D_MAX;
 
 /// Midtone pivot offset applied until an edit records otherwise (identity `0`).
@@ -57,16 +51,10 @@ pub const COARSE_TICKS: i16 = 5;
 /// one tick is ~1/100 EV, still ~330 codes of the 16-bit export.
 pub const EV_TICKS_PER_EV: i16 = 100;
 
-/// Stored ticks per unit of the develop controls' own domains — the contrast
-/// lift (stops), the white density anchor (density), and the midtone pivot
-/// (window fraction) all share one grid.
+/// Stored ticks per unit of the develop tone controls' own domains — the contrast
+/// lift (stops), the black desnity anchor (density), the white density anchor (density),
+/// and the midtone pivot (window fraction) all share one grid.
 pub const TONE_TICKS_PER_UNIT: i16 = 100;
-
-/// Stored ticks per unit of the black density anchor: twice [`TONE_TICKS_PER_UNIT`],
-/// because the black anchor shifts the develop numerator additively
-/// (`(density - black)/span`) and is otherwise ~2× stronger per tick than the
-/// white anchor. Its fine step is therefore half of the other develop controls'.
-pub const BLACK_TICKS_PER_UNIT: i16 = 200;
 
 /// Converts a tick count in any control's domain to that domain's value.
 ///
@@ -95,13 +83,6 @@ pub const TONE_TICK: f32 = step_value(FINE_TICKS, TONE_TICKS_PER_UNIT);
 /// The contrast / white / pivot coarse drag step.
 pub const TONE_STEP: f32 = step_value(COARSE_TICKS, TONE_TICKS_PER_UNIT);
 
-/// The black anchor's one-tick (Shift) step.
-pub const BLACK_TICK: f32 = step_value(FINE_TICKS, BLACK_TICKS_PER_UNIT);
-
-/// The black anchor's coarse drag step — half of [`TONE_STEP`]; see
-/// [`BLACK_TICKS_PER_UNIT`] for why its grid is the finer one.
-pub const BLACK_STEP: f32 = step_value(COARSE_TICKS, BLACK_TICKS_PER_UNIT);
-
 /// Stored exposure tick bounds: the control's whole domain, so they are both the
 /// slider's range (see [`exposure_range`]) and the encode clamp.
 const EXPOSURE_TICK_MIN: i16 = -300;
@@ -116,15 +97,15 @@ const BLACK_TICK_MAX: i16 = 200;
 /// Stored white density anchor bounds (`0.5..5.0` density).
 const WHITE_TICK_MIN: i16 = 50;
 const WHITE_TICK_MAX: i16 = 500;
-/// Stored midtone pivot offset bounds (the `−0.5..=0.5` window-fraction range).
+/// Stored midtone pivot offset bounds (the `−1..=1` window-fraction range).
 const PIVOT_TICK_MIN: i16 = -50;
 const PIVOT_TICK_MAX: i16 = 50;
 
-/// `+0.7 EV` default in ticks (`70 / EV_TICKS_PER_EV`).
+/// Default EV in ticks.
 const DEFAULT_EXPOSURE_TICKS: i16 = 70;
-/// Identity contrast lift in ticks (power `1.0` ⇔ `0` stops).
+/// Identity contrast lift in ticks.
 const DEFAULT_CONTRAST_LIFT_TICKS: i16 = 0;
-/// Default white density in ticks ([`DEFAULT_WHITE`] × [`TONE_TICKS_PER_UNIT`]).
+/// Default white density in ticks
 const DEFAULT_WHITE_TICKS: i16 = 240;
 
 /// A control's whole range, derived from its stored tick bounds.
@@ -158,7 +139,7 @@ pub fn contrast_power_range() -> RangeInclusive<f32> {
 
 /// The black anchor slider's range in density (`−1.0..=1.0`).
 pub fn black_range() -> RangeInclusive<f32> {
-    value_range(BLACK_TICK_MIN, BLACK_TICK_MAX, BLACK_TICKS_PER_UNIT)
+    value_range(BLACK_TICK_MIN, BLACK_TICK_MAX, TONE_TICKS_PER_UNIT)
 }
 
 /// The white anchor slider's range in density (`0.5..=5.0`).
@@ -222,12 +203,12 @@ fn contrast_power(ticks: i16) -> f32 {
 
 /// The stored black density anchor tick.
 fn black_ticks(black: f32) -> i16 {
-    quantize_ticks(black, BLACK_TICKS_PER_UNIT, BLACK_TICK_MIN, BLACK_TICK_MAX)
+    quantize_ticks(black, TONE_TICKS_PER_UNIT, BLACK_TICK_MIN, BLACK_TICK_MAX)
 }
 
 /// The black density anchor a stored tick decodes to.
 fn black_density(ticks: i16) -> f32 {
-    step_value(ticks, BLACK_TICKS_PER_UNIT)
+    step_value(ticks, TONE_TICKS_PER_UNIT)
 }
 
 /// The stored white density anchor tick.
@@ -1010,7 +991,7 @@ mod tests {
 
         assert!(text.contains("exposure_ticks = 40"), "{text}");
         assert!(text.contains("contrast_lift_ticks ="), "{text}");
-        assert!(text.contains("black_ticks = 50"), "{text}");
+        assert!(text.contains("black_ticks = 25"), "{text}");
         assert!(text.contains("white_ticks = 200"), "{text}");
         assert!(text.contains("pivot_ticks = -10"), "{text}");
     }
@@ -1037,9 +1018,9 @@ mod tests {
                 CONTRAST_TICK_MAX,
             ),
             (
-                BLACK_STEP,
-                BLACK_TICK,
-                BLACK_TICKS_PER_UNIT,
+                TONE_STEP,
+                TONE_TICK,
+                TONE_TICKS_PER_UNIT,
                 BLACK_TICK_MIN,
                 BLACK_TICK_MAX,
             ),
@@ -1072,7 +1053,7 @@ mod tests {
             ),
             (
                 black_range(),
-                BLACK_TICKS_PER_UNIT,
+                TONE_TICKS_PER_UNIT,
                 BLACK_TICK_MIN,
                 BLACK_TICK_MAX,
             ),
@@ -1248,7 +1229,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(loaded.meta(), manifest.meta());
         assert_eq!(loaded.meta().film.as_deref(), Some("Kodak Tri-X 400"));
-        assert_eq!(loaded.meta().developer_notes.as_deref(), Some("HC-110 dil B, 6:30"));
+        assert_eq!(
+            loaded.meta().developer_notes.as_deref(),
+            Some("HC-110 dil B, 6:30")
+        );
     }
 
     #[test]
