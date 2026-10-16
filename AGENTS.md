@@ -26,6 +26,7 @@ COSMIC desktop app (libcosmic, Rust edition 2024) for film roll library manageme
 
 - Every `.rs` file starts with `// SPDX-License-Identifier: GPL-3.0-or-later` (repo license is GPL-3.0-or-later).
 - Distro packaging/vendoring flow is documented in README (`just vendor` → `just build-vendored`; `install` honors `rootdir`/`prefix`).
+- Comments/doc comments are the absolute minimum: *what*, not *why it changed*; never reference removed code or prior implementations (`git log` holds history); one terse line or none. If something needs a long comment to explain, treat that as a signal to refactor instead.
 
 ### Docs drift
 
