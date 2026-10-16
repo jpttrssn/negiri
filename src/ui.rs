@@ -19,7 +19,7 @@ use crate::fl;
 use crate::i18n::fl_dyn;
 use crate::library::{LibraryCell, format_roll_card_dates, library_cell_index, library_cells};
 use cosmic::iced::alignment::{Horizontal, Vertical};
-use cosmic::iced::widget::{Grid, MouseArea, Stack, grid};
+use cosmic::iced::widget::{Grid, MouseArea, Sensor, Stack, grid};
 use cosmic::iced::{ContentFit, Length};
 use cosmic::prelude::*;
 use cosmic::widget::{self, canvas, icon};
@@ -70,18 +70,20 @@ pub(crate) fn library_view(app: &AppModel) -> Element<'_, Message> {
     .height(grid::Sizing::AspectRatio(TILE_ASPECT))
     .spacing(space_s);
 
-    let body = widget::scrollable(widget::container(grid).width(Length::Fill).padding(space_s))
-        // Report the viewport so `Nav` can scroll the highlighted tile into
-        // view when it moves beyond the visible area.
-        .id(scrollable_id("rolls-grid"))
-        .on_scroll(Message::GridViewport)
-        .height(Length::Fill);
+    let body: Element<'_, Message> = Sensor::new(
+        widget::scrollable(widget::container(grid).width(Length::Fill).padding(space_s))
+            .id(scrollable_id("rolls-grid"))
+            .on_scroll(Message::GridViewport)
+            .height(Length::Fill),
+    )
+    .on_resize(Message::GridResized)
+    .into();
 
     // A truly empty library shows no hint (the Add Roll tile alone is
     // self-explanatory), and a grid with matching rolls shows none either —
     // only the search-mismatch case (rolls exist but none match) overlays.
     if app.rolls.is_empty() || !empty {
-        return body.into();
+        return body;
     }
 
     // Nothing matches: keep the hint over the space the grid leaves empty.
@@ -137,11 +139,14 @@ pub(crate) fn frames_view(app: &AppModel) -> Element<'_, Message> {
         .height(grid::Sizing::AspectRatio(TILE_ASPECT))
         .spacing(space_s);
 
-        widget::scrollable(widget::container(grid).width(Length::Fill).padding(space_s))
-            .id(scrollable_id("frames-grid"))
-            .on_scroll(Message::GridViewport)
-            .height(Length::Fill)
-            .into()
+        Sensor::new(
+            widget::scrollable(widget::container(grid).width(Length::Fill).padding(space_s))
+                .id(scrollable_id("frames-grid"))
+                .on_scroll(Message::GridViewport)
+                .height(Length::Fill),
+        )
+        .on_resize(Message::GridResized)
+        .into()
     };
 
     let mut page = Stack::with_capacity(1);

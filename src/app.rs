@@ -844,6 +844,8 @@ pub(crate) enum Message {
     /// column/height tracks and re-pumps thumbnail decoding for the rows the new
     /// viewport exposes (via `cosmic::iced::window::resize_events`).
     WindowResized(Size),
+    /// The mounted grid's laid-out size changed (window resize or drawer toggle).
+    GridResized(Size),
     /// The user pressed the mouse on the detail preview — grab-pan begins.
     DetailPanPress,
     /// The cursor moved over the detail preview; while panning this shifts
@@ -1185,10 +1187,6 @@ impl cosmic::Application for AppModel {
         (app, command)
     }
 
-    /// Track the content width so arrow-key navigation of the library grid can
-    /// mirror iced's `Grid::fluid` column count exactly
-    /// (`ceil((width + spacing) / (max_width + spacing))`), and remember the
-    /// window height for the pre-scroll viewport estimate.
     fn on_window_resize(&mut self, _id: cosmic::iced::window::Id, width: f32, height: f32) {
         self.set_window_size(Size::new(width, height));
     }
@@ -1747,6 +1745,7 @@ impl cosmic::Application for AppModel {
                     | Message::GridViewport(_)
                     | Message::DetailAreaResized(_)
                     | Message::WindowResized(_)
+                    | Message::GridResized(_)
                     | Message::ThumbReady(_, _, _)
                     | Message::RollOpened(_, _)
                     | Message::CoverReady(_, _)
@@ -1967,6 +1966,13 @@ impl cosmic::Application for AppModel {
                 Task::batch([self.decode_next(), self.decode_covers()])
             }
 
+            Message::GridResized(size) => {
+                let spacing = f32::from(cosmic::theme::spacing().space_s);
+                self.grid_cols = grid_num_cols(size.width - 2.0 * spacing, spacing).max(1);
+                self.grid_viewport = None;
+                Task::batch([self.decode_next(), self.decode_covers()])
+            }
+
             Message::DetailPanPress => {
                 self.detail_panning = true;
                 Task::none()
@@ -2133,21 +2139,42 @@ impl cosmic::Application for AppModel {
             }
 
             Message::RollInfoLoaded(roll) => {
-                if self.rolls.iter().any(|existing| existing.dir == roll.dir) {
-                    return Task::none();
+                let is_new = !self.rolls.iter().any(|existing| existing.dir == roll.dir);
+                cover_trace(format_args!(
+                    "RollInfoLoaded: {} cover={:?} frames={} new={is_new} active={} inflight={}",
+                    roll.dir.display(),
+                    roll.cover,
+                    roll.frame_count,
+                    self.active.is_some(),
+                    self.cover_inflight.len()
+                ));
+                if is_new {
+                    self.rolls.push(roll);
+                    self.rolls.sort_by(|a, b| a.name.cmp(&b.name));
                 }
-                self.rolls.push(roll);
-                self.rolls.sort_by(|a, b| a.name.cmp(&b.name));
-                Task::none()
+                self.decode_covers()
             }
 
             Message::CoverReady(dir, result) => {
+                if let Err(err) = &result {
+                    log::error!("cover decode failed for {}: {err}", dir.display());
+                }
+                cover_trace(format_args!(
+                    "CoverReady: {} -> {}",
+                    dir.display(),
+                    if result.is_ok() { "ok" } else { "err" }
+                ));
                 if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
                     roll.thumb = match result {
                         Ok(handle) => Thumb::Ready(handle),
                         Err(_) => Thumb::Failed,
                     };
                 }
+                cover_trace(format_args!(
+                    "CoverReady: matching roll for {}: {}",
+                    dir.display(),
+                    self.rolls.iter().any(|roll| roll.dir == dir)
+                ));
                 self.cover_inflight.retain(|pending| pending != &dir);
                 self.decode_covers()
             }
@@ -2169,6 +2196,11 @@ impl cosmic::Application for AppModel {
                     }
                     // The library list is app-wide: persist the new roll no matter
                     // where the folder picker was invoked from.
+                    cover_trace(format_args!(
+                        "RollsAdded: accepted {} (rel={rel:?}, present={})",
+                        dir.display(),
+                        self.rolls.iter().any(|roll| roll.dir == dir)
+                    ));
                     if !self.rolls.iter().any(|roll| roll.dir == dir) {
                         self.config.rolls.push(rel);
                         self.persist_config();
@@ -2181,7 +2213,7 @@ impl cosmic::Application for AppModel {
                         Message::RollInfoLoaded(load_roll(scan_dir).await)
                     })
                 });
-                Task::batch(load_cards).chain(self.decode_covers())
+                Task::batch(load_cards)
             }
 
             Message::CalibrateBaseFromFrame => self.calibrate_base_from_frame(),
@@ -2977,12 +3009,8 @@ impl AppModel {
         )
     }
 
-    /// Records the window size's grid-relevant tracks (column count + height).
-    /// Shared by the `on_window_resize` startup hook and the `WindowResized`
-    /// message (which additionally re-pumps thumbnail decoding).
+    /// Records the window height for the pre-scroll viewport estimate.
     fn set_window_size(&mut self, size: Size) {
-        let spacing = f32::from(cosmic::theme::spacing().space_s);
-        self.grid_cols = grid_num_cols(size.width, spacing).max(1);
         self.window_height = size.height;
     }
 
@@ -2999,7 +3027,11 @@ impl AppModel {
         }
         let spacing = f32::from(cosmic::theme::spacing().space_s);
         let padding = spacing;
-        let (cols, cell, viewport_height, offset_y) = if let Some(viewport) = &self.grid_viewport {
+        let measured = self
+            .grid_viewport
+            .as_ref()
+            .filter(|viewport| viewport.bounds().width > 0.0 && viewport.bounds().height > 0.0);
+        let (cols, cell, viewport_height, offset_y) = if let Some(viewport) = measured {
             let available = viewport.bounds().width - 2.0 * padding;
             let cols = grid_num_cols(available, spacing).max(1);
             let cell = ((available - spacing * (cols as f32 - 1.0)) / cols as f32).max(1.0);
@@ -3211,12 +3243,17 @@ impl AppModel {
         // Covers belong to the library page: pause while a roll is open (they
         // resume when the library becomes visible again on back-out).
         if self.active.is_some() {
+            cover_trace(format_args!("decode_covers: skipped (roll open)"));
             return Task::none();
         }
         let capacity = self
             .thumb_concurrency
             .saturating_sub(self.cover_inflight.len());
         if capacity == 0 {
+            cover_trace(format_args!(
+                "decode_covers: capacity 0 (inflight={})",
+                self.cover_inflight.len()
+            ));
             return Task::none();
         }
 
@@ -3229,27 +3266,70 @@ impl AppModel {
             self.search_filter.as_deref().unwrap_or(""),
             &self.month_aliases,
         );
+        match &self.grid_viewport {
+            Some(vp) => cover_trace(format_args!(
+                "decode_covers viewport: bounds {}x{} offset_y={} content {}x{} grid_cols={} window_height={}",
+                vp.bounds().width,
+                vp.bounds().height,
+                vp.absolute_offset().y,
+                vp.content_bounds().width,
+                vp.content_bounds().height,
+                self.grid_cols,
+                self.window_height,
+            )),
+            None => cover_trace(format_args!(
+                "decode_covers viewport: none grid_cols={} window_height={}",
+                self.grid_cols, self.window_height,
+            )),
+        }
         let visible = self.visible_range(cells.len());
+        cover_trace(format_args!(
+            "decode_covers: cap={capacity} inflight={} cells={} visible={visible:?}",
+            self.cover_inflight.len(),
+            cells.len()
+        ));
         let pending: Vec<(PathBuf, String)> = cells
             .get(visible)
             .unwrap_or(&[])
             .iter()
             .filter_map(|cell| match cell {
-                LibraryCell::Roll(roll)
-                    if matches!(roll.thumb, Thumb::Loading)
-                        && !self.cover_inflight.iter().any(|dir| dir == &roll.dir) =>
-                {
-                    roll.cover.clone().map(|name| (roll.dir.clone(), name))
+                LibraryCell::Roll(roll) if matches!(roll.thumb, Thumb::Loading) => {
+                    if self.cover_inflight.iter().any(|dir| dir == &roll.dir) {
+                        cover_trace(format_args!(
+                            "decode_covers: {} skipped (inflight)",
+                            roll.dir.display()
+                        ));
+                        None
+                    } else if let Some(name) = roll.cover.clone() {
+                        Some((roll.dir.clone(), name))
+                    } else {
+                        cover_trace(format_args!(
+                            "decode_covers: {} skipped (no cover)",
+                            roll.dir.display()
+                        ));
+                        None
+                    }
                 }
-                _ => None,
+                LibraryCell::Roll(roll) => {
+                    cover_trace(format_args!(
+                        "decode_covers: {} skipped (thumb not Loading)",
+                        roll.dir.display()
+                    ));
+                    None
+                }
+                LibraryCell::AddRoll => None,
             })
             .take(capacity)
             .collect();
 
         if pending.is_empty() {
+            cover_trace(format_args!("decode_covers: nothing pending"));
             return Task::none();
         }
 
+        for (dir, _) in &pending {
+            cover_trace(format_args!("decode_covers: planned {}", dir.display()));
+        }
         self.cover_inflight
             .extend(pending.iter().map(|(dir, _)| dir.clone()));
 
@@ -4493,6 +4573,11 @@ fn rebake_trace(args: std::fmt::Arguments<'_>) {
     log::trace!("[rebake] {args}");
 }
 
+/// Logs a roll-cover trace line (`EXPOSURE_TRACE_COVER` forces the trace level).
+fn cover_trace(args: std::fmt::Arguments<'_>) {
+    log::trace!("[cover] {args}");
+}
+
 /// A roll directory's final path component, the fallback display name for a
 /// roll with no manifest label.
 fn dir_leaf(dir: &Path) -> String {
@@ -4635,9 +4720,9 @@ async fn scan_frame_files(dir: &Path) -> Vec<String> {
     files
 }
 
-/// Opens the system folder picker, and on success emits [`Message::RollAdded`]
-/// for the chosen directory (a cancel or portal failure is a no-op). Shared by
-/// the double-click handler and Enter on a selected Add Roll tile.
+/// Opens the system folder picker, and on success emits [`Message::RollsAdded`]
+/// for the chosen directories (a cancel or portal failure is a no-op). Shared
+/// by the double-click handler and Enter on a selected Add Roll tile.
 fn open_roll_picker() -> Task<cosmic::Action<Message>> {
     cosmic::task::future(async {
         let dialog = cosmic::dialog::file_chooser::open::Dialog::new().open_folders();
@@ -5170,6 +5255,11 @@ async fn rebake_thumbnail(
 /// so a library-page cover reflects a calibration recorded from the open roll
 /// without extra plumbing.
 async fn decode_cover(dir: PathBuf, name: String) -> Message {
+    cover_trace(format_args!(
+        "decode_cover: start {}/{}",
+        dir.display(),
+        name
+    ));
     let manifest = edit_manifest::load_roll_manifest_async(&dir).await;
     let develop = manifest.tone(&name).to_develop(manifest.base_or_default());
     let crop = manifest.crop(&name);
@@ -5225,6 +5315,7 @@ where
     F: FnOnce(&rawloader::RawImage) -> Result<T, FrameError> + Send + 'static,
 {
     let path = dir.join(name);
+    let log_path = path.clone();
 
     tokio::task::spawn_blocking(move || {
         let image = match rawloader::decode_file(&path) {
@@ -5240,7 +5331,10 @@ where
         convert(&image)
     })
     .await
-    .unwrap_or(Err(FrameError::ThreadPanic))
+    .unwrap_or_else(|err| {
+        log::error!("decode task failed for {}: {err}", log_path.display());
+        Err(FrameError::ThreadPanic)
+    })
 }
 
 /// Whether a finished hi-res decode belongs to the current selection and is

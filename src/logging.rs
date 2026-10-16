@@ -9,8 +9,9 @@
 //! iced, wgpu, i18n-embed, zbus — stays quiet unless `RUST_LOG` opts into it.
 //! `RUST_LOG=debug` (a bare level) raises the threshold for every crate;
 //! `RUST_LOG=negiri=trace` raises only ours. The
-//! `EXPOSURE_TRACE_DETAIL`/`EXPOSURE_TRACE_REBAKE` env vars force our crate to
-//! `trace`, preserving the codebase's existing detail/rebake tracing knobs.
+//! `EXPOSURE_TRACE_DETAIL`/`EXPOSURE_TRACE_REBAKE`/`EXPOSURE_TRACE_COVER` env
+//! vars force our crate to `trace`, preserving the codebase's existing
+//! detail/rebake/cover tracing knobs.
 //!
 //! Output keeps the established "prefix-less" style: `failed to decode
 //! /path: reason` — the message is written exactly as passed to the macro.
@@ -74,6 +75,7 @@ fn scopes_from_env() -> (LevelFilter, LevelFilter) {
 
     if std::env::var("EXPOSURE_TRACE_DETAIL").is_ok()
         || std::env::var("EXPOSURE_TRACE_REBAKE").is_ok()
+        || std::env::var("EXPOSURE_TRACE_COVER").is_ok()
     {
         own = LevelFilter::Trace;
     }
