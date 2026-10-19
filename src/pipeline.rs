@@ -160,30 +160,41 @@ impl Recon {
 }
 
 /// The reconstruction chosen for the preview and for export, seeded from
-/// `NEGIRI_MONO_PREVIEW` / `NEGIRI_MONO_EXPORT`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// `NEGIRI_MONO_PREVIEW` / `NEGIRI_MONO_EXPORT`. Defaults to the half-res
+/// [`Recon::Average`] for the interactive preview and the full-res
+/// [`Recon::PerSite`] for export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ReconSettings {
     pub(crate) preview: Recon,
     pub(crate) export: Recon,
 }
 
-impl ReconSettings {
-    /// Reads the preview/export selections from the environment (unset or
-    /// unknown → the default).
-    #[must_use]
-    pub(crate) fn from_env() -> Self {
+impl Default for ReconSettings {
+    fn default() -> Self {
         Self {
-            preview: env_recon("NEGIRI_MONO_PREVIEW"),
-            export: env_recon("NEGIRI_MONO_EXPORT"),
+            preview: Recon::Average,
+            export: Recon::PerSite,
         }
     }
 }
 
-fn env_recon(var: &str) -> Recon {
+impl ReconSettings {
+    /// Reads the preview/export selections from the environment; an unset or
+    /// unknown value falls back to [`Self::default`].
+    #[must_use]
+    pub(crate) fn from_env() -> Self {
+        let default = Self::default();
+        Self {
+            preview: env_recon("NEGIRI_MONO_PREVIEW").unwrap_or(default.preview),
+            export: env_recon("NEGIRI_MONO_EXPORT").unwrap_or(default.export),
+        }
+    }
+}
+
+fn env_recon(var: &str) -> Option<Recon> {
     std::env::var(var)
         .ok()
         .and_then(|name| Recon::from_name(&name))
-        .unwrap_or_default()
 }
 
 /// The per-class gains that rescale the four CFA classes onto one common base

@@ -5802,6 +5802,17 @@ mod tests {
     }
 
     #[test]
+    fn recon_settings_default_to_average_preview_and_pixel_export() {
+        assert_eq!(
+            ReconSettings::default(),
+            ReconSettings {
+                preview: Recon::Average,
+                export: Recon::PerSite,
+            }
+        );
+    }
+
+    #[test]
     fn luma_preserves_neutral_levels() {
         assert!((luma(&[1.0, 1.0, 1.0])[0] - 1.0).abs() < 1e-6);
         assert!((luma(&[0.25, 0.25, 0.25])[0] - 0.25).abs() < 1e-6);
