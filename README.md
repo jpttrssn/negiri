@@ -13,7 +13,9 @@ Currently in Beta and only supports black and white negatives. Config and roll m
 - One designated calibration frame per roll sets its clear-film base
 - Histogram with an output/input axis toggle, plus a classic `T(p)` curve overlay
 - Crop mode tuned for removing edges, plus quarter-turn display rotation
-- Post-gain 2×2 CFA averaging for lower read noise on monochrome negatives
+- CFA -> mono reconstruction with per-class gain normalization
+  - Decimating 2×2 average (lower read noise/better performance) for the preview
+  - Full-resolution per-photosite luminance for exports
 - Keyboard-centric controls
 - Set and export original roll date with chronological frame order
 - Search by roll metadata
