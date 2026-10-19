@@ -89,32 +89,111 @@ pub(crate) fn crop_samples(
 }
 
 /// Approximate number of photosites sampled per CFA class when measuring
-/// clear-film bases in [`flatten_bayer`].
+/// clear-film bases in [`flatten_bayer_average`].
 pub(crate) const BASE_SAMPLE_TARGET: usize = 250_000;
 
-/// Reconstructs a monochrome negative from bayer samples, one output pixel per
-/// 2×2 CFA cell.
+/// A linear decoded frame: interleaved `channels` f32 samples.
 ///
-/// Monochrome film carries no color signal, so each CFA class is treated as an
-/// independent density measurement: every class's clear-film transmission is
-/// measured from a strided subsample and the classes are rescaled onto one
-/// common base (neutralizing the light-table/sensor cast). Because the four
-/// sites of a cell then measure the *same* luminance on one common scale, they
-/// are averaged — gain first, then mean — halving the read noise versus
-/// emitting a single photosite per pixel. The output is half-resolution in each
-/// axis (a final partial row/column for odd dimensions is edge-replicated).
-///
-/// This is a luminance reconstruction for a monochrome scene, not a color
-/// demosaic; color negatives will need a real demosaic pass later.
-///
-/// Returns the mono samples plus their (halved) dimensions.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub(crate) fn flatten_bayer(
+/// `channels == 1` is monochrome (today); the field is the seam for a future
+/// color reconstruction (`channels == 3`).
+#[derive(Debug, Clone)]
+pub(crate) struct LinearImage {
+    pub(crate) data: Vec<f32>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) channels: u8,
+}
+
+/// How a CFA mosaic is reconstructed to a linear frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) enum Recon {
+    /// Per-class gain normalize + decimating 2x2 average (half resolution).
+    #[default]
+    Average,
+    /// Per-photosite gain-normalized luminance (full sensor resolution).
+    PerSite,
+    /// [`Recon::PerSite`] plus green-guided class-noise suppression.
+    PerSiteDenoise,
+}
+
+impl Recon {
+    /// The reconstruction for a config/display name, or `None` if unknown.
+    #[must_use]
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "average" => Some(Self::Average),
+            "pixel" => Some(Self::PerSite),
+            "pixel-denoise" => Some(Self::PerSiteDenoise),
+            _ => None,
+        }
+    }
+
+    /// The config/display name for this reconstruction.
+    #[must_use]
+    #[allow(dead_code)] // inverse of `from_name`; used by tests and the future UI
+    pub(crate) fn as_name(self) -> &'static str {
+        match self {
+            Self::Average => "average",
+            Self::PerSite => "pixel",
+            Self::PerSiteDenoise => "pixel-denoise",
+        }
+    }
+
+    fn reconstruct(
+        self,
+        samples: &[f32],
+        width: usize,
+        height: usize,
+        cfa: &rawloader::CFA,
+    ) -> LinearImage {
+        match self {
+            Self::Average => flatten_bayer_average(samples, width, height, cfa),
+            Self::PerSite | Self::PerSiteDenoise => {
+                let mut image = flatten_bayer_pixel(samples, width, height, cfa);
+                if matches!(self, Self::PerSiteDenoise) {
+                    denoise_class_pattern(&mut image, cfa);
+                }
+                image
+            }
+        }
+    }
+}
+
+/// The reconstruction chosen for the preview and for export, seeded from
+/// `NEGIRI_MONO_PREVIEW` / `NEGIRI_MONO_EXPORT`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReconSettings {
+    pub(crate) preview: Recon,
+    pub(crate) export: Recon,
+}
+
+impl ReconSettings {
+    /// Reads the preview/export selections from the environment (unset or
+    /// unknown → the default).
+    #[must_use]
+    pub(crate) fn from_env() -> Self {
+        Self {
+            preview: env_recon("NEGIRI_MONO_PREVIEW"),
+            export: env_recon("NEGIRI_MONO_EXPORT"),
+        }
+    }
+}
+
+fn env_recon(var: &str) -> Recon {
+    std::env::var(var)
+        .ok()
+        .and_then(|name| Recon::from_name(&name))
+        .unwrap_or_default()
+}
+
+/// The per-class gains that rescale the four CFA classes onto one common base
+/// (the green anchor when present, else the dimmest measurable class).
+fn bayer_class_gains(
     samples: &[f32],
     width: usize,
     height: usize,
     cfa: &rawloader::CFA,
-) -> (Vec<f32>, u32, u32) {
+) -> [f32; 4] {
     let pixels = width * height;
     // An odd step cannot alias with the period-2 CFA grid.
     let step = usize::max(pixels / BASE_SAMPLE_TARGET, 1) | 1;
@@ -133,13 +212,22 @@ pub(crate) fn flatten_bayer(
             *base = measured;
         }
     }
-    // Anchor onto the green class when present (best SNR, keeps magnitudes
-    // close to true transmissions); otherwise the dimmest measurable class.
     let empty = std::array::from_fn(|class| class_samples[class].is_empty());
-    let gains = class_gains(anchored, empty);
+    class_gains(anchored, empty)
+}
 
-    // Gain-normalize every site onto the common base BEFORE averaging, so the
-    // four classes of a cell are comparable measurements of one luminance.
+/// Reconstructs a monochrome negative from bayer samples, one output pixel per
+/// 2×2 CFA cell. Each site is gain-normalized onto the common class base first
+/// (so the four classes are comparable luminance measurements), then the cell
+/// is averaged — halving read noise at half resolution per axis.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub(crate) fn flatten_bayer_average(
+    samples: &[f32],
+    width: usize,
+    height: usize,
+    cfa: &rawloader::CFA,
+) -> LinearImage {
+    let gains = bayer_class_gains(samples, width, height, cfa);
     let gain_at = |y: usize, x: usize| gains[cfa.color_at(y, x)];
 
     let out_w = width.div_ceil(2);
@@ -166,7 +254,80 @@ pub(crate) fn flatten_bayer(
         }
     }
 
-    (mono, out_w as u32, out_h as u32)
+    LinearImage {
+        data: mono,
+        width: out_w as u32,
+        height: out_h as u32,
+        channels: 1,
+    }
+}
+
+/// Per-photosite gain-normalized luminance: every site is a luminance sample
+/// for a neutral negative, so this keeps the full sensor resolution.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub(crate) fn flatten_bayer_pixel(
+    samples: &[f32],
+    width: usize,
+    height: usize,
+    cfa: &rawloader::CFA,
+) -> LinearImage {
+    let gains = bayer_class_gains(samples, width, height, cfa);
+    let mut mono = Vec::with_capacity(width * height);
+    for y in 0..height {
+        for x in 0..width {
+            mono.push(samples[y * width + x] * gains[cfa.color_at(y, x)]);
+        }
+    }
+
+    LinearImage {
+        data: mono,
+        width: width as u32,
+        height: height as u32,
+        channels: 1,
+    }
+}
+
+/// Blend strength toward the neighboring green estimate at an R/B site.
+const DENOISE_ALPHA: f32 = 0.5;
+/// Difference scale (in normalized units) above which an R/B/green mismatch
+/// reads as an edge and the measured value is kept.
+const DENOISE_EDGE_SCALE: f32 = 8.0;
+
+/// Green-guided suppression of the per-class noise texture in a per-site
+/// reconstruction: blends each R/B site toward its neighboring green samples,
+/// backing off where the local difference suggests an edge.
+fn denoise_class_pattern(image: &mut LinearImage, cfa: &rawloader::CFA) {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let src = image.data.clone();
+    for y in 0..height {
+        for x in 0..width {
+            if cfa.color_at(y, x) == 1 {
+                continue;
+            }
+            // The orthogonal neighbors of an R/B site are green.
+            let mut sum = 0.0_f32;
+            let mut count = 0.0_f32;
+            for (nx, ny) in [
+                (x.wrapping_sub(1), y),
+                (x + 1, y),
+                (x, y.wrapping_sub(1)),
+                (x, y + 1),
+            ] {
+                if nx < width && ny < height && cfa.color_at(ny, nx) == 1 {
+                    sum += src[ny * width + nx];
+                    count += 1.0;
+                }
+            }
+            if count == 0.0 {
+                continue;
+            }
+            let green = sum / count;
+            let value = src[y * width + x];
+            let edge = 1.0 / (1.0 + (DENOISE_EDGE_SCALE * (green - value)).powi(2));
+            image.data[y * width + x] = value + DENOISE_ALPHA * edge * (green - value);
+        }
+    }
 }
 
 /// Gains that rescale the four CFA classes onto one common base.
@@ -250,7 +411,7 @@ fn luma_of_means(r: f32, g: f32, b: f32) -> f32 {
 ///
 /// Reads the raw sensor samples exactly once into per-output-pixel
 /// accumulators, bypassing the full-resolution linear buffer the separate
-/// [`normalize_samples`]/[`crop_samples`]/[`flatten_bayer`]/[`resize_area`]
+/// [`normalize_samples`]/[`crop_samples`]/[`flatten_bayer_average`]/[`resize_area`]
 /// steps build. The size math and block mapping match [`resize_area`] (never
 /// upscales). Returns a small linear negative-space mono; inversion happens in
 /// the caller.
@@ -1089,21 +1250,18 @@ fn orient(
     (oriented, out_width, out_height)
 }
 /// Runs a RAW decode plus mono reconstruction on a blocking worker thread,
-/// returning TRUE sensor-linear `mono` (post-downscale) oriented to display
+/// returning TRUE sensor-linear data (post-downscale) oriented to display
 /// upright — the shader applies the pointwise density develop per fragment.
-/// `max_edge` is the downscale target for the long edge.
-///
-/// The `src_long_edge` field is the sensor's true long edge AFTER cropping but
-/// BEFORE the downscale — i.e. the real native long edge the overview was
-/// scaled down from (< `max_edge` means the overview is already full-res). For
-/// a bayer source the mono is first CFA-averaged to half resolution (see
-/// [`flatten_bayer`]), so the returned `width`/`height` are half the cropped
-/// sensor dims while `src_long_edge` stays in sensor pixels.
+/// `max_edge` is the downscale target for the long edge. `recon` selects the
+/// CFA reconstruction ([`Recon`]), so a bayer mono is half the cropped sensor
+/// dims for [`Recon::Average`] but full dims for the per-site variants;
+/// `src_long_edge` stays in sensor pixels either way.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) async fn decode_raw_detail(
     dir: PathBuf,
     name: String,
     max_edge: u32,
+    recon: Recon,
 ) -> Result<DetailDecode, FrameError> {
     let path = dir.join(name);
 
@@ -1145,10 +1303,8 @@ pub(crate) async fn decode_raw_detail(
             }
 
             let cfa = image.cfa.shift(image.crops[3], image.crops[0]);
-            // `flatten_bayer` averages each 2×2 CFA cell into one output pixel,
-            // so it returns its own (halved) dimensions.
-            let (mono, out_w, out_h) = flatten_bayer(&samples, width, height, &cfa);
-            (mono, out_w as usize, out_h as usize)
+            let frame = recon.reconstruct(&samples, width, height, &cfa);
+            (frame.data, frame.width as usize, frame.height as usize)
         };
 
         // True sensor-linear data: the mono stays linear `[0,1]` relative to the
@@ -1160,34 +1316,27 @@ pub(crate) async fn decode_raw_detail(
         let (oriented, width, height) = orient_mono(&mono, width, height, image.orientation);
 
         Ok(DetailDecode {
-            mono: oriented,
-            width,
-            height,
+            image: LinearImage {
+                data: oriented,
+                width,
+                height,
+                channels: 1,
+            },
             src_long_edge,
         })
     })
     .await
     .unwrap_or(Err(FrameError::ThreadPanic))
 }
-/// A decoded TRUE sensor-linear mono frame plus the geometry the detail and
-/// export paths need.
-///
-/// `mono` is linear `[0,1]` relative to the sensor white point — the single
-/// source of truth; the exposure gain and the density develop happen downstream
-/// from the frame's resolved [`film::Develop`].
+/// A decoded sensor-linear frame plus the geometry the detail and export paths
+/// need. `image` is linear `[0,1]` relative to the sensor white point; the
+/// exposure gain and density develop happen downstream.
 #[derive(Debug, Clone)]
 pub(crate) struct DetailDecode {
-    pub(crate) mono: Vec<f32>,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    /// The sensor's true long edge AFTER cropping but BEFORE any downscale.
-    /// Kept in SENSOR pixels (not the CFA-averaged mono's) so the crop margins
-    /// — authored against the full-resolution display frame by the grid bake
-    /// and keyboard trims — stay in one reference frame across grid, detail,
-    /// and export. The detail texture is a downscale of `mono`, which for a
-    /// bayer source is already 2× CFA-averaged, so its true 1:1 is reached
-    /// earlier; the `src_long_edge`/texture aspect is preserved, so
-    /// [`shader::DetailProgram`] still recovers the correct source dims.
+    pub(crate) image: LinearImage,
+    /// The sensor's true long edge AFTER cropping but BEFORE any downscale,
+    /// kept in SENSOR pixels so the crop margins stay in one reference frame
+    /// across grid, detail, and export.
     pub(crate) src_long_edge: u32,
 }
 

@@ -14,8 +14,9 @@ use crate::library::{
     record_roll_drawer, resolve_date_draft, roll_dates_valid,
 };
 use crate::pipeline::{
-    DetailDecode, ThumbMono, bake_thumbnail, convert_thumbnail, decode_raw_detail,
-    downsample_thumbnail_mono, histogram_from_develop, is_supported_raw, resized_dims,
+    DetailDecode, LinearImage, Recon, ReconSettings, ThumbMono, bake_thumbnail, convert_thumbnail,
+    decode_raw_detail, downsample_thumbnail_mono, histogram_from_develop, is_supported_raw,
+    resized_dims,
 };
 use crate::shader;
 use crate::ui::{
@@ -225,6 +226,8 @@ pub(crate) struct AppModel {
     key_binds: HashMap<menu::KeyBind, MenuAction>,
     /// Configuration data that persists between application runs.
     config: Config,
+    /// The CFA reconstruction chosen for the preview and for export.
+    recon: ReconSettings,
     /// Film rolls listed on the library page, one directory of negatives each.
     pub(crate) rolls: Vec<Roll>,
     /// Directory of the roll currently drilled into (its frame grid and the
@@ -449,7 +452,7 @@ pub(crate) struct AppModel {
     /// returning to a recently-viewed frame doesn't re-decode the RAW. Survives
     /// roll switches and detail close; eviction is global (see
     /// [`DETAIL_CACHE_CAPACITY`]). Only overview (2048px) buffers are stored.
-    detail_cache: LruCache<(PathBuf, String), DetailMono>,
+    detail_cache: LruCache<(PathBuf, String, Recon), DetailMono>,
     /// LRU of decoded frame thumbnails keyed by (roll dir, file name), storing
     /// the edit-independent [`ThumbMono`] so re-opening a roll (or re-baking an
     /// edit / calibration change) re-bakes without re-decoding the RAW. Eviction
@@ -593,15 +596,13 @@ pub(crate) struct Tile {
     pub(crate) meta_failed: bool,
 }
 
-/// A decoded detail-view overview: the linear pre-sRGB mono buffer plus its
-/// geometry, as delivered by [`decode_raw_detail`]. Exactly what an
-/// [`shader::DetailProgram`] needs to (re)build without re-decoding
-/// the RAW. Cached by the detail LRU keyed on (roll dir, file name).
+/// A decoded detail-view overview: the linear pre-sRGB frame plus its geometry,
+/// as delivered by [`decode_raw_detail`]. Exactly what an
+/// [`shader::DetailProgram`] needs to (re)build without re-decoding the RAW.
+/// Cached by the detail LRU keyed on (roll dir, file name, reconstruction).
 #[derive(Debug, Clone)]
 struct DetailMono {
-    mono: Vec<f32>,
-    width: u32,
-    height: u32,
+    image: LinearImage,
     /// The sensor's true long edge AFTER cropping but BEFORE the downscale, so
     /// a served cache entry can decide whether the overview was already native.
     src_long_edge: u32,
@@ -1084,6 +1085,7 @@ impl cosmic::Application for AppModel {
                     }
                 })
                 .unwrap_or_default(),
+            recon: ReconSettings::from_env(),
             rolls: Vec::new(),
             active: None,
             library_selection: None,
@@ -2964,6 +2966,7 @@ impl AppModel {
             .collect();
         let total = frames.len();
         self.export_progress = Some((0, total));
+        let recon = self.recon.export;
 
         // Stream from an async channel so the UI sees per-frame ticks. After
         // each frame the sender pushes an `ExportProgress` message (dropping
@@ -2980,6 +2983,7 @@ impl AppModel {
                 frames,
                 options,
                 start_date.clone(),
+                recon,
                 &mut tick,
             )
             .await;
@@ -3407,7 +3411,10 @@ impl AppModel {
         // The viewed frame's overview is usually cached; measure straight from
         // it (the exact mono the user is looking at). A cold frame falls back
         // to a one-shot decode that lands in `CalibrationBaseMeasured`.
-        let Some(cached) = self.detail_cache.get(&(dir.clone(), name.clone())) else {
+        let Some(cached) = self
+            .detail_cache
+            .get(&(dir.clone(), name.clone(), Recon::Average))
+        else {
             // Designate the frame in RAM AND on disk before the decode returns,
             // since `apply_calibration_measurement` reads the manifest back
             // from disk and would otherwise drop the result as stale.
@@ -3415,7 +3422,7 @@ impl AppModel {
             self.persist_roll();
             return cosmic::task::future(measure_frame_base(dir, name));
         };
-        let base = measure_base(&cached.mono).filter(|base| *base >= MIN_PLAUSIBLE_BASE);
+        let base = measure_base(&cached.image.data).filter(|base| *base >= MIN_PLAUSIBLE_BASE);
         self.roll.set_calibration_frame(&name);
         match base {
             Some(base) => self.roll.set_calibrated_base(base),
@@ -3569,14 +3576,15 @@ impl AppModel {
             && let Some(dir) = self.active.clone()
             && let Some(cached) = self
                 .detail_cache
-                .get(&(dir, name.clone()))
-                .map(|c| (c.mono.clone(), c.width, c.height, c.src_long_edge))
+                .get(&(dir, name.clone(), self.recon.preview))
+                .map(|c| (c.image.clone(), c.src_long_edge))
         {
-            let (mono, width, height, src_long_edge) = cached;
+            let (image, src_long_edge) = cached;
             detail_trace(format_args!(
-                "cache hit: {name} {width}x{height} (src {src_long_edge})"
+                "cache hit: {name} {}x{} (src {src_long_edge})",
+                image.width, image.height
             ));
-            self.install_detail_shader(mono, width, height, src_long_edge);
+            self.install_detail_shader(image, src_long_edge);
             return self.request_histogram();
         }
 
@@ -3592,7 +3600,7 @@ impl AppModel {
             return Task::none();
         };
 
-        cosmic::task::future(decode_detail(dir, name, cap))
+        cosmic::task::future(decode_detail(dir, name, cap, self.recon.preview))
     }
 
     /// Builds and installs the detail shader from a decoded mono buffer,
@@ -3600,23 +3608,18 @@ impl AppModel {
     /// native level-up done when the source was already at (or below) the
     /// overview cap. Used when serving an LRU cache hit so the preview appears
     /// immediately without re-decoding the RAW.
-    fn install_detail_shader(
-        &mut self,
-        mono: Vec<f32>,
-        width: u32,
-        height: u32,
-        src_long_edge: u32,
-    ) {
+    fn install_detail_shader(&mut self, image: LinearImage, src_long_edge: u32) {
+        debug_assert_eq!(image.channels, 1, "mono pipeline expects a 1-channel frame");
         let image_id = self.next_image_id;
         self.next_image_id = self.next_image_id.wrapping_add(1);
         // Share the overview mono (a refcount, not a buffer copy) so the drawer
         // histogram can be recomputed on the blocking pool as the develop
         // changes.
-        self.histogram_mono = Some(Arc::new(mono.clone()));
+        self.histogram_mono = Some(Arc::new(image.data.clone()));
         self.detail_shader = Some(shader::DetailProgram::new(
-            mono,
-            width,
-            height,
+            image.data,
+            image.width,
+            image.height,
             self.tone.to_develop(self.roll.base_or_default()),
             self.crop,
             self.rotation,
@@ -3689,18 +3692,14 @@ impl AppModel {
             .retain(|(pending_dir, pending_name)| pending_dir != dir || pending_name != name);
 
         if let Ok(DetailDecode {
-            mono,
-            width,
-            height,
+            image,
             src_long_edge,
         }) = result
         {
             let _evicted = self.detail_cache.insert(
-                (dir.clone(), name.to_string()),
+                (dir.clone(), name.to_string(), self.recon.preview),
                 DetailMono {
-                    mono,
-                    width,
-                    height,
+                    image,
                     src_long_edge,
                 },
             );
@@ -3742,7 +3741,7 @@ impl AppModel {
         let pending: Vec<String> = neighbors
             .into_iter()
             .filter(|n| {
-                let key = (dir.clone(), n.clone());
+                let key = (dir.clone(), n.clone(), self.recon.preview);
                 !self.detail_cache.contains(&key)
                     && !self
                         .detail_preload_inflight
@@ -3759,10 +3758,11 @@ impl AppModel {
         self.detail_preload_inflight
             .extend(pending.iter().map(|n| (dir.clone(), n.clone())));
 
+        let recon = self.recon.preview;
         Task::batch(
             pending
                 .into_iter()
-                .map(|n| cosmic::task::future(preload_detail(dir.clone(), n))),
+                .map(|n| cosmic::task::future(preload_detail(dir.clone(), n, recon))),
         )
     }
 
@@ -4413,15 +4413,13 @@ impl AppModel {
             let mut landed = false;
             match result {
                 Ok(DetailDecode {
-                    mono,
-                    width,
-                    height,
+                    image,
                     src_long_edge,
                 }) => {
                     landed = true;
                     detail_trace(format_args!(
                         "arrived ok: {name} {}x{} (src long edge {src_long_edge}), fresh={fresh_open}, zoom={:.3}",
-                        width, height, self.detail_zoom.0
+                        image.width, image.height, self.detail_zoom.0
                     ));
                     // Stash a fresh overview decode into the LRU so returning
                     // to this frame is instant. Only the level-1 overview is
@@ -4434,11 +4432,9 @@ impl AppModel {
                         // freeing its memory eagerly; the value is otherwise
                         // unused.
                         let _evicted = self.detail_cache.insert(
-                            (dir.clone(), name.to_string()),
+                            (dir.clone(), name.to_string(), self.recon.preview),
                             DetailMono {
-                                mono: mono.clone(),
-                                width,
-                                height,
+                                image: image.clone(),
                                 src_long_edge,
                             },
                         );
@@ -4462,11 +4458,11 @@ impl AppModel {
                     // Share the overview mono for the drawer histogram (a
                     // refcount, recomputed on the blocking pool as the develop
                     // changes).
-                    self.histogram_mono = Some(Arc::new(mono.clone()));
+                    self.histogram_mono = Some(Arc::new(image.data.clone()));
                     self.detail_shader = Some(shader::DetailProgram::new(
-                        mono,
-                        width,
-                        height,
+                        image.data,
+                        image.width,
+                        image.height,
                         self.tone.to_develop(self.roll.base_or_default()),
                         self.crop,
                         self.rotation,
@@ -5277,16 +5273,16 @@ async fn decode_cover(dir: PathBuf, name: String) -> Message {
 /// shader uploads and applies exposure to.  `max_edge` caps the long edge in
 /// pixels; the overview level uses [`HI_RES_SIZE`], the native level-up
 /// [`MAX_TEXTURE_EDGE`].
-async fn decode_detail(dir: PathBuf, name: String, max_edge: u32) -> Message {
-    let result = decode_raw_detail(dir, name.clone(), max_edge).await;
+async fn decode_detail(dir: PathBuf, name: String, max_edge: u32, recon: Recon) -> Message {
+    let result = decode_raw_detail(dir, name.clone(), max_edge, recon).await;
     Message::DetailReady(name, result)
 }
 
 /// Decodes a neighbor frame's overview for the preload cache. Unlike
 /// [`decode_detail`] this only populates the LRU — it never becomes the active
 /// detail shader — so it always decodes at the fixed overview cap.
-async fn preload_detail(dir: PathBuf, name: String) -> Message {
-    let result = decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE).await;
+async fn preload_detail(dir: PathBuf, name: String, recon: Recon) -> Message {
+    let result = decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE, recon).await;
     Message::DetailPreloaded(dir, name, result)
 }
 
@@ -5299,10 +5295,12 @@ async fn preload_detail(dir: PathBuf, name: String) -> Message {
 /// plateau. Implausible or missing measurements arrive as `None` (the caller
 /// keeps the default fallback rather than recording a bad base).
 async fn measure_frame_base(dir: PathBuf, name: String) -> Message {
-    let base = decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE)
+    let base = decode_raw_detail(dir.clone(), name.clone(), HI_RES_SIZE, Recon::Average)
         .await
         .ok()
-        .and_then(|decoded| measure_base(&decoded.mono).filter(|base| *base >= MIN_PLAUSIBLE_BASE));
+        .and_then(|decoded| {
+            measure_base(&decoded.image.data).filter(|base| *base >= MIN_PLAUSIBLE_BASE)
+        });
     Message::CalibrationBaseMeasured(dir, name, base)
 }
 
@@ -5459,7 +5457,8 @@ mod tests {
     use crate::pipeline::{
         apply_exposure, bake_develop, bake_thumbnail, class_gains, convert_thumbnail, crop_rgba,
         crop_samples, display_source_dims, downsample_thumbnail, downsample_thumbnail_mono,
-        flatten_bayer, luma, resize_area, resized_dims, rotate_quarters, scale_crop, srgb_encode,
+        flatten_bayer_average, flatten_bayer_pixel, luma, resize_area, resized_dims,
+        rotate_quarters, scale_crop, srgb_encode,
     };
 
     fn tile(name: &str) -> Tile {
@@ -5714,11 +5713,15 @@ mod tests {
         let cfa = rawloader::CFA::new("RGGB");
         let samples = [0.60, 0.50, 0.50, 0.40]; // R, G, G, B sites
 
-        let (mono, w, h) = flatten_bayer(&samples, 2, 2, &cfa);
+        let image = flatten_bayer_average(&samples, 2, 2, &cfa);
 
-        assert_eq!((w, h), (1, 1));
-        assert_eq!(mono.len(), 1);
-        assert!((mono[0] - 0.5).abs() < 1e-6, "collapsed to {}", mono[0]);
+        assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!(image.data.len(), 1);
+        assert!(
+            (image.data[0] - 0.5).abs() < 1e-6,
+            "collapsed to {}",
+            image.data[0]
+        );
     }
 
     #[test]
@@ -5727,10 +5730,14 @@ mod tests {
         let cfa = rawloader::CFA::new("GBRG");
         let samples = [0.25, 0.20, 0.30, 0.25]; // G, B, R, G sites
 
-        let (mono, w, h) = flatten_bayer(&samples, 2, 2, &cfa);
+        let image = flatten_bayer_average(&samples, 2, 2, &cfa);
 
-        assert_eq!((w, h), (1, 1));
-        assert!((mono[0] - 0.25).abs() < 1e-6, "collapsed to {}", mono[0]);
+        assert_eq!((image.width, image.height), (1, 1));
+        assert!(
+            (image.data[0] - 0.25).abs() < 1e-6,
+            "collapsed to {}",
+            image.data[0]
+        );
     }
 
     #[test]
@@ -5739,10 +5746,14 @@ mod tests {
         let cfa = rawloader::CFA::new("RGBE");
         let samples = [0.45, 0.50, 0.55, 0.50]; // R, G, B, E sites
 
-        let (mono, w, h) = flatten_bayer(&samples, 2, 2, &cfa);
+        let image = flatten_bayer_average(&samples, 2, 2, &cfa);
 
-        assert_eq!((w, h), (1, 1));
-        assert!((mono[0] - 0.5).abs() < 1e-6, "collapsed to {}", mono[0]);
+        assert_eq!((image.width, image.height), (1, 1));
+        assert!(
+            (image.data[0] - 0.5).abs() < 1e-6,
+            "collapsed to {}",
+            image.data[0]
+        );
     }
 
     #[test]
@@ -5751,9 +5762,9 @@ mod tests {
         // average to exactly that value, whatever the per-class gains.
         let cfa = rawloader::CFA::new("RGGB");
         let samples = [0.30, 0.30, 0.30, 0.30];
-        let (mono, w, h) = flatten_bayer(&samples, 2, 2, &cfa);
-        assert_eq!((w, h), (1, 1));
-        assert!((mono[0] - 0.30).abs() < 1e-6);
+        let image = flatten_bayer_average(&samples, 2, 2, &cfa);
+        assert_eq!((image.width, image.height), (1, 1));
+        assert!((image.data[0] - 0.30).abs() < 1e-6);
     }
 
     #[test]
@@ -5763,10 +5774,31 @@ mod tests {
         // mean of each cell.
         let cfa = rawloader::CFA::new("RGGB");
         let samples = [0.5_f32; 9];
-        let (mono, w, h) = flatten_bayer(&samples, 3, 3, &cfa);
-        assert_eq!((w, h), (2, 2));
-        assert_eq!(mono.len(), 4);
-        assert!(mono.iter().all(|value| (value - 0.5).abs() < 1e-6));
+        let image = flatten_bayer_average(&samples, 3, 3, &cfa);
+        assert_eq!((image.width, image.height), (2, 2));
+        assert_eq!(image.data.len(), 4);
+        assert!(image.data.iter().all(|value| (value - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn flatten_bayer_pixel_normalizes_and_keeps_full_resolution() {
+        // Per-site keeps every photosite; each site is gain-normalized onto the
+        // common base, so a neutral cell reads its transmission everywhere.
+        let cfa = rawloader::CFA::new("RGGB");
+        let samples = [0.60, 0.50, 0.50, 0.40]; // R, G, G, B sites at T = 0.5
+        let image = flatten_bayer_pixel(&samples, 2, 2, &cfa);
+        assert_eq!((image.width, image.height), (2, 2));
+        assert_eq!(image.data.len(), 4);
+        assert!(image.data.iter().all(|value| (value - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn recon_names_round_trip() {
+        for recon in [Recon::Average, Recon::PerSite, Recon::PerSiteDenoise] {
+            assert_eq!(Recon::from_name(recon.as_name()), Some(recon));
+        }
+        assert_eq!(Recon::from_name("nonsense"), None);
+        assert_eq!(Recon::default(), Recon::Average);
     }
 
     #[test]

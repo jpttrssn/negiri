@@ -13,7 +13,8 @@ use crate::exif_writer;
 use crate::film::Develop;
 use crate::fl;
 use crate::pipeline::{
-    DetailDecode, bake_develop, bake_geometry, bake_geometry16, decode_raw_detail, scale_crop,
+    DetailDecode, LinearImage, Recon, bake_develop, bake_geometry, bake_geometry16,
+    decode_raw_detail, scale_crop,
 };
 
 /// A curated export preset: the default combination of format, bit depth, and
@@ -271,6 +272,7 @@ pub(crate) async fn export_frames(
     frames: Vec<(String, Develop, edit_manifest::CropMargins, u8, usize)>,
     options: ExportOptions,
     start_date: Option<String>,
+    recon: Recon,
     mut progress: impl FnMut(usize, usize) + Send,
 ) -> (usize, usize, usize) {
     let mut ok = 0;
@@ -303,6 +305,7 @@ pub(crate) async fn export_frames(
             rotation,
             options,
             start_date.clone(),
+            recon,
         )
         .await
         .is_ok()
@@ -339,6 +342,7 @@ pub(crate) async fn export_one(
     rotation: u8,
     options: ExportOptions,
     start_date: Option<String>,
+    recon: Recon,
 ) -> Result<(), FrameError> {
     let max_edge = options.size.long_edge();
     // True sensor-linear mono (masked-border cropped, downscaled per the size,
@@ -347,14 +351,19 @@ pub(crate) async fn export_one(
     // long edge, so the factor pins how far below native the print is; the
     // film inversion (if any) is applied in the bake below, not in the decode.
     let DetailDecode {
-        mut mono,
-        width,
-        height,
+        image:
+            LinearImage {
+                data: mut mono,
+                width,
+                height,
+                channels: _,
+            },
         src_long_edge,
     } = decode_raw_detail(
         dir.clone(),
         name.clone(),
         if max_edge == 0 { u32::MAX } else { max_edge },
+        recon,
     )
     .await
     .map_err(|err| {
