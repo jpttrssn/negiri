@@ -554,8 +554,10 @@ pub(crate) const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("h / j / k / l", "help-crop-move"),
             ("← ↑ ↓ →", "help-crop-move"),
+            ("drag", "help-crop-drag"),
             ("- / =", "help-crop-resize"),
             ("r / Shift+R", "help-crop-rotate"),
+            ("Shift+drag", "help-crop-pan"),
             ("Shift", "help-crop-nudge"),
             ("c / Esc", "help-crop-exit"),
         ],

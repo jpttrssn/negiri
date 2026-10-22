@@ -240,6 +240,77 @@ impl DetailProgram {
         1.0 + (dw / sc_w).max(dh / sc_h).log2().max(0.0)
     }
 
+    /// Physical pixels per source pixel along each upright source axis for the
+    /// crop-mode full-frame overlay at `zoom` (mirrors `overlay_sample`'s
+    /// contain-fit on the FULL frame). Maps a cursor drag to a crop delta;
+    /// `widget_w`/`widget_h` are the preview's LOGICAL size.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn overlay_phys_per_src(
+        &self,
+        widget_w: f32,
+        widget_h: f32,
+        scale_factor: f32,
+        zoom: f32,
+    ) -> (f32, f32) {
+        let scale = self.overlay_scale(widget_w, widget_h, scale_factor, zoom);
+        let fx = scale * self.width as f32 / self.src_w.max(1) as f32;
+        let fy = scale * self.height as f32 / self.src_h.max(1) as f32;
+        (fx.max(f32::MIN_POSITIVE), fy.max(f32::MIN_POSITIVE))
+    }
+
+    /// The crop window's rectangle in the preview, in LOGICAL points relative to
+    /// the WIDGET CENTER (matching `DetailArea`'s center-relative cursor, so no
+    /// absolute widget origin is needed). Mirrors `overlay_sample`'s crop-box
+    /// layout at the full-frame contain fit + `zoom` + `pan`.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn crop_rect_center(
+        &self,
+        widget_w: f32,
+        widget_h: f32,
+        scale_factor: f32,
+        zoom: f32,
+        pan: cosmic::iced::Point,
+    ) -> Rectangle {
+        let tw = self.width as f32;
+        let th = self.height as f32;
+        let ((cl, ct), (cw, ch)) =
+            crop_uv_geometry(self.crop, self.width, self.height, self.src_w, self.src_h);
+        let (du0, du1, dv0, dv1) = crop_box_display(
+            self.rotation,
+            cl / tw,
+            (cl + cw) / tw,
+            ct / th,
+            (ct + ch) / th,
+        );
+        let (dw, dh) = rotated_dims(tw, th, self.rotation);
+        let scale = self.overlay_scale(widget_w, widget_h, scale_factor, zoom);
+        let rw = dw * scale;
+        let rh = dh * scale;
+        // Widget-center-relative physical corner of the crop box.
+        let x0 = pan.x * scale_factor - rw * 0.5 + du0 * rw;
+        let y0 = pan.y * scale_factor - rh * 0.5 + dv0 * rh;
+        Rectangle {
+            x: x0 / scale_factor,
+            y: y0 / scale_factor,
+            width: (du1 - du0) * rw / scale_factor,
+            height: (dv1 - dv0) * rh / scale_factor,
+        }
+    }
+
+    /// The full-frame overlay's physical-pixels-per-texture-pixel scale at
+    /// `zoom` (the WGSL `scale = contain · 2^(zoom−1)` in `overlay_sample`).
+    #[allow(clippy::cast_precision_loss)]
+    fn overlay_scale(&self, widget_w: f32, widget_h: f32, scale_factor: f32, zoom: f32) -> f32 {
+        let (dw, dh) = rotated_dims(self.width as f32, self.height as f32, self.rotation);
+        let sc_w = (widget_w * scale_factor).max(1.0);
+        let sc_h = (widget_h * scale_factor).max(1.0);
+        let avail_w = (sc_w - 2.0 * self.pad * scale_factor).max(1.0);
+        let avail_h = (sc_h - 2.0 * self.pad * scale_factor).max(1.0);
+        (avail_w / dw).min(avail_h / dh) * (zoom - 1.0).exp2()
+    }
+
     /// Wrap in a `Shader` widget sized to fill the parent.
     pub fn view<M>(&self) -> Shader<M, Self> {
         Shader::new(self.clone())
@@ -323,6 +394,24 @@ impl<M> Program<M> for DetailProgram {
 // ---------------------------------------------------------------------------
 // Crop-geometry pure helpers
 // ---------------------------------------------------------------------------
+
+/// The dims a `w`×`h` frame presents after `rot` counter-clockwise quarter
+/// turns (odd turns swap the axes). Rust mirror of the WGSL `rotated_dims`.
+fn rotated_dims(w: f32, h: f32, rot: u8) -> (f32, f32) {
+    if rot & 1 != 0 { (h, w) } else { (w, h) }
+}
+
+/// The crop sub-rectangle (as fractions of the DISPLAYED frame) after `rot`
+/// quarter turns, given its `u0/u1`/`v0/v1` fractions in the EXIF-upright
+/// frame. Rust mirror of the WGSL `crop_box_display`.
+fn crop_box_display(rot: u8, u0: f32, u1: f32, v0: f32, v1: f32) -> (f32, f32, f32, f32) {
+    match rot & 3 {
+        1 => (v0, v1, 1.0 - u1, 1.0 - u0),
+        2 => (1.0 - u1, 1.0 - u0, 1.0 - v1, 1.0 - v0),
+        3 => (1.0 - v1, 1.0 - v0, u0, u1),
+        _ => (u0, u1, v0, v1),
+    }
+}
 
 /// The live-crop sub-rectangle in **texture space** as `(origin, size)`, both
 /// `(x, y)` pairs, given the source-pixel crop margins, the downscaled texture
@@ -1191,6 +1280,77 @@ mod tests {
 
         // The 1:1 projection is floored at contain fit like the real cap.
         assert!((program.zoom_100_for(1000, 500, 4000.0, 4000.0, 1.0) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn overlay_phys_per_src_scales_the_texture_and_source_axes() {
+        // Texture 1000×500, source 2000×1000 (2× downscale). The full frame
+        // contain-fits a 1000×1000 widget on the width (1000/1000 = 1), so the
+        // overlay scale is 1 physical px per texture px; fx = tex_w/src_w = 0.5,
+        // fy = tex_h/src_h = 0.5.
+        let program = DetailProgram::new(
+            vec![0.0; 1000 * 500],
+            1000,
+            500,
+            crate::film::Develop::with_base(crate::film::DEFAULT_FILM_BASE),
+            CropMargins::default(),
+            0,
+            1,
+            2000,
+        );
+        let (fx, fy) = program.overlay_phys_per_src(1000.0, 1000.0, 1.0, 1.0);
+        assert!((fx - 0.5).abs() < 1e-6, "fx = {fx}");
+        assert!((fy - 0.5).abs() < 1e-6, "fy = {fy}");
+        // One zoom unit doubles the scale (2^(zoom−1)).
+        let (fx2, _) = program.overlay_phys_per_src(1000.0, 1000.0, 1.0, 2.0);
+        assert!((fx2 - 1.0).abs() < 1e-6, "fx2 = {fx2}");
+    }
+
+    #[test]
+    fn crop_rect_center_maps_the_crop_box_and_rotates_with_the_frame() {
+        // Texture 400×300, source 1:1. Crop removes 100px from the left → a
+        // 300×300 box on the right, centered vertically. In a 400×300 widget at
+        // contain (scale 1) the full frame fills it, so center-relative the crop
+        // spans x ∈ [-100, 200], y ∈ [-150, 150].
+        let crop = CropMargins {
+            top: 0,
+            right: 0,
+            bottom: 0,
+            left: 100,
+        };
+        let program = DetailProgram::new(
+            vec![0.0; 400 * 300],
+            400,
+            300,
+            crate::film::Develop::with_base(crate::film::DEFAULT_FILM_BASE),
+            crop,
+            0,
+            1,
+            400,
+        );
+        let rect = program.crop_rect_center(400.0, 300.0, 1.0, 1.0, cosmic::iced::Point::ORIGIN);
+        assert!((rect.x - (-100.0)).abs() < 1e-4, "x = {}", rect.x);
+        assert!((rect.y - (-150.0)).abs() < 1e-4, "y = {}", rect.y);
+        assert!((rect.width - 300.0).abs() < 1e-4, "w = {}", rect.width);
+        assert!((rect.height - 300.0).abs() < 1e-4, "h = {}", rect.height);
+
+        // Rotated 90° the frame presents 300×400 and contain-fits 400×300 at
+        // 0.75 (rw = 225, rh = 300); the crop box lands on the display's bottom.
+        let rotated = DetailProgram::new(
+            vec![0.0; 400 * 300],
+            400,
+            300,
+            crate::film::Develop::with_base(crate::film::DEFAULT_FILM_BASE),
+            crop,
+            1,
+            1,
+            400,
+        );
+        let rect = rotated.crop_rect_center(400.0, 300.0, 1.0, 1.0, cosmic::iced::Point::ORIGIN);
+        assert!((rect.x - (-112.5)).abs() < 1e-4, "x = {}", rect.x);
+        assert!((rect.width - 225.0).abs() < 1e-4, "w = {}", rect.width);
+        assert!((rect.y - (-150.0)).abs() < 1e-4, "y = {}", rect.y);
+        assert!((rect.height - 225.0).abs() < 1e-4, "h = {}", rect.height);
     }
 
     #[test]

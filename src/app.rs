@@ -363,6 +363,9 @@ pub(crate) struct AppModel {
     /// What a live drag on the detail preview is doing, latched at press (`None`
     /// when no button is down).
     detail_drag: Option<DragTarget>,
+    /// Whether the current crop drag actually moved the crop, so release only
+    /// commits (persist + re-bake) after a real move, not a bare click.
+    crop_drag_dirty: bool,
     /// Most recent cursor position over the detail preview, widget-relative
     /// logical points; anchors wheel-zoom at the cursor.
     detail_cursor: Option<Point>,
@@ -1046,8 +1049,10 @@ fn crop_step(shift: bool, percent: u32) -> CropStep {
 /// What a live drag on the detail preview does, latched at press.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum DragTarget {
-    /// Pan the image.
+    /// Pan the image (the detail view; or Shift held in crop mode).
     Pan,
+    /// Move the crop window (crop mode, grabbed inside the crop).
+    MoveCrop,
 }
 
 /// A key event routed from the subscription for mode-aware resolution: the key
@@ -1233,6 +1238,7 @@ impl cosmic::Application for AppModel {
             detail_area_size: None,
             detail_pan: Point::default(),
             detail_drag: None,
+            crop_drag_dirty: false,
             detail_cursor: None,
             histogram_mono: None,
             histogram: None,
@@ -3704,6 +3710,7 @@ impl AppModel {
         self.detail_logged_failure = None;
         self.detail_pan = Point::default();
         self.detail_drag = None;
+        self.crop_drag_dirty = false;
         self.detail_cursor = None;
         // Any held editing key is dead once the detail view (and its edit
         // context) goes away; a late key release will find it clear and no-op
@@ -3801,18 +3808,30 @@ impl AppModel {
         cap.min(NATIVE_ZOOM_THRESHOLD)
     }
 
-    /// The cursor to show over the detail preview: a grab hand once the view is
-    /// zoomed past the contain fit, and a grasping hand while a grab-pan drag is
-    /// active. At fit (or before any zoom) it stays the default arrow.
+    /// The cursor to show over the detail preview. Normal mode: a grab hand
+    /// once the view is zoomed past the contain fit, grasping while a grab-pan
+    /// drag runs, the arrow at fit. Crop mode: a grab hand over the crop window
+    /// (or with Shift, since it pans), grasping while a crop drag runs, and the
+    /// arrow elsewhere.
     ///
     /// Any `zoom > 1.0` already overflows the preview in at least the
     /// constraining axis (`scale = contain_s · 2^(zoom−1) > contain_s`), so
     /// "zoomed" and "able to pan" coincide at that threshold.
     pub(crate) fn detail_cursor_interaction(&self) -> cosmic::iced::mouse::Interaction {
-        detail_cursor_for(
-            self.detail_zoom.0,
-            self.detail_drag == Some(DragTarget::Pan),
-        )
+        use cosmic::iced::mouse::Interaction;
+        let panning = self.detail_drag == Some(DragTarget::Pan);
+        match self.mode() {
+            Mode::Crop => {
+                if self.detail_drag == Some(DragTarget::MoveCrop) {
+                    Interaction::Grabbing
+                } else if panning || self.modifiers.shift() || self.cursor_in_crop() {
+                    Interaction::Grab
+                } else {
+                    Interaction::None
+                }
+            }
+            _ => detail_cursor_for(self.detail_zoom.0, panning),
+        }
     }
 
     /// Recompute the zoom cap and pull the current zoom down to it if it shrank
@@ -4124,11 +4143,7 @@ impl AppModel {
                 if self.detail_drag == Some(DragTarget::Pan)
                     && let Some(prev) = prev
                 {
-                    self.detail_pan.x += pt.x - prev.x;
-                    self.detail_pan.y += pt.y - prev.y;
-                    if let Some(shader) = &mut self.detail_shader {
-                        shader.set_view(self.detail_zoom.0, self.detail_pan);
-                    }
+                    self.pan_view(pt.x - prev.x, pt.y - prev.y);
                 }
             }
             PointerEvent::Release => self.detail_drag = None,
@@ -4136,10 +4151,107 @@ impl AppModel {
         Task::none()
     }
 
+    /// Grab-pans the image by `(dx, dy)` logical points (the image follows the
+    /// cursor 1:1, independent of zoom).
+    fn pan_view(&mut self, dx: f32, dy: f32) {
+        self.detail_pan.x += dx;
+        self.detail_pan.y += dy;
+        if let Some(shader) = &mut self.detail_shader {
+            shader.set_view(self.detail_zoom.0, self.detail_pan);
+        }
+    }
+
     /// A preview drag in crop mode: grabbing inside the crop window moves it;
-    /// Shift-drag pans the image instead.
+    /// Shift-drag pans the image instead; a grab outside the crop (no Shift)
+    /// does nothing. The target is latched at press so a drag that leaves the
+    /// crop mid-way keeps its meaning. Releasing after a real move commits.
     fn on_crop_pointer(&mut self, event: PointerEvent) -> Task<cosmic::Action<Message>> {
-        self.on_view_pointer(event)
+        match event {
+            PointerEvent::Press => {
+                self.detail_drag = self.crop_drag_target();
+                self.crop_drag_dirty = false;
+            }
+            PointerEvent::Move(pt) => {
+                let prev = self.detail_cursor;
+                self.detail_cursor = Some(pt);
+                if let Some(prev) = prev {
+                    match self.detail_drag {
+                        Some(DragTarget::MoveCrop) => {
+                            self.apply_crop_drag(pt.x - prev.x, pt.y - prev.y);
+                        }
+                        Some(DragTarget::Pan) => self.pan_view(pt.x - prev.x, pt.y - prev.y),
+                        None => {}
+                    }
+                }
+            }
+            PointerEvent::Release => {
+                let commit = self.detail_drag == Some(DragTarget::MoveCrop) && self.crop_drag_dirty;
+                self.detail_drag = None;
+                self.crop_drag_dirty = false;
+                if commit {
+                    return self.commit_edit();
+                }
+            }
+        }
+        Task::none()
+    }
+
+    /// The drag target for a press in crop mode: Shift pans; a grab inside the
+    /// crop moves the window; a grab outside it (no Shift) does nothing.
+    fn crop_drag_target(&self) -> Option<DragTarget> {
+        if self.modifiers.shift() {
+            Some(DragTarget::Pan)
+        } else if self.cursor_in_crop() {
+            Some(DragTarget::MoveCrop)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the last reported cursor position lies inside the crop window on
+    /// screen (used for the crop-mode grab cursor and drag target).
+    fn cursor_in_crop(&self) -> bool {
+        let Some(shader) = &self.detail_shader else {
+            return false;
+        };
+        let Some(size) = self.detail_area_size else {
+            return false;
+        };
+        let Some(cursor) = self.detail_cursor else {
+            return false;
+        };
+        let sf = self.core().scale_factor();
+        shader
+            .crop_rect_center(
+                size.width,
+                size.height,
+                sf,
+                self.detail_zoom.0,
+                self.detail_pan,
+            )
+            .contains(cursor)
+    }
+
+    /// Moves the crop window to follow a cursor drag of `(dx, dy)` logical
+    /// points: converts through the crop-mode overlay's scale and the display
+    /// rotation into a source-pixel delta, moves the window (clamped to the
+    /// frame), and writes it live. No-op without a detail shader/size.
+    fn apply_crop_drag(&mut self, dx: f32, dy: f32) {
+        let Some(size) = self.detail_area_size else {
+            return;
+        };
+        let Some(shader) = &self.detail_shader else {
+            return;
+        };
+        let sf = self.core().scale_factor();
+        let (w, h) = shader.source_dimensions();
+        let (fx, fy) = shader.overlay_phys_per_src(size.width, size.height, sf, self.detail_zoom.0);
+        let (move_x, move_y) = crop_drag_delta(self.rotation, (fx, fy), dx, dy, sf);
+        let next = drag_crop_box(self.crop, move_x, move_y, w, h);
+        if next != self.crop {
+            self.crop_drag_dirty = true;
+        }
+        self.apply_crop(next);
     }
 
     /// Moves the browse/detail selection or pages the detail view — the shared
@@ -5428,6 +5540,59 @@ fn rotate_crop_box(
     CropRect::from_margins(crop, width, height)
         .rotated_90_fitted(width, height, MIN_CROP_WINDOW)
         .to_margins(width, height)
+}
+
+/// Shifts the crop window by a signed `(dx, dy)` in source pixels (rounded),
+/// clamped inside the `w` × `h` frame; size and aspect are kept.
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+fn drag_crop_box(
+    crop: edit_manifest::CropMargins,
+    dx: f32,
+    dy: f32,
+    width: u32,
+    height: u32,
+) -> edit_manifest::CropMargins {
+    let rect = CropRect::from_margins(crop, width, height);
+    let max_x = width.saturating_sub(rect.width);
+    let max_y = height.saturating_sub(rect.height);
+    let left = (i64::from(rect.left) + i64::from(dx.round() as i32)).clamp(0, i64::from(max_x));
+    let top = (i64::from(rect.top) + i64::from(dy.round() as i32)).clamp(0, i64::from(max_y));
+    CropRect {
+        left: left as u32,
+        top: top as u32,
+        width: rect.width,
+        height: rect.height,
+    }
+    .to_margins(width, height)
+}
+
+/// Maps a cursor drag `(dx, dy)` in logical points over the crop-mode overlay to
+/// a source-pixel crop delta, given the physical-px-per-source-px scale on each
+/// upright source axis (`fx`/`fy` from
+/// [`shader::DetailProgram::overlay_phys_per_src`]) and the display rotation.
+/// The crop follows the cursor (dragging right moves the window right on
+/// screen); `scale_factor` converts the logical drag to physical pixels.
+#[must_use]
+fn crop_drag_delta(
+    rotation: u8,
+    (fx, fy): (f32, f32),
+    dx: f32,
+    dy: f32,
+    scale_factor: f32,
+) -> (f32, f32) {
+    let dxp = dx * scale_factor;
+    let dyp = dy * scale_factor;
+    match rotation & 3 {
+        1 => (-dyp / fx, dxp / fy),
+        2 => (-dxp / fx, -dyp / fy),
+        3 => (dyp / fx, -dxp / fy),
+        _ => (dxp / fx, dyp / fy),
+    }
 }
 
 /// Maps a develop-step key to a [`ToneAdjust`], or `None` when the key is not a
@@ -7331,6 +7496,58 @@ mod tests {
         assert_eq!(rotated.cropped_height(300), 300);
         assert_eq!(rotated.left, 0);
         assert_eq!(rotated.top, 0);
+    }
+
+    #[test]
+    fn drag_crop_box_shifts_and_clamps_the_window() {
+        // A 200×100 window at (40, 30) in a 400×300 frame.
+        let crop = Marg {
+            top: 30,
+            right: 160,
+            bottom: 170,
+            left: 40,
+        };
+        // Drag right/down by 25: origin moves, size kept.
+        let moved = drag_crop_box(crop, 25.0, 25.0, 400, 300);
+        assert_eq!(moved.left, 65);
+        assert_eq!(moved.top, 55);
+        assert_eq!(moved.cropped_width(400), 200);
+        assert_eq!(moved.cropped_height(300), 100);
+        // A huge drag clamps to the far edge.
+        let far = drag_crop_box(crop, 10_000.0, 10_000.0, 400, 300);
+        assert_eq!(far.left, 200);
+        assert_eq!(far.top, 200);
+        // A negative drag rounds and clamps to the origin.
+        let back = drag_crop_box(moved, -1_000.0, -1_000.0, 400, 300);
+        assert_eq!(back.left, 0);
+        assert_eq!(back.top, 0);
+    }
+
+    #[test]
+    fn crop_drag_delta_matches_the_keyboard_move_directions() {
+        // At 1:1 (fx = fy = 1, no UI scaling) the source delta is the drag
+        // magnitude, so a drag in a screen direction must shift the crop exactly
+        // as the keyboard's matching `MoveDir` does — at every rotation.
+        let crop = Marg {
+            top: 100,
+            right: 100,
+            bottom: 100,
+            left: 100,
+        };
+        let drags = [
+            (MoveDir::Left, -10.0, 0.0),
+            (MoveDir::Right, 10.0, 0.0),
+            (MoveDir::Up, 0.0, -10.0),
+            (MoveDir::Down, 0.0, 10.0),
+        ];
+        for rot in 0..4u8 {
+            for (dir, dx, dy) in drags {
+                let (mx, my) = crop_drag_delta(rot, (1.0, 1.0), dx, dy, 1.0);
+                let dragged = drag_crop_box(crop, mx, my, 400, 300);
+                let keyed = move_crop_box(crop, crop_move_direction(dir, rot), 10, 400, 300);
+                assert_eq!(dragged, keyed, "rot {rot} dir {dir:?}");
+            }
+        }
     }
 
     #[test]
