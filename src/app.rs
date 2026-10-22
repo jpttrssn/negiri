@@ -394,6 +394,9 @@ pub(crate) struct AppModel {
     /// Live keyboard crop margins for the detail view; loaded from the stored
     /// manifest per open and applied to the GPU shader as a uniform UV-remap.
     pub(crate) crop: edit_manifest::CropMargins,
+    /// The crop window's target aspect ratio (the crop margins are the actual
+    /// geometry); loaded per open and shown in the editing panel's dropdown.
+    pub(crate) aspect: edit_manifest::AspectRatio,
     /// Live display rotation for the detail view: cumulative counter-clockwise
     /// 90° quarter-turns (`0`…`3`) on top of the EXIF orientation. Loaded from
     /// the stored manifest per open and applied to the GPU shader as a uniform.
@@ -437,6 +440,9 @@ pub(crate) struct AppModel {
     reset_tone: edit_manifest::ToneEdit,
     /// Crop as it was when the detail panel was opened; `ResetAll` restores it.
     reset_crop: edit_manifest::CropMargins,
+    /// Crop aspect as it was when the detail panel was opened; `ResetAll`
+    /// restores it.
+    reset_aspect: edit_manifest::AspectRatio,
     /// Rotation as it was when the detail panel was opened; `ResetAll`
     /// restores it. Tracked separately from [`Self::rotation`]'s zeroing in
     /// [`Self::clear_detail`] like the other reset snapshots.
@@ -864,6 +870,9 @@ pub(crate) enum Message {
     /// Reset only the crop margins to zero (show the full frame), leaving the
     /// exposure and tone edits untouched, and persist the reset.
     ResetCrop,
+    /// Set the crop window to the given aspect ratio (centered inside the
+    /// current crop) and persist it.
+    SetAspect(edit_manifest::AspectRatio),
     /// The user typed into a roll date field in the roll-info drawer. Carries
     /// the affected field and the new draft text (kept in RAM so typing doesn't
     /// fight a read-only view); persisted by the debounced `RollDraftsCommit`.
@@ -1147,6 +1156,7 @@ impl cosmic::Application for AppModel {
             histogram_dirty: false,
             tone: edit_manifest::ToneEdit::default(),
             crop: edit_manifest::CropMargins::default(),
+            aspect: edit_manifest::AspectRatio::Original,
             roll_date_drafts: RollDateDrafts {
                 key: None,
                 start: String::new(),
@@ -1161,6 +1171,7 @@ impl cosmic::Application for AppModel {
             help_visible: false,
             reset_tone: edit_manifest::ToneEdit::default(),
             reset_crop: edit_manifest::CropMargins::default(),
+            reset_aspect: edit_manifest::AspectRatio::Original,
             reset_rotation: 0,
             clipboard: None,
             next_image_id: 0,
@@ -2020,12 +2031,14 @@ impl cosmic::Application for AppModel {
                 // `EditSave` points persist it).
                 self.tone = self.reset_tone;
                 self.crop = self.reset_crop;
+                self.aspect = self.reset_aspect;
                 self.rotation = self.reset_rotation;
                 if let Some(selected) = &self.selected {
                     self.roll
                         .set_exposure(selected, self.reset_tone.exposure_ev);
                     self.roll.set_develop(selected, self.reset_tone);
                     self.roll.set_crop(selected, self.reset_crop);
+                    self.roll.set_aspect(selected, self.reset_aspect);
                     self.roll.set_rotation(selected, self.reset_rotation);
                 }
                 if let Some(shader) = &mut self.detail_shader {
@@ -2042,13 +2055,29 @@ impl cosmic::Application for AppModel {
             // untouched, and persist the reset immediately.
             Message::ResetCrop => {
                 self.crop = edit_manifest::CropMargins::default();
+                self.aspect = edit_manifest::AspectRatio::Original;
                 if let Some(selected) = &self.selected {
                     self.roll.set_crop(selected, self.crop);
+                    self.roll.set_aspect(selected, self.aspect);
                 }
                 if let Some(shader) = &mut self.detail_shader {
                     shader.set_crop(self.crop);
                 }
                 self.reclamp_detail_zoom();
+                self.commit_edit()
+            }
+
+            // Set the crop window to the chosen aspect ratio, centered inside
+            // the current crop, and persist immediately (like `ResetCrop`).
+            Message::SetAspect(aspect) => {
+                if self.detail_shader.is_none() {
+                    return Task::none();
+                }
+                self.aspect = aspect;
+                self.refit_crop_aspect(edit_manifest::CropMargins::default());
+                if let Some(selected) = &self.selected {
+                    self.roll.set_aspect(selected, aspect);
+                }
                 self.commit_edit()
             }
 
@@ -2864,6 +2893,7 @@ impl AppModel {
             self.clear_detail();
             self.tone = stored_tone;
             self.crop = self.roll.crop(name);
+            self.aspect = self.roll.aspect(name);
             self.rotation = self.roll.rotation(name) & 3;
             // Entering the detail view: the drawer (if the detail's memory says
             // open) shows the editing panel; navigation never closes it.
@@ -2872,6 +2902,7 @@ impl AppModel {
             // manifest values), so Reset reverts here rather than to identity.
             self.reset_tone = stored_tone;
             self.reset_crop = self.crop;
+            self.reset_aspect = self.aspect;
             self.reset_rotation = self.rotation;
         }
 
@@ -3800,12 +3831,14 @@ impl AppModel {
         self.histogram_dirty = false;
         self.tone = edit_manifest::ToneEdit::default();
         self.crop = edit_manifest::CropMargins::default();
+        self.aspect = edit_manifest::AspectRatio::Original;
         self.rotation = 0;
         self.crop_mode = false;
         // The reset snapshot mirrors the live edit values' lifecycle: reset
         // to identity on close; the next `ThumbnailActivated` re-syncs it.
         self.reset_tone = edit_manifest::ToneEdit::default();
         self.reset_crop = edit_manifest::CropMargins::default();
+        self.reset_aspect = edit_manifest::AspectRatio::Original;
         self.reset_rotation = 0;
     }
 
@@ -4266,6 +4299,34 @@ impl AppModel {
         }
         if let Some(shader) = &mut self.detail_shader {
             shader.set_rotation(self.rotation);
+        }
+        // A chosen display ratio is preserved across the rotation by re-fitting
+        // the crop to the new source orientation, bounded to the current crop so
+        // the user's size survives the rotate.
+        if self.aspect != edit_manifest::AspectRatio::Original {
+            self.refit_crop_aspect(self.crop);
+        }
+        self.reclamp_detail_zoom();
+    }
+
+    /// Re-fits the crop window to [`Self::aspect`]'s aspect for the current
+    /// source orientation, centered inside `bound`. No-op without a decoded
+    /// detail shader (no source dims yet).
+    fn refit_crop_aspect(&mut self, bound: edit_manifest::CropMargins) {
+        let Some((w, h)) = self
+            .detail_shader
+            .as_ref()
+            .map(shader::DetailProgram::source_dimensions)
+        else {
+            return;
+        };
+        let next = fit_crop_to_aspect(bound, w, h, self.aspect.source_aspect(w, h, self.rotation));
+        self.crop = next;
+        if let Some(selected) = &self.selected {
+            self.roll.set_crop(selected, next);
+        }
+        if let Some(shader) = &mut self.detail_shader {
+            shader.set_crop(next);
         }
         self.reclamp_detail_zoom();
     }
@@ -5020,14 +5081,6 @@ pub(crate) fn white_density_from_ui(ui: f32) -> f32 {
     *range.start() + *range.end() - ui
 }
 
-/// Translates the crop window by `delta_px` in `direction`, keeping the window
-/// size (and thus aspect) untouched. The window stays clamped inside the source
-/// frame `[0, w] × [0, h]`.
-///
-/// The margins model the window's top-left as `(left, top)` and its bottom-right
-/// as `(w − right, h − bottom)`, so moving the window adjusts the parallel pair
-/// by equal-and-opposite amounts: moving right grows `left` and shrinks `right`,
-/// moving left the reverse, etc.
 /// Maps a screen-space crop move (arrow or `h`/`j`/`k`/`l`) to the EXIF-upright
 /// crop-window direction that produces the same VISUAL movement, given the
 /// display's cumulative counter-clockwise `rotation` quarter-turns.
@@ -5054,6 +5107,82 @@ fn crop_move_direction(dir: MoveDir, rotation: u8) -> edit_manifest::CropDirecti
     }
 }
 
+/// A crop window in source pixels: top-left plus size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CropRect {
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
+}
+
+impl CropRect {
+    /// The window described by `crop`'s margins within a `w` × `h` frame.
+    fn from_margins(crop: edit_manifest::CropMargins, w: u32, h: u32) -> Self {
+        Self {
+            left: crop.left,
+            top: crop.top,
+            width: crop.cropped_width(w).max(1),
+            height: crop.cropped_height(h).max(1),
+        }
+    }
+
+    /// The margins this window leaves in a `w` × `h` frame.
+    fn to_margins(self, w: u32, h: u32) -> edit_manifest::CropMargins {
+        edit_manifest::CropMargins {
+            top: self.top,
+            right: w.saturating_sub(self.left).saturating_sub(self.width),
+            bottom: h.saturating_sub(self.top).saturating_sub(self.height),
+            left: self.left,
+        }
+    }
+
+    /// The largest box of `aspect` (width/height) centered inside this window,
+    /// grown to at least `min_long` on its long edge, clamped into the frame.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn fit_aspect_centered(self, aspect: f32, min_long: u32, frame_w: u32, frame_h: u32) -> Self {
+        let current = self.width as f32 / self.height.max(1) as f32;
+        let aspect = if aspect.is_finite() && aspect > 0.0 {
+            aspect
+        } else {
+            current
+        };
+        let (mut nw, mut nh) = if aspect >= current {
+            (
+                self.width,
+                ((self.width as f32 / aspect).round() as u32).max(1),
+            )
+        } else {
+            (
+                ((self.height as f32 * aspect).round() as u32).max(1),
+                self.height,
+            )
+        };
+        let long = nw.max(nh);
+        if long < min_long {
+            let scale = min_long as f32 / long as f32;
+            nw = ((nw as f32 * scale).round() as u32).clamp(1, frame_w);
+            nh = ((nh as f32 * scale).round() as u32).clamp(1, frame_h);
+        }
+        let left = (i64::from(self.left) + (i64::from(self.width) - i64::from(nw)) / 2)
+            .clamp(0, i64::from(frame_w.saturating_sub(nw))) as u32;
+        let top = (i64::from(self.top) + (i64::from(self.height) - i64::from(nh)) / 2)
+            .clamp(0, i64::from(frame_h.saturating_sub(nh))) as u32;
+        Self {
+            left,
+            top,
+            width: nw,
+            height: nh,
+        }
+    }
+}
+
+/// Translates the crop window by `delta_px` in `direction`, keeping its size
+/// (and thus aspect). The window stays clamped inside the `w` × `h` frame.
 fn move_crop_box(
     crop: edit_manifest::CropMargins,
     direction: edit_manifest::CropDirection,
@@ -5063,32 +5192,37 @@ fn move_crop_box(
 ) -> edit_manifest::CropMargins {
     use edit_manifest::CropDirection::{Bottom, Left, Right, Top};
 
-    let cw = crop.cropped_width(width);
-    let ch = crop.cropped_height(height);
+    let rect = CropRect::from_margins(crop, width, height);
     let (left, top) = match direction {
         Left => (
-            clamp_window_origin(crop.left, delta_px, false, width.saturating_sub(cw)),
-            crop.top,
+            clamp_window_origin(rect.left, delta_px, false, width.saturating_sub(rect.width)),
+            rect.top,
         ),
         Right => (
-            clamp_window_origin(crop.left, delta_px, true, width.saturating_sub(cw)),
-            crop.top,
+            clamp_window_origin(rect.left, delta_px, true, width.saturating_sub(rect.width)),
+            rect.top,
         ),
         Top => (
-            crop.left,
-            clamp_window_origin(crop.top, delta_px, false, height.saturating_sub(ch)),
+            rect.left,
+            clamp_window_origin(
+                rect.top,
+                delta_px,
+                false,
+                height.saturating_sub(rect.height),
+            ),
         ),
         Bottom => (
-            crop.left,
-            clamp_window_origin(crop.top, delta_px, true, height.saturating_sub(ch)),
+            rect.left,
+            clamp_window_origin(rect.top, delta_px, true, height.saturating_sub(rect.height)),
         ),
     };
-    edit_manifest::CropMargins {
-        top,
-        right: width.saturating_sub(left).saturating_sub(cw),
-        bottom: height.saturating_sub(top).saturating_sub(ch),
+    CropRect {
         left,
+        top,
+        width: rect.width,
+        height: rect.height,
     }
+    .to_margins(width, height)
 }
 
 /// Clamps the window origin coordinate after a `delta` move in the given
@@ -5120,9 +5254,8 @@ fn resize_crop_box(
     width: u32,
     height: u32,
 ) -> edit_manifest::CropMargins {
-    let cw = crop.cropped_width(width).max(1);
-    let ch = crop.cropped_height(height).max(1);
-    let long = u32::max(cw, ch);
+    let rect = CropRect::from_margins(crop, width, height);
+    let long = u32::max(rect.width, rect.height);
     let frame_long = u32::max(width, height);
     // Scale factor so the long edge changes by `delta_px`; both axes scale
     // together, preserving the aspect exactly.
@@ -5131,25 +5264,42 @@ fn resize_crop_box(
         f64::from(MIN_CROP_WINDOW) / f64::from(long),
         f64::from(frame_long) / f64::from(long),
     );
-    let nw = (f64::from(cw) * scale).round().clamp(1.0, f64::from(width)) as u32;
-    let nh = (f64::from(ch) * scale)
+    let nw = (f64::from(rect.width) * scale)
+        .round()
+        .clamp(1.0, f64::from(width)) as u32;
+    let nh = (f64::from(rect.height) * scale)
         .round()
         .clamp(1.0, f64::from(height)) as u32;
     // Keep the window's center fixed; recompute margins from it.
-    let cx = f64::from(crop.left) + f64::from(cw) / 2.0;
-    let cy = f64::from(crop.top) + f64::from(ch) / 2.0;
+    let cx = f64::from(rect.left) + f64::from(rect.width) / 2.0;
+    let cy = f64::from(rect.top) + f64::from(rect.height) / 2.0;
     let left = (cx - f64::from(nw) / 2.0)
         .round()
         .clamp(0.0, f64::from(width - nw)) as u32;
     let top = (cy - f64::from(nh) / 2.0)
         .round()
         .clamp(0.0, f64::from(height - nh)) as u32;
-    edit_manifest::CropMargins {
-        top,
-        right: width.saturating_sub(left).saturating_sub(nw),
-        bottom: height.saturating_sub(top).saturating_sub(nh),
+    CropRect {
         left,
+        top,
+        width: nw,
+        height: nh,
     }
+    .to_margins(width, height)
+}
+
+/// Fits the largest box of `aspect` (source-frame width/height) centered inside
+/// the current crop, clamped into the frame and to the minimum crop window.
+#[must_use]
+fn fit_crop_to_aspect(
+    crop: edit_manifest::CropMargins,
+    width: u32,
+    height: u32,
+    aspect: f32,
+) -> edit_manifest::CropMargins {
+    CropRect::from_margins(crop, width, height)
+        .fit_aspect_centered(aspect, MIN_CROP_WINDOW, width, height)
+        .to_margins(width, height)
 }
 
 /// Maps a keyboard shortcut character to an [`EditAdjust`], or `None` when the
@@ -6818,6 +6968,64 @@ mod tests {
         let tiny = resize_crop_box(crop, -10_000, 400, 300);
         assert_eq!(tiny.cropped_width(400), MIN_CROP_WINDOW);
         assert_aspects(tiny, 400, 300);
+    }
+
+    #[test]
+    fn fit_crop_to_aspect_centers_and_matches_the_ratio() {
+        // Full 400×300 frame, target 1:1 → 300×300 centered horizontally.
+        let fit = fit_crop_to_aspect(Marg::default(), 400, 300, 1.0);
+        assert_eq!(fit.cropped_width(400), 300);
+        assert_eq!(fit.cropped_height(300), 300);
+        assert_eq!(fit.left, 50);
+        assert_eq!(fit.top, 0);
+        // 4:5 (0.8) is height-limited: 240×300 centered.
+        let fit = fit_crop_to_aspect(Marg::default(), 400, 300, 0.8);
+        assert_eq!(fit.cropped_height(300), 300);
+        assert_eq!(fit.cropped_width(400), 240);
+        assert_eq!(fit.left, 80);
+    }
+
+    #[test]
+    fn fit_crop_to_aspect_stays_inside_the_current_crop() {
+        // Current crop is a 200×150 box at (100, 75); fitting 1:1 gives a
+        // 150×150 box centered inside it.
+        let crop = Marg {
+            top: 75,
+            right: 100,
+            bottom: 75,
+            left: 100,
+        };
+        let fit = fit_crop_to_aspect(crop, 400, 300, 1.0);
+        assert_eq!(fit.cropped_width(400), 150);
+        assert_eq!(fit.cropped_height(300), 150);
+        assert_eq!(fit.left, 125);
+        assert_eq!(fit.top, 75);
+    }
+
+    #[test]
+    fn fit_crop_to_aspect_grows_to_the_minimum_window() {
+        // A 2×2 crop is smaller than the minimum long edge; the fit grows it.
+        let crop = Marg {
+            top: 0,
+            right: 398,
+            bottom: 298,
+            left: 0,
+        };
+        let fit = fit_crop_to_aspect(crop, 400, 300, 1.0);
+        assert_eq!(fit.cropped_width(400), MIN_CROP_WINDOW);
+        assert_eq!(fit.cropped_height(300), MIN_CROP_WINDOW);
+    }
+
+    #[test]
+    fn fit_crop_to_aspect_honors_a_rotated_display_ratio() {
+        // 3:2 chosen with the display rotated 90° → a 2:3 source box.
+        let aspect = edit_manifest::AspectRatio::R3x2.source_aspect(400, 300, 1);
+        let fit = fit_crop_to_aspect(Marg::default(), 400, 300, aspect);
+        let ratio = fit.cropped_width(400) as f32 / fit.cropped_height(300) as f32;
+        assert!(
+            (ratio - aspect).abs() < 0.02,
+            "source ratio {ratio} != {aspect}"
+        );
     }
 
     #[test]

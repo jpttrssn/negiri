@@ -176,11 +176,10 @@ fn crop_box_display(rot: f32, u0: f32, u1: f32, v0: f32, v1: f32) -> vec4<f32> {
 }
 
 /// The "view dimmed crop area" overlay sample: `inside` is true when the
-/// fragment lies on the full uncropped frame (laid out over the SAME contain-fit
-/// box as the base view, so the mask is always exactly the size of the image),
-/// and `dim` is 1.0 when it falls OUTSIDE the crop rectangle (in that layout) so
-/// [`fs_main`] can darken it. Reuses the same zoom/pan as the base view; the
-/// overlay never re-sizes or re-zooms the image. Any part of the full frame
+/// fragment lies on the full uncropped frame (contain-fit at the frame's own
+/// aspect), and `dim` is 1.0 when it falls OUTSIDE the crop rectangle (in that
+/// layout) so [`fs_main`] can darken it. Reuses the same zoom/pan as the base
+/// view; the overlay never re-sizes the image. Any part of the full frame
 /// beyond the shader region is clipped by the render-pass viewport.
 struct OverlaySample {
     uv: vec2<f32>,
@@ -190,14 +189,13 @@ struct OverlaySample {
 
 fn overlay_sample(frag: vec2<f32>) -> OverlaySample {
     let rot = uniforms.rot;
-    // Contain both axes of the CROPPED frame as DISPLAYED (rotated) — the same
-    // contain-fit box the base view uses — so the dim overlay is always the
-    // same size as the image and covers it exactly, whatever the crop's aspect.
-    // (The overlay still samples the FULL texture over that box; the crop rect
-    // and dim logic are expressed in full-frame fractions, unchanged.) The
-    // crop-mode minimum padding (`uniforms.pad`) shrinks the available box on
-    // every side so the overlay's white margin matches the base view's.
-    let dims = rotated_dims(uniforms.crop_w, uniforms.crop_h, rot);
+    // Contain both axes of the FULL frame as DISPLAYED (rotated), so the full
+    // negative is laid out at its own aspect whatever the crop's aspect (a
+    // cropped frame would stretch it). The crop rectangle is expressed in
+    // full-frame fractions below. The crop-mode minimum padding
+    // (`uniforms.pad`) shrinks the available box on every side so a white
+    // margin surrounds the frame.
+    let dims = rotated_dims(uniforms.tex_w, uniforms.tex_h, rot);
     let avail_w = max(uniforms.sc_w - 2.0 * uniforms.pad, 1.0);
     let avail_h = max(uniforms.sc_h - 2.0 * uniforms.pad, 1.0);
     let contain = min(avail_w / dims.x, avail_h / dims.y);
@@ -294,27 +292,24 @@ fn shade(uv: vec2<f32>) -> f32 {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let frag = input.position.xy;
-    let sample = view_uv(frag);
-    let srgb = shade(sample.uv);
 
-    // When the dim-overlay is on, take the fragment's color from the full-frame
-    // overlay wherever it is on the uncropped frame, darkening outside the crop.
-    var rgb = srgb;
-    var alpha = select(0.0, 1.0, sample.inside);
+    // Crop mode: render only the full-frame dim overlay (the base zoom-crop
+    // view is unused here), so a crop whose aspect differs from the frame can
+    // never bleed into the letterbox/pillarbox bars.
     if uniforms.show_mask != 0.0 {
         let overlay = overlay_sample(frag);
-        if overlay.inside {
-            let overlay_srgb = shade(overlay.uv);
-            // Dim (multiply down) the region outside the crop rectangle.
-            let factor = 1.0 - DIM_AMOUNT * overlay.dim;
-            rgb = overlay_srgb * factor;
-            alpha = 1.0;
-        }
+        // Dim (multiply down) the region inside the frame but outside the crop.
+        let dimmed = shade(overlay.uv) * (1.0 - DIM_AMOUNT * overlay.dim);
+        let alpha = select(0.0, 1.0, overlay.inside);
+        return vec4<f32>(dimmed, dimmed, dimmed, alpha);
     }
 
-    // Outside both the base image rect and any overlay region (letterbox/
+    // Normal mode: the base zoom-crop view. Outside the image rect (letterbox/
     // pillarbox bars at low zoom, the edges revealed while panning, or the
     // trimmed margins), output transparent (alpha=0) so the COSMIC panel
     // background shows through via `BlendState::ALPHA_BLENDING`.
-    return vec4<f32>(rgb, rgb, rgb, alpha);
+    let sample = view_uv(frag);
+    let srgb = shade(sample.uv);
+    let alpha = select(0.0, 1.0, sample.inside);
+    return vec4<f32>(srgb, srgb, srgb, alpha);
 }

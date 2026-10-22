@@ -186,6 +186,10 @@ pub struct EditData {
     /// here. Missing in older manifests stays `0` (no user rotation).
     #[serde(default)]
     pub rotation: u8,
+    /// The crop window's target aspect ratio (the crop margins are the actual
+    /// geometry). Missing in older manifests stays [`AspectRatio::Original`].
+    #[serde(default)]
+    pub aspect: AspectRatio,
 }
 
 impl Default for EditData {
@@ -199,6 +203,7 @@ impl Default for EditData {
             pivot_offset: 0.0,
             crop: CropMargins::default(),
             rotation: 0,
+            aspect: AspectRatio::Original,
         }
     }
 }
@@ -328,6 +333,59 @@ pub enum CropDirection {
     Bottom,
     Left,
     Right,
+}
+
+/// The crop window's target aspect ratio, as a *display-orientation* ratio for
+/// the fixed variants. `Original` keeps the source frame's own aspect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AspectRatio {
+    #[default]
+    Original,
+    #[serde(rename = "3:2")]
+    R3x2,
+    #[serde(rename = "4:3")]
+    R4x3,
+    #[serde(rename = "4:5")]
+    R4x5,
+    #[serde(rename = "1:1")]
+    R1x1,
+}
+
+impl AspectRatio {
+    /// All variants in dropdown order.
+    pub const ALL: [Self; 5] = [
+        Self::Original,
+        Self::R3x2,
+        Self::R4x3,
+        Self::R4x5,
+        Self::R1x1,
+    ];
+
+    /// The display width/height ratio, or `None` for [`Self::Original`].
+    #[must_use]
+    pub fn display_ratio(self) -> Option<f32> {
+        match self {
+            Self::Original => None,
+            Self::R3x2 => Some(3.0 / 2.0),
+            Self::R4x3 => Some(4.0 / 3.0),
+            Self::R4x5 => Some(4.0 / 5.0),
+            Self::R1x1 => Some(1.0),
+        }
+    }
+
+    /// The source-frame width/height aspect that yields this display ratio for
+    /// the given `rotation` (odd quarter-turns swap the display axes). Returns
+    /// the frame's own aspect for [`Self::Original`].
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // frame dims are far below f32's exact range
+    pub fn source_aspect(self, src_w: u32, src_h: u32, rotation: u8) -> f32 {
+        let frame = src_w.max(1) as f32 / src_h.max(1) as f32;
+        match self.display_ratio() {
+            None => frame,
+            Some(ratio) if rotation & 1 == 0 => ratio,
+            Some(ratio) => 1.0 / ratio,
+        }
+    }
 }
 
 /// A film roll directory's app-owned manifest: roll metadata plus per-file
@@ -534,6 +592,10 @@ impl RollManifest {
             .get(name)
             .map_or(CropMargins::default(), |edit| edit.crop);
         let rotation = self.edits.get(name).map_or(0, |edit| edit.rotation);
+        let aspect = self
+            .edits
+            .get(name)
+            .map_or(AspectRatio::Original, |edit| edit.aspect);
         self.edits.insert(
             name.to_owned(),
             EditData {
@@ -544,6 +606,7 @@ impl RollManifest {
                 pivot_offset: quantize(clamp_to(tone.pivot_offset, pivot_range())),
                 crop: existing,
                 rotation,
+                aspect,
             },
         );
     }
@@ -596,6 +659,33 @@ impl RollManifest {
                 EditData {
                     rotation,
                     ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// The crop aspect ratio recorded for `name`; files (or manifest fields)
+    /// never touched fall back to [`AspectRatio::Original`].
+    #[must_use]
+    pub fn aspect(&self, name: &str) -> AspectRatio {
+        self.edits
+            .get(name)
+            .map_or(AspectRatio::Original, |edit| edit.aspect)
+    }
+
+    /// Records the crop aspect ratio for `name`, updating an existing entry in
+    /// place.
+    ///
+    /// RAM-only: the caller flushes to disk via [`save_roll_manifest`].
+    pub fn set_aspect(&mut self, name: &str, aspect: AspectRatio) {
+        if let Some(edit) = self.edits.get_mut(name) {
+            edit.aspect = aspect;
+        } else {
+            self.edits.insert(
+                name.to_owned(),
+                EditData {
+                    aspect,
+                    ..EditData::default()
                 },
             );
         }
@@ -1055,6 +1145,7 @@ mod tests {
             },
         );
         manifest.set_rotation("a.DNG", 2);
+        manifest.set_aspect("a.DNG", AspectRatio::R4x5);
         let pasted = ToneEdit {
             exposure_ev: -0.5,
             contrast: 2.0,
@@ -1065,6 +1156,7 @@ mod tests {
         manifest.set_tone("a.DNG", pasted);
         assert_eq!(manifest.tone("a.DNG"), pasted);
         assert_eq!(manifest.rotation("a.DNG"), 2);
+        assert_eq!(manifest.aspect("a.DNG"), AspectRatio::R4x5);
         assert_eq!(
             manifest.crop("a.DNG"),
             CropMargins {
@@ -1091,12 +1183,33 @@ mod tests {
             },
         );
         manifest.set_rotation("a.DNG", 3);
+        manifest.set_aspect("a.DNG", AspectRatio::R3x2);
         save_roll_manifest(&dir, &manifest).unwrap();
         let loaded = load_roll_manifest(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(loaded.crop("a.DNG").top, 5);
         assert_eq!(loaded.crop("a.DNG").left, 8);
         assert_eq!(loaded.rotation("a.DNG"), 3);
+        assert_eq!(loaded.aspect("a.DNG"), AspectRatio::R3x2);
+        assert_eq!(loaded.aspect("missing.DNG"), AspectRatio::Original);
+    }
+
+    #[test]
+    fn aspect_source_ratios_align_with_rotation() {
+        // Original keeps the frame's own source aspect regardless of rotation.
+        for rotation in 0..4 {
+            let aspect = AspectRatio::Original.source_aspect(6000, 4000, rotation);
+            assert!((aspect - 1.5).abs() < 1e-6, "rot {rotation}: {aspect}");
+        }
+        // A fixed ratio is a display ratio: odd quarter-turns swap the axes.
+        let three_two = AspectRatio::R3x2.display_ratio().unwrap();
+        assert!((AspectRatio::R3x2.source_aspect(6000, 4000, 0) - three_two).abs() < 1e-6);
+        assert!((AspectRatio::R3x2.source_aspect(6000, 4000, 1) - 1.0 / three_two).abs() < 1e-6);
+        assert!((AspectRatio::R3x2.source_aspect(6000, 4000, 2) - three_two).abs() < 1e-6);
+        // 4:5 is portrait (0.8 wide/tall) in display orientation.
+        assert!((AspectRatio::R4x5.display_ratio().unwrap() - 0.8).abs() < 1e-6);
+        assert!((AspectRatio::R4x5.source_aspect(6000, 4000, 1) - 1.25).abs() < 1e-6);
+        assert_eq!(AspectRatio::Original.display_ratio(), None);
     }
 
     #[test]

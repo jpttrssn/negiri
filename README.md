@@ -12,7 +12,7 @@ Currently in Beta and only supports black and white negatives. Config and roll m
 - Film-negative inversion in the optical-density domain: exposure, contrast, black, white, midtone pivot
 - One designated calibration frame per roll sets its clear-film base
 - Histogram with an output/input axis toggle, plus a classic `T(p)` curve overlay
-- Crop mode tuned for removing edges, plus quarter-turn display rotation
+- Crop mode with aspect-ratio presets (Original, 3:2, 4:3, 4:5, 1:1) aligned to display rotation, plus quarter-turn display rotation
 - CFA -> mono reconstruction with per-class gain normalization
   - Decimating 2×2 average (lower read noise/better performance) for the preview
   - Full-resolution per-photosite luminance for exports

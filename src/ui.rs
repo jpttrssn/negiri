@@ -20,7 +20,7 @@ use crate::i18n::fl_dyn;
 use crate::library::{LibraryCell, format_roll_card_dates, library_cell_index, library_cells};
 use cosmic::iced::alignment::{Horizontal, Vertical};
 use cosmic::iced::widget::{Grid, MouseArea, Sensor, Stack, grid};
-use cosmic::iced::{ContentFit, Length};
+use cosmic::iced::{Alignment, ContentFit, Length};
 use cosmic::prelude::*;
 use cosmic::widget::{self, canvas, icon};
 
@@ -319,7 +319,33 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let reset_all = widget::button::standard(fl!("reset-all")).on_press(Message::ResetAll);
     let reset_crop = widget::button::standard(fl!("reset-crop")).on_press(Message::ResetCrop);
 
-    widget::column::with_capacity(24)
+    // Crop aspect-ratio dropdown: each option sets the crop box (centered
+    // inside the current crop) to that ratio in the current display
+    // orientation.
+    let aspect_labels: Vec<String> = edit_manifest::AspectRatio::ALL
+        .iter()
+        .map(|aspect| match aspect {
+            edit_manifest::AspectRatio::Original => fl!("aspect-original"),
+            edit_manifest::AspectRatio::R3x2 => fl!("aspect-3-2"),
+            edit_manifest::AspectRatio::R4x3 => fl!("aspect-4-3"),
+            edit_manifest::AspectRatio::R4x5 => fl!("aspect-4-5"),
+            edit_manifest::AspectRatio::R1x1 => fl!("aspect-1-1"),
+        })
+        .collect();
+    let aspect_selected = edit_manifest::AspectRatio::ALL
+        .iter()
+        .position(|option| *option == app.aspect);
+    let aspect_label = widget::text(fl!("aspect-label"));
+    let aspect_dropdown = widget::dropdown(aspect_labels, aspect_selected, move |index| {
+        Message::SetAspect(
+            edit_manifest::AspectRatio::ALL
+                .get(index)
+                .copied()
+                .unwrap_or_default(),
+        )
+    });
+
+    widget::column::with_capacity(26)
         .push(histogram)
         .push(histogram_toggle)
         .push(label)
@@ -334,7 +360,14 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .push(pivot_slider)
         .push(reset_all)
         .push(widget::divider::horizontal::default())
-        .push(reset_crop)
+        .push(
+            widget::Row::with_capacity(2)
+                .push(aspect_label)
+                .push(aspect_dropdown)
+                .push(reset_crop)
+                .spacing(space_s)
+                .align_y(Alignment::Center),
+        )
         .spacing(space_s)
         .width(Length::Fill)
         .into()
@@ -1083,11 +1116,22 @@ fn tile_view(tile: &Tile, selected: bool, is_calibration_frame: bool) -> Element
     // (no cropping); placeholders stay centered in the same sheet. The frame
     // name now lives in the frame-info context drawer (its title), not on the
     // tile.
+    //
+    // The image is clipped to the theme radius so a crop whose aspect fills the
+    // square cell (e.g. 1:1) cannot bleed past the tile's rounded corners; an
+    // inset (non-square) frame never reaches the corners, so this is a no-op
+    // for it.
+    let radius: cosmic::iced::border::Radius = cosmic::theme::active()
+        .cosmic()
+        .corner_radii
+        .radius_s
+        .into();
     let content: Element<'_, Message> = match &tile.thumb {
         Thumb::Ready(handle) => widget::image(handle.clone())
             .width(Length::Fill)
             .height(Length::Fill)
             .content_fit(ContentFit::Contain)
+            .border_radius(radius)
             .into(),
         Thumb::Loading => widget::container(icon::from_name("image-loading-symbolic").icon())
             .width(Length::Fill)
