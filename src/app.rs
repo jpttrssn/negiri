@@ -259,9 +259,9 @@ pub(crate) struct AppModel {
     /// frame in/out of the multi-selection) or a Shift+click (range), since
     /// iced's `MouseArea` delivers no modifier info.
     modifiers: keyboard::Modifiers,
-    /// Whether an editing shortcut key (an `AdjustEdit` character) is currently
-    /// held. Keyboard steps mutate the live preview (RAM + shader) on every
-    /// press/repeat like a slider drag, and commit once when the key is
+    /// Whether an editing shortcut key (one that resolves to an `Action`) is
+    /// currently held. Keyboard steps mutate the live preview (RAM + shader) on
+    /// every press/repeat like a slider drag, and commit once when the key is
     /// released — mirroring the slider's drag/release cadence instead of
     /// persisting + re-baking the thumbnail per auto-repeated press.
     editing_key_held: bool,
@@ -360,8 +360,9 @@ pub(crate) struct AppModel {
     detail_area_size: Option<Size>,
     /// Pan offset of the image center from the widget center (logical points).
     pub(crate) detail_pan: Point,
-    /// True while the user is pressing/dragging the detail preview (grab-pan).
-    detail_panning: bool,
+    /// What a live drag on the detail preview is doing, latched at press (`None`
+    /// when no button is down).
+    detail_drag: Option<DragTarget>,
     /// Most recent cursor position over the detail preview, widget-relative
     /// logical points; anchors wheel-zoom at the cursor.
     detail_cursor: Option<Point>,
@@ -782,10 +783,11 @@ pub(crate) enum Message {
     OpenSelected,
     /// A roll tile was double-clicked — drill into its frame grid.
     RollActivated(PathBuf),
-    /// Arrow-key navigation. On the library page it moves the roll selection;
-    /// inside an open roll it moves the frame highlight, or pages the detail
-    /// view left/right when one is open.
-    Nav(MoveDir),
+    /// A mode-dependent key press or release, resolved against the current
+    /// [`Mode`] in `on_key` (navigation, develop stepping, crop move/resize,
+    /// rotation). The subscription emits this for every non-control key; the
+    /// handler decides what it means (or ignores it) per mode.
+    Key(KeyInput),
     /// A frame tile was single-clicked — select it (accent ring) without
     /// opening the detail view. Honors the current modifier state: a plain
     /// click clears and selects, Ctrl+click toggles membership, Shift+click
@@ -833,14 +835,6 @@ pub(crate) enum Message {
     DetailFadeTick,
     /// The user moved the exposure slider.
     ExposureChanged(f32),
-    /// A keyboard shortcut adjusted one of the editing controls by a signed
-    /// delta (positive = increase). Routes through the same RAM + live-shader
-    /// path as the matching slider; no-op unless a detail view is open.
-    AdjustEdit(EditAdjust),
-    /// An editing-shortcut key was released: commit any keyboard adjustments
-    /// made while it was held (persist + re-bake), mirroring the slider's
-    /// release commit instead of committing per auto-repeated press.
-    EditKeyReleased,
     /// Wheel-scroll zoom in the detail view; payload is the change in zoom
     /// units (log2 of the scale ratio), positive = zoom in, negative = out.
     DetailZoom(f32),
@@ -854,13 +848,9 @@ pub(crate) enum Message {
     WindowResized(Size),
     /// The mounted grid's laid-out size changed (window resize or drawer toggle).
     GridResized(Size),
-    /// The user pressed the mouse on the detail preview — grab-pan begins.
-    DetailPanPress,
-    /// The cursor moved over the detail preview; while panning this shifts
-    /// the image. Carries the widget-relative cursor position (logical points).
-    DetailPanMove(Point),
-    /// The mouse was released or left the preview — grab-pan ends.
-    DetailPanRelease,
+    /// A mouse event over the detail preview (press / center-relative move /
+    /// release), resolved against the current [`Mode`] in `on_pointer`.
+    Pointer(PointerEvent),
     /// The live density develop shape changed: new contrast, black, white, and
     /// midtone pivot. Applies to the shader as uniform-only updates.
     DevelopChanged(f32, f32, f32, f32),
@@ -964,29 +954,54 @@ pub(crate) enum MoveDir {
     Down,
 }
 
-/// A single editing-control adjustment from a keyboard shortcut: which control
-/// and the signed delta to apply (positive = increase). The step (coarse vs
-/// nudge) is resolved at construction by `edit_adjust_for`, so the handler
-/// only clamps against the control's range and applies. Deltas are in each
-/// control's UI axis (what the slider drags), not necessarily its stored
+/// The interaction mode the app is in, derived from the open views (no stored
+/// state): a detail view is open with crop mode on (`Crop`), a detail view is
+/// open (`Detail`), or neither (`Browse` — the library page or the bare frame
+/// grid). Key and pointer events resolve against it in one place.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mode {
+    Browse,
+    Detail,
+    Crop,
+}
+
+/// A resolved user intent, independent of the physical input that produced it.
+/// The subscription emits neutral [`Message::Key`]/[`Message::Pointer`] events;
+/// `on_key`/`on_pointer` resolve them against the current [`Mode`] into an
+/// `Action`, which the `apply_action` dispatch turns into a model effect. This
+/// keeps mode handling out of the input mapping and the input out of the
+/// effects.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Action {
+    /// Move the browse/detail selection or page the detail view.
+    Navigate(MoveDir),
+    /// Step one of the numeric develop controls.
+    Tone(ToneAdjust),
+    /// Rotate the display one quarter-turn counter-clockwise.
+    RotateDisplay,
+    /// Rotate the crop window one quarter-turn (swap its aspect, fit to frame).
+    RotateCrop,
+    /// Move the crop window; `dir` is the on-screen direction.
+    MoveCrop(MoveDir, CropStep),
+    /// Resize the crop window about its center.
+    ResizeCrop(ResizeCrop, CropStep),
+}
+
+/// A single numeric develop-control adjustment from a keyboard shortcut: which
+/// control and the signed delta to apply (positive = increase). The step
+/// (coarse vs nudge) is resolved at construction by `tone_action`, so the
+/// handler only clamps against the control's range and applies. Deltas are in
+/// each control's UI axis (what the slider drags), not necessarily its stored
 /// domain: Contrast carries a stop lift (converted to a power) and White an
 /// inverted-axis value (converted to the density anchor); see
-/// `apply_edit_adjust`.
+/// `apply_tone_adjust`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum EditAdjust {
+enum ToneAdjust {
     Exposure(f32),
     Contrast(f32),
     Black(f32),
     White(f32),
     Pivot(f32),
-    /// Rotate the display one quarter-turn counter-clockwise (a discrete step,
-    /// no delta payload; unlike the numeric adjusts it doesn't hold-repeat a
-    /// magnitude, but the edit-key machinery still commits on release).
-    RotateCcw,
-    /// Rotate the crop window one quarter-turn (swap its aspect, fit to the
-    /// frame), independent of the display rotation. A discrete step like
-    /// [`EditAdjust::RotateCcw`].
-    RotateCrop,
 }
 
 /// Crop-window resize direction: which way a `-`/`=` press scales the window.
@@ -1016,6 +1031,43 @@ impl CropStep {
             Self::Pixels(px) => px,
         }
     }
+}
+
+/// The step a crop move/resize key applies: the resolution-relative percentage
+/// for a bare key, the fixed 1px nudge with Shift.
+fn crop_step(shift: bool, percent: u32) -> CropStep {
+    if shift {
+        CropStep::Pixels(CROP_NUDGE_PX)
+    } else {
+        CropStep::Percent(percent)
+    }
+}
+
+/// What a live drag on the detail preview does, latched at press.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DragTarget {
+    /// Pan the image.
+    Pan,
+}
+
+/// A key event routed from the subscription for mode-aware resolution: the key
+/// plus the modifier state and whether it is a press or release. Control is
+/// filtered at the subscription, so it is not carried here.
+#[derive(Debug, Clone)]
+pub(crate) struct KeyInput {
+    key: keyboard::Key,
+    alt: bool,
+    shift: bool,
+    release: bool,
+}
+
+/// A mouse event over the detail preview. `Move` carries the cursor position
+/// relative to the widget center in logical points, matching the pan offset.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PointerEvent {
+    Press,
+    Move(Point),
+    Release,
 }
 
 /// Create a COSMIC application from the app model
@@ -1180,7 +1232,7 @@ impl cosmic::Application for AppModel {
             detail_zoom: Zoom::CONTAIN,
             detail_area_size: None,
             detail_pan: Point::default(),
-            detail_panning: false,
+            detail_drag: None,
             detail_cursor: None,
             histogram_mono: None,
             histogram: None,
@@ -1590,21 +1642,14 @@ impl cosmic::Application for AppModel {
             // so this subscription only maps the app-specific keys below.
             //
             // `Subscription::filter_map` requires a NON-CAPTURING (zero-sized)
-            // closure, so the crop-mode routing below cannot read `self` — it
-            // maps key events unconditionally and the message handlers do the
-            // crop-mode gating (`Message::Nav` and `Message::AdjustEdit`).
+            // closure, so the mode-aware routing cannot read `self` — every
+            // non-control key is forwarded as a neutral [`Message::Key`] and the
+            // update handler resolves it against the current mode.
             keyboard::listen().filter_map(|event| match event {
                 keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(named),
+                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
                     ..
-                } => match named {
-                    keyboard::key::Named::Enter => Some(Message::OpenSelected),
-                    keyboard::key::Named::ArrowLeft => Some(Message::Nav(MoveDir::Left)),
-                    keyboard::key::Named::ArrowRight => Some(Message::Nav(MoveDir::Right)),
-                    keyboard::key::Named::ArrowUp => Some(Message::Nav(MoveDir::Up)),
-                    keyboard::key::Named::ArrowDown => Some(Message::Nav(MoveDir::Down)),
-                    _ => None,
-                },
+                } => Some(Message::OpenSelected),
                 // Track the held modifier state (Ctrl/Shift/Alt) delivered by
                 // the platform so frame clicks can decide their selection
                 // behavior — iced's `MouseArea` carries no modifier info.
@@ -1676,59 +1721,25 @@ impl cosmic::Application for AppModel {
                 } if !modifiers.control() && !repeat && modifiers.shift() && character == "/" => {
                     Some(Message::ToggleHelp)
                 }
-                // VIM-style navigation: bare `h`/`j`/`k`/`l` mirror the arrow keys via the
-                // same `Nav` message — navigating outside crop mode, moving the
-                // crop window inside it (Shift handled by `Nav`; repeats like
-                // arrows).
-                keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(character),
-                    modifiers,
-                    ..
-                } if !modifiers.control() && character == "h" => Some(Message::Nav(MoveDir::Left)),
-                keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(character),
-                    modifiers,
-                    ..
-                } if !modifiers.control() && character == "j" => Some(Message::Nav(MoveDir::Down)),
-                keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(character),
-                    modifiers,
-                    ..
-                } if !modifiers.control() && character == "k" => Some(Message::Nav(MoveDir::Up)),
-                keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(character),
-                    modifiers,
-                    ..
-                } if !modifiers.control() && character == "l" => Some(Message::Nav(MoveDir::Right)),
-                // Editing shortcuts: bare (no Ctrl) keys that map to one of the
-                // editing controls; holding Shift switches to the fine nudge
-                // step. Mapped unconditionally — the `AdjustEdit` handler gates
-                // on crop mode (which reinterprets `-`/`=` as crop resize and
-                // allows `r`/Shift+`r`, ignoring the numeric tone keys) and
-                // no-ops without a detail view.
-                keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(character),
-                    modifiers,
-                    ..
-                } if !modifiers.control() => {
-                    edit_adjust_for(character.as_str(), modifiers.alt(), modifiers.shift())
-                        .map(Message::AdjustEdit)
+                // Everything else — the arrow/VIM movement keys, the develop-step
+                // keys, `r`/Shift+`r` — is forwarded for mode-aware resolution.
+                // Presses and releases both flow through so the held-edit-key
+                // commit stays on release.
+                keyboard::Event::KeyPressed { key, modifiers, .. } if !modifiers.control() => {
+                    Some(Message::Key(KeyInput {
+                        key,
+                        alt: modifiers.alt(),
+                        shift: modifiers.shift(),
+                        release: false,
+                    }))
                 }
-                // Releasing an editing-shortcut key ends the hold: commit the
-                // adjustments made while it was down (one persist + re-bake per
-                // hold, not per auto-repeated press). Only fires for keys that
-                // actually map to an editing control, so releasing a modifier
-                // or a non-edit character stays a no-op. The update handler
-                // ignores the release if no editing key is recorded as held.
-                keyboard::Event::KeyReleased {
-                    key: keyboard::Key::Character(character),
-                    modifiers,
-                    ..
-                } if !modifiers.control()
-                    && edit_adjust_for(character.as_str(), modifiers.alt(), modifiers.shift())
-                        .is_some() =>
-                {
-                    Some(Message::EditKeyReleased)
+                keyboard::Event::KeyReleased { key, modifiers, .. } if !modifiers.control() => {
+                    Some(Message::Key(KeyInput {
+                        key,
+                        alt: modifiers.alt(),
+                        shift: modifiers.shift(),
+                        release: true,
+                    }))
                 }
                 _ => None,
             }),
@@ -1916,65 +1927,12 @@ impl cosmic::Application for AppModel {
 
             Message::ExposureChanged(ev) => {
                 // RAM-only until an edit flush point; the shader stays live.
-                // Shared with the keyboard `AdjustEdit` path via `set_exposure`.
+                // Shared with the keyboard `Action` path via `set_exposure`.
                 self.set_exposure(ev);
                 self.request_histogram()
             }
 
-            Message::AdjustEdit(adjust) => {
-                // Keyboard shortcuts only make sense while a detail view (and
-                // its editing controls) are on screen.
-                //
-                // Crop mode is a focused modal state: the h/j/k/l keys MOVE the
-                // crop window, `-`/`=` (which normally adjust exposure) RESIZE
-                // it about its center, and `r`/Shift+`r` still rotate the
-                // display/crop (useful while framing). Every OTHER edit key is
-                // inert inside it. Blocked adjusts never set `editing_key_held`,
-                // so a later key release stays a no-op instead of committing a
-                // stale hold.
-                if self.crop_mode {
-                    match adjust {
-                        EditAdjust::Exposure(ev) => {
-                            let step = if self.modifiers.shift() {
-                                CropStep::Pixels(CROP_NUDGE_PX)
-                            } else {
-                                CropStep::Percent(CROP_RESIZE_STEP_PCT)
-                            };
-                            self.editing_key_held = true;
-                            let resize = if ev < 0.0 {
-                                ResizeCrop::Shrink
-                            } else {
-                                ResizeCrop::Expand
-                            };
-                            self.apply_crop_resize(resize, step);
-                        }
-                        EditAdjust::RotateCcw | EditAdjust::RotateCrop => {
-                            self.editing_key_held = true;
-                            self.apply_edit_adjust(adjust);
-                        }
-                        _ => {}
-                    }
-                    return Task::none();
-                }
-                // Every other adjust acts as usual.
-                self.editing_key_held = true;
-                self.apply_edit_adjust(adjust);
-                self.request_histogram()
-            }
-
-            Message::EditKeyReleased => {
-                // The held editing key was released: commit the adjustments
-                // made while it was down exactly once (persist + re-bake tile
-                // + cover), mirroring the slider's `EditSave` on release. If
-                // nothing was held (stray release, or a release after the
-                // detail view closed) this is a no-op.
-                if self.editing_key_held {
-                    self.editing_key_held = false;
-                    self.commit_edit()
-                } else {
-                    Task::none()
-                }
-            }
+            Message::Pointer(event) => self.on_pointer(event),
 
             Message::DetailZoom(delta) => {
                 let (new_zoom, new_pan) = apply_detail_zoom(
@@ -2027,37 +1985,10 @@ impl cosmic::Application for AppModel {
                 Task::batch([self.decode_next(), self.decode_covers()])
             }
 
-            Message::DetailPanPress => {
-                self.detail_panning = true;
-                Task::none()
-            }
-
-            Message::DetailPanMove(pt) => {
-                let prev = self.detail_cursor;
-                self.detail_cursor = Some(pt);
-                if self.detail_panning
-                    && let Some(prev) = prev
-                {
-                    // Grab-pan: the image follows the cursor 1:1 in logical
-                    // points, independent of zoom.
-                    self.detail_pan.x += pt.x - prev.x;
-                    self.detail_pan.y += pt.y - prev.y;
-                    if let Some(shader) = &mut self.detail_shader {
-                        shader.set_view(self.detail_zoom.0, self.detail_pan);
-                    }
-                }
-                Task::none()
-            }
-
-            Message::DetailPanRelease => {
-                self.detail_panning = false;
-                Task::none()
-            }
-
             Message::DevelopChanged(contrast, black, white, pivot) => {
                 // RAM-only until an edit flush point (slider `on_release`,
                 // `DetailClosed`, window close) — same lifecycle as exposure.
-                // Shared with the keyboard `AdjustEdit` path via `set_develop`.
+                // Shared with the keyboard `Action` path via `set_develop`.
                 self.set_develop_shape(contrast, black, white, pivot);
                 self.request_histogram()
             }
@@ -2331,92 +2262,7 @@ impl cosmic::Application for AppModel {
                 }
             }
 
-            Message::Nav(dir) => {
-                // Crop mode is a focused, VIM-like modal state: arrow keys MOVE
-                // the crop window (Left/Right/Up/Down) instead of paging frames
-                // or moving a grid highlight, which stay disabled while it is
-                // on. Outside crop mode the arrows page the detail view or move
-                // the grid highlight as usual.
-                if self.crop_mode {
-                    // The move direction is expressed visually: pressing ← moves
-                    // the crop window left on screen even when the frame is
-                    // rotated (`crop_move_direction` compensates for the CCW
-                    // display rotation).
-                    let direction = crop_move_direction(dir, self.rotation);
-                    let step = if self.modifiers.shift() {
-                        CropStep::Pixels(CROP_NUDGE_PX)
-                    } else {
-                        CropStep::Percent(CROP_STEP_PCT)
-                    };
-                    self.editing_key_held = true;
-                    self.apply_crop_move(direction, step);
-                    return Task::none();
-                }
-                if self.active.is_some() {
-                    // Inside a roll. With the detail view open, Left/Right page
-                    // through the frames; on the bare grid they move the
-                    // highlight.
-                    if self.selected.is_some() {
-                        let current = self
-                            .selected
-                            .as_ref()
-                            .and_then(|name| self.tiles.iter().position(|tile| tile.name == *name));
-                        if let Some(target) =
-                            current.and_then(|idx| paginate(idx, self.tiles.len(), dir))
-                        {
-                            let name = self.tiles[target].name.clone();
-                            return self.open_frame(&name);
-                        }
-                        return Task::none();
-                    }
-
-                    // Bare frame grid: move the highlight, then reveal it if it
-                    // stepped out of the viewport.
-                    let selected = self
-                        .frame_selected
-                        .as_ref()
-                        .and_then(|name| self.tiles.iter().position(|tile| tile.name == *name));
-                    let len = self.tiles.len();
-                    let cols = self.nav_cols();
-                    if let Some(target) = nav_target(selected, len, cols, dir) {
-                        let name = self.tiles[target].name.clone();
-                        self.frame_selected = Some(name.clone());
-                        // Shift+arrow extends the multi-selection (keeping it
-                        // additive); a plain arrow collapses to the new primary.
-                        if self.modifiers.shift() {
-                            self.selected_frames.insert(name.clone());
-                        } else {
-                            self.selected_frames.clear();
-                            self.selected_frames.insert(name.clone());
-                        }
-                        self.selection_anchor = Some(name.clone());
-                        return Task::batch([
-                            self.scroll_selection_into_view("frames-grid", target, len, cols),
-                            self.ensure_frame_info_loaded().unwrap_or_else(Task::none),
-                        ]);
-                    }
-                    return Task::none();
-                }
-
-                // Library grid: move the selection over every visible cell —
-                // the leading Add Roll tile (only when no search is active),
-                // then the filtered rolls — and reveal it out of the viewport.
-                // While a search is active the Add Roll tile is hidden, so an
-                // empty match set yields no destination at all.
-                let cells = library_cells(
-                    &self.rolls,
-                    self.search_filter.as_deref().unwrap_or(""),
-                    &self.month_aliases,
-                );
-                let selected = library_cell_index(self.library_selection.as_ref(), &cells);
-                let len = cells.len();
-                let cols = self.nav_cols();
-                if let Some(target) = nav_target(selected, len, cols, dir) {
-                    self.set_library_selection(cells[target].selection());
-                    return self.scroll_selection_into_view("rolls-grid", target, len, cols);
-                }
-                Task::none()
-            }
+            Message::Key(input) => self.on_key(&input),
 
             Message::FrameSelected(name) => {
                 // The clicked tile is always the keyboard focus / primary, even
@@ -3455,9 +3301,9 @@ impl AppModel {
 
     /// Commits the open frame's edits: persists the RAM manifest to disk, then
     /// re-bakes the affected grid tile + roll cover. This is the single commit
-    /// point shared by slider release (`EditSave`), keyboard-shortcut release
-    /// (`EditKeyReleased`), and the discrete crop commits (typed margin submit,
-    /// reset crop). Editing steps themselves mutate live (RAM + shader) only;
+    /// point shared by slider release (`EditSave`), held-edit-key release
+    /// (`Message::Key` release), and the discrete crop commits (typed margin
+    /// submit, reset crop). Editing steps mutate live (RAM + shader) only;
     /// the commit happens once per interaction, like a slider drag/release.
     fn commit_edit(&mut self) -> Task<cosmic::Action<Message>> {
         self.persist_roll();
@@ -3857,11 +3703,11 @@ impl AppModel {
         self.detail_native_queued = false;
         self.detail_logged_failure = None;
         self.detail_pan = Point::default();
-        self.detail_panning = false;
+        self.detail_drag = None;
         self.detail_cursor = None;
         // Any held editing key is dead once the detail view (and its edit
-        // context) goes away; a late `EditKeyReleased` will find it clear and
-        // no-op rather than committing a stale selection.
+        // context) goes away; a late key release will find it clear and no-op
+        // rather than committing a stale selection.
         self.editing_key_held = false;
         self.histogram_mono = None;
         self.histogram = None;
@@ -3963,7 +3809,10 @@ impl AppModel {
     /// constraining axis (`scale = contain_s · 2^(zoom−1) > contain_s`), so
     /// "zoomed" and "able to pan" coincide at that threshold.
     pub(crate) fn detail_cursor_interaction(&self) -> cosmic::iced::mouse::Interaction {
-        detail_cursor_for(self.detail_zoom.0, self.detail_panning)
+        detail_cursor_for(
+            self.detail_zoom.0,
+            self.detail_drag == Some(DragTarget::Pan),
+        )
     }
 
     /// Recompute the zoom cap and pull the current zoom down to it if it shrank
@@ -4176,9 +4025,191 @@ impl AppModel {
             .map(cosmic::Action::App)
     }
 
+    /// The current interaction mode, derived from the open views (no stored
+    /// state): a detail view with crop mode on, a detail view, or neither.
+    fn mode(&self) -> Mode {
+        if self.selected.is_some() {
+            if self.crop_mode {
+                Mode::Crop
+            } else {
+                Mode::Detail
+            }
+        } else {
+            Mode::Browse
+        }
+    }
+
+    /// Resolves a key press/release against the current mode. A release that
+    /// maps to an action ends the held-edit-key hold (commit once); a press
+    /// applies the action, or does nothing when the key is inert in this mode.
+    fn on_key(&mut self, input: &KeyInput) -> Task<cosmic::Action<Message>> {
+        let mode = self.mode();
+        let action = key_action(mode, &input.key, input.alt, input.shift);
+        if input.release {
+            return if action.is_some() {
+                self.end_edit_key()
+            } else {
+                Task::none()
+            };
+        }
+        match action {
+            Some(action) => self.apply_action(action),
+            None => Task::none(),
+        }
+    }
+
+    /// Applies a resolved action. Every editing action marks the edit key held
+    /// and mutates RAM + the live shader only; the key release commits (see
+    /// [`Self::end_edit_key`]).
+    fn apply_action(&mut self, action: Action) -> Task<cosmic::Action<Message>> {
+        match action {
+            Action::Navigate(dir) => return self.navigate(dir),
+            Action::Tone(adjust) => {
+                self.editing_key_held = true;
+                self.apply_tone_adjust(adjust);
+                return self.request_histogram();
+            }
+            Action::RotateDisplay => {
+                self.editing_key_held = true;
+                self.apply_rotate_ccw();
+            }
+            Action::RotateCrop => {
+                self.editing_key_held = true;
+                self.apply_crop_rotate();
+            }
+            Action::MoveCrop(dir, step) => {
+                // The move direction is expressed visually: pressing ← moves
+                // the crop window left on screen even when the frame is rotated
+                // (`crop_move_direction` compensates for the CCW display turn).
+                self.editing_key_held = true;
+                let direction = crop_move_direction(dir, self.rotation);
+                self.apply_crop_move(direction, step);
+            }
+            Action::ResizeCrop(resize, step) => {
+                self.editing_key_held = true;
+                self.apply_crop_resize(resize, step);
+            }
+        }
+        Task::none()
+    }
+
+    /// The held editing key was released: commit the adjustments made while it
+    /// was down exactly once (persist + re-bake), mirroring the slider's
+    /// `EditSave` on release. No-op when nothing was held (a stray release).
+    fn end_edit_key(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.editing_key_held {
+            self.editing_key_held = false;
+            self.commit_edit()
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Resolves a pointer event against the current mode.
+    fn on_pointer(&mut self, event: PointerEvent) -> Task<cosmic::Action<Message>> {
+        match self.mode() {
+            Mode::Crop => self.on_crop_pointer(event),
+            _ => self.on_view_pointer(event),
+        }
+    }
+
+    /// A preview drag in the detail view: grab-pan the image 1:1 with the
+    /// cursor in logical points, independent of zoom.
+    fn on_view_pointer(&mut self, event: PointerEvent) -> Task<cosmic::Action<Message>> {
+        match event {
+            PointerEvent::Press => self.detail_drag = Some(DragTarget::Pan),
+            PointerEvent::Move(pt) => {
+                let prev = self.detail_cursor;
+                self.detail_cursor = Some(pt);
+                if self.detail_drag == Some(DragTarget::Pan)
+                    && let Some(prev) = prev
+                {
+                    self.detail_pan.x += pt.x - prev.x;
+                    self.detail_pan.y += pt.y - prev.y;
+                    if let Some(shader) = &mut self.detail_shader {
+                        shader.set_view(self.detail_zoom.0, self.detail_pan);
+                    }
+                }
+            }
+            PointerEvent::Release => self.detail_drag = None,
+        }
+        Task::none()
+    }
+
+    /// A preview drag in crop mode: grabbing inside the crop window moves it;
+    /// Shift-drag pans the image instead.
+    fn on_crop_pointer(&mut self, event: PointerEvent) -> Task<cosmic::Action<Message>> {
+        self.on_view_pointer(event)
+    }
+
+    /// Moves the browse/detail selection or pages the detail view — the shared
+    /// arrow/VIM navigation path.
+    fn navigate(&mut self, dir: MoveDir) -> Task<cosmic::Action<Message>> {
+        if self.active.is_some() {
+            // Inside a roll. With the detail view open, Left/Right page
+            // through the frames; on the bare grid they move the highlight.
+            if self.selected.is_some() {
+                let current = self
+                    .selected
+                    .as_ref()
+                    .and_then(|name| self.tiles.iter().position(|tile| tile.name == *name));
+                if let Some(target) = current.and_then(|idx| paginate(idx, self.tiles.len(), dir)) {
+                    let name = self.tiles[target].name.clone();
+                    return self.open_frame(&name);
+                }
+                return Task::none();
+            }
+
+            // Bare frame grid: move the highlight, then reveal it if it stepped
+            // out of the viewport.
+            let selected = self
+                .frame_selected
+                .as_ref()
+                .and_then(|name| self.tiles.iter().position(|tile| tile.name == *name));
+            let len = self.tiles.len();
+            let cols = self.nav_cols();
+            if let Some(target) = nav_target(selected, len, cols, dir) {
+                let name = self.tiles[target].name.clone();
+                self.frame_selected = Some(name.clone());
+                // Shift+arrow extends the multi-selection (keeping it
+                // additive); a plain arrow collapses to the new primary.
+                if self.modifiers.shift() {
+                    self.selected_frames.insert(name.clone());
+                } else {
+                    self.selected_frames.clear();
+                    self.selected_frames.insert(name.clone());
+                }
+                self.selection_anchor = Some(name.clone());
+                return Task::batch([
+                    self.scroll_selection_into_view("frames-grid", target, len, cols),
+                    self.ensure_frame_info_loaded().unwrap_or_else(Task::none),
+                ]);
+            }
+            return Task::none();
+        }
+
+        // Library grid: move the selection over every visible cell — the leading
+        // Add Roll tile (only when no search is active), then the filtered rolls
+        // — and reveal it out of the viewport. While a search is active the Add
+        // Roll tile is hidden, so an empty match set yields no destination.
+        let cells = library_cells(
+            &self.rolls,
+            self.search_filter.as_deref().unwrap_or(""),
+            &self.month_aliases,
+        );
+        let selected = library_cell_index(self.library_selection.as_ref(), &cells);
+        let len = cells.len();
+        let cols = self.nav_cols();
+        if let Some(target) = nav_target(selected, len, cols, dir) {
+            self.set_library_selection(cells[target].selection());
+            return self.scroll_selection_into_view("rolls-grid", target, len, cols);
+        }
+        Task::none()
+    }
+
     /// Writes the open frame's exposure live: the RAM roll edit and the GPU
     /// shader uniform. The slider (`ExposureChanged`) and a keyboard step
-    /// (`EditAdjust::Exposure`) both route here; committing (persist + re-bake)
+    /// (`ToneAdjust::Exposure`) both route here; committing (persist + re-bake)
     /// stays separate so the sliders can stream drags without re-decoding
     /// thumbnails on every move.
     fn set_exposure(&mut self, ev: f32) {
@@ -4193,7 +4224,7 @@ impl AppModel {
 
     /// Writes the open frame's density develop shape live: the RAM roll edit
     /// and the GPU shader uniforms. The slider (`DevelopChanged`) and a
-    /// keyboard step (`EditAdjust::Contrast`/`Black`/`White`/`Pivot`) both
+    /// keyboard step (`ToneAdjust::Contrast`/`Black`/`White`/`Pivot`) both
     /// route here; committing (persist + re-bake) stays separate like
     /// [`Self::set_exposure`].
     ///
@@ -4213,13 +4244,13 @@ impl AppModel {
         }
     }
 
-    /// Applies a keyboard-shortcut edit adjustment, mirroring the slider
+    /// Applies a keyboard-shortcut tone adjustment, mirroring the slider
     /// messages: mutate the RAM roll edit and the live shader only — the
     /// commit (persist + re-bake) happens on key release via
     /// [`Self::commit_edit`], the same cadence as a slider drag/release.
     /// No-ops unless a detail view is open (there is nothing to edit
     /// otherwise).
-    fn apply_edit_adjust(&mut self, adjust: EditAdjust) {
+    fn apply_tone_adjust(&mut self, adjust: ToneAdjust) {
         // Only adjust while a detail view is up, so the bindings never mutate
         // edits for an unseen frame.
         if self.selected.is_none() {
@@ -4227,14 +4258,14 @@ impl AppModel {
         }
 
         match adjust {
-            EditAdjust::Exposure(delta) => {
+            ToneAdjust::Exposure(delta) => {
                 let ev = clamp_ev(self.tone.exposure_ev + delta);
                 self.set_exposure(ev);
             }
             // Each develop arm only changes one control; the others keep their
             // current values. Contrast steps its stop lift, so the "increase"
             // keys raise the power — matching the slider's rightward drag.
-            EditAdjust::Contrast(delta) => {
+            ToneAdjust::Contrast(delta) => {
                 let contrast = contrast_power_for_lift(contrast_lift(self.tone.contrast) + delta);
                 self.set_develop_shape(
                     contrast,
@@ -4243,7 +4274,7 @@ impl AppModel {
                     self.tone.pivot_offset,
                 );
             }
-            EditAdjust::Black(delta) => {
+            ToneAdjust::Black(delta) => {
                 self.set_develop_shape(
                     self.tone.contrast,
                     clamp_black(self.tone.black + delta),
@@ -4251,7 +4282,7 @@ impl AppModel {
                     self.tone.pivot_offset,
                 );
             }
-            EditAdjust::White(delta) => {
+            ToneAdjust::White(delta) => {
                 // `delta` is in the White slider's UI axis (right = brighter),
                 // which is the density anchor mirrored — so a positive step
                 // LOWERS the stored density (see `white_density_from_ui`).
@@ -4262,25 +4293,13 @@ impl AppModel {
                     self.tone.pivot_offset,
                 );
             }
-            EditAdjust::Pivot(delta) => {
+            ToneAdjust::Pivot(delta) => {
                 self.set_develop_shape(
                     self.tone.contrast,
                     self.tone.black,
                     self.tone.white,
                     clamp_pivot(self.tone.pivot_offset + delta),
                 );
-            }
-            // A display rotation steps one quarter-turn counter-clockwise
-            // (authoring the composite of the crop + the EXIF-upright frame;
-            // the crop margins themselves are untouched). Live-only until the
-            // trim key's release commits, mirroring the numeric adjusts.
-            EditAdjust::RotateCcw => {
-                self.apply_rotate_ccw();
-            }
-            // Rotate the crop window one quarter-turn, independent of the
-            // display rotation.
-            EditAdjust::RotateCrop => {
-                self.apply_crop_rotate();
             }
         }
     }
@@ -4335,8 +4354,8 @@ impl AppModel {
 
     /// Rotates the open frame's display one quarter-turn counter-clockwise by
     /// writing the RAM roll edit and the live GPU shader uniform. Shared by the
-    /// keyboard shortcut (via [`Self::apply_edit_adjust`]) and the editing
-    /// drawer button (which additionally persists via [`Self::commit_edit`]).
+    /// keyboard shortcut (via [`Self::apply_action`]) and the editing drawer
+    /// button (which additionally persists via [`Self::commit_edit`]).
     fn apply_rotate_ccw(&mut self) {
         self.rotation = (self.rotation + 1) & 3;
         if let Some(selected) = &self.selected {
@@ -5411,8 +5430,8 @@ fn rotate_crop_box(
         .to_margins(width, height)
 }
 
-/// Maps a keyboard shortcut character to an [`EditAdjust`], or `None` when the
-/// key is not bound. `alt` and `shift` are the event's modifier state.
+/// Maps a develop-step key to a [`ToneAdjust`], or `None` when the key is not a
+/// develop control. `shift` is the event's Shift state.
 ///
 /// The five control pairs are laid out on a US keyboard left-to-right to match
 /// the editing panel's control order (Exposure → Contrast → Black → White →
@@ -5420,46 +5439,86 @@ fn rotate_crop_box(
 /// `u`/`i` midtone pivot. A bare key uses the coarse step; holding `Shift`
 /// selects the fine nudge step. The "increase" key of each pair
 /// (`=`/`]`/`'`/`.`/`i`) applies a POSITIVE step.
-/// `-`/`=` stay the exposure pair here; the crop-mode handler reinterprets them
-/// as the window resize. `r` rotates the display one quarter-turn
-/// counter-clockwise; Shift+`r` rotates the crop window instead. The VIM movement keys
-/// `h`/`j`/`k`/`l` are NOT mapped here — they route to `Message::Nav` in the
-/// subscription, mirroring the arrow keys for navigation (and, in crop mode,
-/// the crop-window move).
-/// The `key` payload
-/// is deliberately layout-stable: iced's `keyboard::listen` delivers the
-/// unmodified character (`key_without_modifiers`), and the iced fork never
-/// reports the `Shift`-produced symbols from the base keys used here, so nudge
-/// is driven by the event's modifier state rather than by matching
-/// `_`/`+`/`{`/`}`/`:`/`"`/`<`/`>`.
-fn edit_adjust_for(key: &str, _alt: bool, shift: bool) -> Option<EditAdjust> {
+/// The `key` payload is deliberately layout-stable: iced's `keyboard::listen`
+/// delivers the unmodified character (`key_without_modifiers`), and the iced
+/// fork never reports the `Shift`-produced symbols from the base keys used
+/// here, so nudge is driven by the event's modifier state rather than by
+/// matching `_`/`+`/`{`/`}`/`:`/`"`/`<`/`>`.
+fn tone_action(key: &str, shift: bool) -> Option<ToneAdjust> {
     let ev = if shift { EDIT_NUDGE_EV } else { EDIT_STEP_EV };
     let curve = if shift {
         EDIT_NUDGE_CURVE
     } else {
         EDIT_STEP_CURVE
     };
-    match key {
-        "-" => Some(EditAdjust::Exposure(-ev)),
-        "=" => Some(EditAdjust::Exposure(ev)),
-        "[" => Some(EditAdjust::Contrast(-curve)),
-        "]" => Some(EditAdjust::Contrast(curve)),
-        ";" => Some(EditAdjust::Black(-curve)),
-        "'" => Some(EditAdjust::Black(curve)),
-        "," => Some(EditAdjust::White(-curve)),
-        "." => Some(EditAdjust::White(curve)),
-        "u" => Some(EditAdjust::Pivot(-curve)),
-        "i" => Some(EditAdjust::Pivot(curve)),
-        // `r` rotates the display one quarter-turn counter-clockwise; Shift+`r`
-        // instead rotates the crop window. Both fire on press and the edit-key
-        // release commits the persist + re-bake (the release arm matches through
-        // this same function, so both are covered).
-        "r" => Some(if shift {
-            EditAdjust::RotateCrop
-        } else {
-            EditAdjust::RotateCcw
-        }),
+    Some(match key {
+        "-" => ToneAdjust::Exposure(-ev),
+        "=" => ToneAdjust::Exposure(ev),
+        "[" => ToneAdjust::Contrast(-curve),
+        "]" => ToneAdjust::Contrast(curve),
+        ";" => ToneAdjust::Black(-curve),
+        "'" => ToneAdjust::Black(curve),
+        "," => ToneAdjust::White(-curve),
+        "." => ToneAdjust::White(curve),
+        "u" => ToneAdjust::Pivot(-curve),
+        "i" => ToneAdjust::Pivot(curve),
+        _ => return None,
+    })
+}
+
+/// Resolves a key against the current [`Mode`] into an [`Action`], or `None`
+/// when the key is inert there.
+///
+/// The arrow/VIM movement keys navigate in browse/detail and move the crop
+/// window in crop mode. The develop-step keys act only in detail mode; `r`
+/// rotates the display and Shift+`r` the crop. In crop mode `-`/`=` resize the
+/// crop window instead of stepping exposure. `alt` is accepted to mirror the
+/// event but no binding uses it.
+fn key_action(mode: Mode, key: &keyboard::Key, alt: bool, shift: bool) -> Option<Action> {
+    let _ = alt;
+    let dir = match key {
+        keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => Some(MoveDir::Left),
+        keyboard::Key::Named(keyboard::key::Named::ArrowRight) => Some(MoveDir::Right),
+        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(MoveDir::Up),
+        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(MoveDir::Down),
+        keyboard::Key::Character(character) => match character.as_str() {
+            "h" => Some(MoveDir::Left),
+            "j" => Some(MoveDir::Down),
+            "k" => Some(MoveDir::Up),
+            "l" => Some(MoveDir::Right),
+            _ => None,
+        },
         _ => None,
+    };
+    if let Some(dir) = dir {
+        return Some(match mode {
+            Mode::Crop => Action::MoveCrop(dir, crop_step(shift, CROP_STEP_PCT)),
+            _ => Action::Navigate(dir),
+        });
+    }
+    let keyboard::Key::Character(character) = key else {
+        return None;
+    };
+    match mode {
+        Mode::Browse => None,
+        Mode::Detail => match character.as_str() {
+            "r" if shift => Some(Action::RotateCrop),
+            "r" => Some(Action::RotateDisplay),
+            _ => tone_action(character, shift).map(Action::Tone),
+        },
+        Mode::Crop => match character.as_str() {
+            "-" => Some(Action::ResizeCrop(
+                ResizeCrop::Shrink,
+                crop_step(shift, CROP_RESIZE_STEP_PCT),
+            )),
+            "=" => Some(Action::ResizeCrop(
+                ResizeCrop::Expand,
+                crop_step(shift, CROP_RESIZE_STEP_PCT),
+            )),
+            "r" if shift => Some(Action::RotateCrop),
+            "r" => Some(Action::RotateDisplay),
+            _ => None,
+        },
     }
 }
 
@@ -6790,110 +6849,188 @@ mod tests {
         assert!((contrast_power_for_lift(0.0) - 1.0).abs() < 1e-6);
     }
 
-    #[test]
-    fn edit_adjust_maps_bare_and_shifted_keys() {
-        // Exposure pair: `-`/`=` coarse, Shift nudge.
-        assert_eq!(
-            edit_adjust_for("-", false, false),
-            Some(EditAdjust::Exposure(-EDIT_STEP_EV))
-        );
-        assert_eq!(
-            edit_adjust_for("=", false, false),
-            Some(EditAdjust::Exposure(EDIT_STEP_EV))
-        );
-        assert_eq!(
-            edit_adjust_for("-", false, true),
-            Some(EditAdjust::Exposure(-EDIT_NUDGE_EV))
-        );
-        assert_eq!(
-            edit_adjust_for("=", false, true),
-            Some(EditAdjust::Exposure(EDIT_NUDGE_EV))
-        );
-        // Contrast pair: `[`/`]` coarse, Shift nudge.
-        assert_eq!(
-            edit_adjust_for("[", false, false),
-            Some(EditAdjust::Contrast(-EDIT_STEP_CURVE))
-        );
-        assert_eq!(
-            edit_adjust_for("]", false, false),
-            Some(EditAdjust::Contrast(EDIT_STEP_CURVE))
-        );
-        assert_eq!(
-            edit_adjust_for("[", false, true),
-            Some(EditAdjust::Contrast(-EDIT_NUDGE_CURVE))
-        );
-        assert_eq!(
-            edit_adjust_for("]", false, true),
-            Some(EditAdjust::Contrast(EDIT_NUDGE_CURVE))
-        );
-        assert_eq!(
-            edit_adjust_for(";", false, false),
-            Some(EditAdjust::Black(-EDIT_STEP_CURVE))
-        );
-        assert_eq!(
-            edit_adjust_for("'", false, false),
-            Some(EditAdjust::Black(EDIT_STEP_CURVE))
-        );
-        assert_eq!(
-            edit_adjust_for(";", false, true),
-            Some(EditAdjust::Black(-EDIT_NUDGE_CURVE))
-        );
-        assert_eq!(
-            edit_adjust_for("'", false, true),
-            Some(EditAdjust::Black(EDIT_NUDGE_CURVE))
-        );
-        // White pair: `,`/`.` coarse, Shift nudge.
-        assert_eq!(
-            edit_adjust_for(",", false, false),
-            Some(EditAdjust::White(-EDIT_STEP_CURVE))
-        );
-        assert_eq!(
-            edit_adjust_for(".", false, false),
-            Some(EditAdjust::White(EDIT_STEP_CURVE))
-        );
-        assert_eq!(
-            edit_adjust_for(",", false, true),
-            Some(EditAdjust::White(-EDIT_NUDGE_CURVE))
-        );
-        assert_eq!(
-            edit_adjust_for(".", false, true),
-            Some(EditAdjust::White(EDIT_NUDGE_CURVE))
-        );
-        // Pivot pair: `u`/`i` coarse, Shift nudge.
-        assert_eq!(
-            edit_adjust_for("u", false, false),
-            Some(EditAdjust::Pivot(-EDIT_STEP_CURVE))
-        );
-        assert_eq!(
-            edit_adjust_for("i", false, false),
-            Some(EditAdjust::Pivot(EDIT_STEP_CURVE))
-        );
-        // `r` rotates the display; Shift+`r` rotates the crop window instead.
-        assert_eq!(
-            edit_adjust_for("r", false, false),
-            Some(EditAdjust::RotateCcw)
-        );
-        assert_eq!(
-            edit_adjust_for("r", false, true),
-            Some(EditAdjust::RotateCrop)
-        );
-        // The VIM movement keys are NOT edit adjusts — `h`/`j`/`k`/`l` route to
-        // `Message::Nav` in the subscription (mirroring the arrows), so they map
-        // to `None` here.
-        assert_eq!(edit_adjust_for("h", false, false), None);
-        assert_eq!(edit_adjust_for("j", false, false), None);
-        assert_eq!(edit_adjust_for("k", false, false), None);
-        assert_eq!(edit_adjust_for("l", false, false), None);
-        // Shift/Alt leave them unbound too.
-        assert_eq!(edit_adjust_for("h", true, true), None);
+    /// A `Key::Character` for the resolver tests.
+    fn ch(s: &str) -> keyboard::Key {
+        keyboard::Key::Character(s.into())
     }
 
     #[test]
-    fn edit_adjust_ignores_unbound_keys() {
-        assert_eq!(edit_adjust_for("a", false, false), None);
-        assert_eq!(edit_adjust_for(" ", false, false), None);
-        assert_eq!(edit_adjust_for("p", false, true), None);
-        assert_eq!(edit_adjust_for("_", false, true), None);
+    fn tone_action_maps_bare_and_shifted_keys() {
+        // Exposure pair: `-`/`=` coarse, Shift nudge.
+        assert_eq!(
+            tone_action("-", false),
+            Some(ToneAdjust::Exposure(-EDIT_STEP_EV))
+        );
+        assert_eq!(
+            tone_action("=", false),
+            Some(ToneAdjust::Exposure(EDIT_STEP_EV))
+        );
+        assert_eq!(
+            tone_action("-", true),
+            Some(ToneAdjust::Exposure(-EDIT_NUDGE_EV))
+        );
+        assert_eq!(
+            tone_action("=", true),
+            Some(ToneAdjust::Exposure(EDIT_NUDGE_EV))
+        );
+        // Contrast pair: `[`/`]` coarse, Shift nudge.
+        assert_eq!(
+            tone_action("[", false),
+            Some(ToneAdjust::Contrast(-EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            tone_action("]", false),
+            Some(ToneAdjust::Contrast(EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            tone_action("[", true),
+            Some(ToneAdjust::Contrast(-EDIT_NUDGE_CURVE))
+        );
+        assert_eq!(
+            tone_action("]", true),
+            Some(ToneAdjust::Contrast(EDIT_NUDGE_CURVE))
+        );
+        // Black pair: `;`/`'`.
+        assert_eq!(
+            tone_action(";", false),
+            Some(ToneAdjust::Black(-EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            tone_action("'", false),
+            Some(ToneAdjust::Black(EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            tone_action(";", true),
+            Some(ToneAdjust::Black(-EDIT_NUDGE_CURVE))
+        );
+        assert_eq!(
+            tone_action("'", true),
+            Some(ToneAdjust::Black(EDIT_NUDGE_CURVE))
+        );
+        // White pair: `,`/`.`.
+        assert_eq!(
+            tone_action(",", false),
+            Some(ToneAdjust::White(-EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            tone_action(".", false),
+            Some(ToneAdjust::White(EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            tone_action(",", true),
+            Some(ToneAdjust::White(-EDIT_NUDGE_CURVE))
+        );
+        assert_eq!(
+            tone_action(".", true),
+            Some(ToneAdjust::White(EDIT_NUDGE_CURVE))
+        );
+        // Pivot pair: `u`/`i`.
+        assert_eq!(
+            tone_action("u", false),
+            Some(ToneAdjust::Pivot(-EDIT_STEP_CURVE))
+        );
+        assert_eq!(
+            tone_action("i", false),
+            Some(ToneAdjust::Pivot(EDIT_STEP_CURVE))
+        );
+        // Navigation, rotation, and unbound keys are not tone controls.
+        assert_eq!(tone_action("h", false), None);
+        assert_eq!(tone_action("r", false), None);
+        assert_eq!(tone_action("a", false), None);
+    }
+
+    #[test]
+    fn key_action_resolves_movement_per_mode() {
+        // Movement keys navigate in browse/detail, move the crop in crop mode.
+        assert_eq!(
+            key_action(Mode::Browse, &ch("h"), false, false),
+            Some(Action::Navigate(MoveDir::Left))
+        );
+        assert_eq!(
+            key_action(Mode::Detail, &ch("l"), false, false),
+            Some(Action::Navigate(MoveDir::Right))
+        );
+        assert_eq!(
+            key_action(Mode::Crop, &ch("j"), false, false),
+            Some(Action::MoveCrop(
+                MoveDir::Down,
+                CropStep::Percent(CROP_STEP_PCT)
+            ))
+        );
+        assert_eq!(
+            key_action(Mode::Crop, &ch("k"), false, true),
+            Some(Action::MoveCrop(
+                MoveDir::Up,
+                CropStep::Pixels(CROP_NUDGE_PX)
+            ))
+        );
+        // Named arrows mirror the VIM keys.
+        use keyboard::key::Named;
+        assert_eq!(
+            key_action(
+                Mode::Browse,
+                &keyboard::Key::Named(Named::ArrowUp),
+                false,
+                false
+            ),
+            Some(Action::Navigate(MoveDir::Up))
+        );
+        assert_eq!(
+            key_action(
+                Mode::Crop,
+                &keyboard::Key::Named(Named::ArrowLeft),
+                false,
+                false
+            ),
+            Some(Action::MoveCrop(
+                MoveDir::Left,
+                CropStep::Percent(CROP_STEP_PCT)
+            ))
+        );
+    }
+
+    #[test]
+    fn key_action_resolves_edits_per_mode() {
+        // Detail: tone keys step, `r`/Shift+`r` rotate display/crop.
+        assert_eq!(
+            key_action(Mode::Detail, &ch("="), false, false),
+            Some(Action::Tone(ToneAdjust::Exposure(EDIT_STEP_EV)))
+        );
+        assert_eq!(
+            key_action(Mode::Detail, &ch("r"), false, false),
+            Some(Action::RotateDisplay)
+        );
+        assert_eq!(
+            key_action(Mode::Detail, &ch("r"), false, true),
+            Some(Action::RotateCrop)
+        );
+        // Crop: `-`/`=` resize, `r` still rotates, tone keys are inert.
+        assert_eq!(
+            key_action(Mode::Crop, &ch("="), false, false),
+            Some(Action::ResizeCrop(
+                ResizeCrop::Expand,
+                CropStep::Percent(CROP_RESIZE_STEP_PCT)
+            ))
+        );
+        assert_eq!(
+            key_action(Mode::Crop, &ch("-"), false, true),
+            Some(Action::ResizeCrop(
+                ResizeCrop::Shrink,
+                CropStep::Pixels(CROP_NUDGE_PX)
+            ))
+        );
+        assert_eq!(
+            key_action(Mode::Crop, &ch("r"), false, false),
+            Some(Action::RotateDisplay)
+        );
+        assert_eq!(
+            key_action(Mode::Crop, &ch("r"), false, true),
+            Some(Action::RotateCrop)
+        );
+        assert_eq!(key_action(Mode::Crop, &ch("["), false, false), None);
+        // Browse: every editing key is inert.
+        assert_eq!(key_action(Mode::Browse, &ch("="), false, false), None);
+        assert_eq!(key_action(Mode::Browse, &ch("r"), false, false), None);
     }
 
     #[test]

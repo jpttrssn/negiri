@@ -7,8 +7,8 @@
 use std::path::Path;
 
 use crate::app::{
-    AppModel, Message, Roll, RollDateField, RollMetaField, THUMB_SIZE, TILE_ASPECT, Thumb, Tile,
-    contrast_lift, contrast_power_for_lift, detail_zoom_delta, white_density_from_ui,
+    AppModel, Message, PointerEvent, Roll, RollDateField, RollMetaField, THUMB_SIZE, TILE_ASPECT,
+    Thumb, Tile, contrast_lift, contrast_power_for_lift, detail_zoom_delta, white_density_from_ui,
     white_ui_from_density,
 };
 use crate::detail_area::DetailArea;
@@ -1283,9 +1283,9 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
                 )
                 .on_scroll(|delta| Message::DetailZoom(detail_zoom_delta(delta)))
                 .on_resize(Message::DetailAreaResized)
-                .on_press(Message::DetailPanPress)
-                .on_move(Message::DetailPanMove)
-                .on_release(Message::DetailPanRelease)
+                .on_press(Message::Pointer(PointerEvent::Press))
+                .on_move(|pt| Message::Pointer(PointerEvent::Move(pt)))
+                .on_release(Message::Pointer(PointerEvent::Release))
                 // Grab/grasping hand once the view is pannable (zoomed past
                 // contain fit) and while a drag is in progress, so the preview
                 // advertises that press+drag pans.
