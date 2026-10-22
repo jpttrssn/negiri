@@ -982,6 +982,10 @@ pub enum EditAdjust {
     /// no delta payload; unlike the numeric adjusts it doesn't hold-repeat a
     /// magnitude, but the edit-key machinery still commits on release).
     RotateCcw,
+    /// Rotate the crop window one quarter-turn (swap its aspect, fit to the
+    /// frame), independent of the display rotation. A discrete step like
+    /// [`EditAdjust::RotateCcw`].
+    RotateCrop,
 }
 
 /// Create a COSMIC application from the app model
@@ -1669,9 +1673,9 @@ impl cosmic::Application for AppModel {
                 // Editing shortcuts: bare (no Ctrl) keys that map to one of the
                 // editing controls; holding Shift switches to the fine nudge
                 // step. Mapped unconditionally — the `AdjustEdit` handler gates
-                // on crop mode (only h/j/k/l crop trims pass through while it
-                // is on, and they are inert outside it) and no-ops without a
-                // detail view.
+                // on crop mode (which reinterprets `-`/`=` as crop resize and
+                // allows `r`/Shift+`r`, ignoring the numeric tone keys) and
+                // no-ops without a detail view.
                 keyboard::Event::KeyPressed {
                     key: keyboard::Key::Character(character),
                     modifiers,
@@ -1892,26 +1896,34 @@ impl cosmic::Application for AppModel {
                 // its editing controls) are on screen.
                 //
                 // Crop mode is a focused modal state: the h/j/k/l keys MOVE the
-                // crop window, and `-`/`=` (which normally adjust exposure)
-                // RESIZE it about its center. Every OTHER edit key is inert
-                // inside it. Blocked adjusts never set `editing_key_held`, so a
-                // later key release stays a no-op instead of committing a stale
-                // hold.
+                // crop window, `-`/`=` (which normally adjust exposure) RESIZE
+                // it about its center, and `r`/Shift+`r` still rotate the
+                // display/crop (useful while framing). Every OTHER edit key is
+                // inert inside it. Blocked adjusts never set `editing_key_held`,
+                // so a later key release stays a no-op instead of committing a
+                // stale hold.
                 if self.crop_mode {
-                    let step = if self.modifiers.shift() {
-                        CROP_NUDGE_PX
-                    } else {
-                        CROP_RESIZE_STEP_PX
-                    };
-                    // `-`/`=` arrive as `Exposure(∓ev)`; the sign picks the
-                    // resize direction (negative shrinks, positive grows) and
-                    // the step/nudge comes from the Shift state. (Crop-window
-                    // MOVE is not an edit adjust — `h`/`j`/`k`/`l` route to
-                    // `Message::Nav`, like the arrows.)
-                    if let EditAdjust::Exposure(delta) = adjust {
-                        self.editing_key_held = true;
-                        let delta = if delta < 0.0 { -step } else { step };
-                        self.apply_crop_resize(delta);
+                    match adjust {
+                        // `-`/`=` arrive as `Exposure(∓ev)`; the sign picks the
+                        // resize direction (negative shrinks, positive grows)
+                        // and the step/nudge comes from the Shift state.
+                        // (Crop-window MOVE is not an edit adjust — `h`/`j`/`k`/
+                        // `l` route to `Message::Nav`, like the arrows.)
+                        EditAdjust::Exposure(delta) => {
+                            let step = if self.modifiers.shift() {
+                                CROP_NUDGE_PX
+                            } else {
+                                CROP_RESIZE_STEP_PX
+                            };
+                            self.editing_key_held = true;
+                            let delta = if delta < 0.0 { -step } else { step };
+                            self.apply_crop_resize(delta);
+                        }
+                        EditAdjust::RotateCcw | EditAdjust::RotateCrop => {
+                            self.editing_key_held = true;
+                            self.apply_edit_adjust(adjust);
+                        }
+                        _ => {}
                     }
                     return Task::none();
                 }
@@ -2067,8 +2079,9 @@ impl cosmic::Application for AppModel {
                 self.commit_edit()
             }
 
-            // Set the crop window to the chosen aspect ratio, centered inside
-            // the current crop, and persist immediately (like `ResetCrop`).
+            // Set the crop window to the largest box of the chosen aspect
+            // centered in the full frame, and persist immediately (like
+            // `ResetCrop`).
             Message::SetAspect(aspect) => {
                 if self.detail_shader.is_none() {
                     return Task::none();
@@ -4235,6 +4248,11 @@ impl AppModel {
             EditAdjust::RotateCcw => {
                 self.apply_rotate_ccw();
             }
+            // Rotate the crop window one quarter-turn, independent of the
+            // display rotation.
+            EditAdjust::RotateCrop => {
+                self.apply_crop_rotate();
+            }
         }
     }
 
@@ -4253,14 +4271,7 @@ impl AppModel {
             return;
         };
         let next = move_crop_box(self.crop, direction, delta, w, h);
-        self.crop = next;
-        if let Some(selected) = &self.selected {
-            self.roll.set_crop(selected, next);
-        }
-        if let Some(shader) = &mut self.detail_shader {
-            shader.set_crop(next);
-        }
-        self.reclamp_detail_zoom();
+        self.apply_crop(next);
     }
 
     /// Resizes the crop window about its center by `delta` source pixels
@@ -4278,14 +4289,7 @@ impl AppModel {
             return;
         };
         let next = resize_crop_box(self.crop, delta, w, h);
-        self.crop = next;
-        if let Some(selected) = &self.selected {
-            self.roll.set_crop(selected, next);
-        }
-        if let Some(shader) = &mut self.detail_shader {
-            shader.set_crop(next);
-        }
-        self.reclamp_detail_zoom();
+        self.apply_crop(next);
     }
 
     /// Rotates the open frame's display one quarter-turn counter-clockwise by
@@ -4300,18 +4304,14 @@ impl AppModel {
         if let Some(shader) = &mut self.detail_shader {
             shader.set_rotation(self.rotation);
         }
-        // A chosen display ratio is preserved across the rotation by re-fitting
-        // the crop to the new source orientation, bounded to the current crop so
-        // the user's size survives the rotate.
-        if self.aspect != edit_manifest::AspectRatio::Original {
-            self.refit_crop_aspect(self.crop);
-        }
+        // The crop is authored in the source frame, so the display rotation
+        // leaves it untouched — the image and crop rotate together.
         self.reclamp_detail_zoom();
     }
 
-    /// Re-fits the crop window to [`Self::aspect`]'s aspect for the current
-    /// source orientation, centered inside `bound`. No-op without a decoded
-    /// detail shader (no source dims yet).
+    /// Re-fits the crop window to [`Self::aspect`]'s source aspect, centered
+    /// inside `bound`. No-op without a decoded detail shader (no source dims
+    /// yet).
     fn refit_crop_aspect(&mut self, bound: edit_manifest::CropMargins) {
         let Some((w, h)) = self
             .detail_shader
@@ -4320,13 +4320,37 @@ impl AppModel {
         else {
             return;
         };
-        let next = fit_crop_to_aspect(bound, w, h, self.aspect.source_aspect(w, h, self.rotation));
-        self.crop = next;
+        let next = fit_crop_to_aspect(bound, w, h, self.aspect.source_aspect(w, h));
+        self.apply_crop(next);
+    }
+
+    /// Rotates the crop window one quarter-turn about its center (swapping its
+    /// aspect) and fits it to the full frame — shrinking or expanding to the
+    /// largest box of the swapped aspect, keeping the crop's center (clamped).
+    /// Independent of the display rotation. No-op without a decoded detail
+    /// shader.
+    fn apply_crop_rotate(&mut self) {
+        let Some((w, h)) = self
+            .detail_shader
+            .as_ref()
+            .map(shader::DetailProgram::source_dimensions)
+        else {
+            return;
+        };
+        let next = rotate_crop_box(self.crop, w, h);
+        self.apply_crop(next);
+    }
+
+    /// Writes a new crop to the live RAM roll and GPU shader uniform, then
+    /// re-clamps the zoom. The single apply point for every crop mutation
+    /// (move, resize, aspect preset, crop rotation).
+    fn apply_crop(&mut self, crop: edit_manifest::CropMargins) {
+        self.crop = crop;
         if let Some(selected) = &self.selected {
-            self.roll.set_crop(selected, next);
+            self.roll.set_crop(selected, crop);
         }
         if let Some(shader) = &mut self.detail_shader {
-            shader.set_crop(next);
+            shader.set_crop(crop);
         }
         self.reclamp_detail_zoom();
     }
@@ -5179,6 +5203,36 @@ impl CropRect {
             height: nh,
         }
     }
+
+    /// The 90°-rotated window fitted to the frame: the largest box of the
+    /// swapped aspect (`height/width`, the reciprocal of this window's aspect)
+    /// that fits `frame_w × frame_h`, at least `min_long` on its long edge,
+    /// centered on this window's center (clamped into the frame).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn rotated_90_fitted(self, frame_w: u32, frame_h: u32, min_long: u32) -> Self {
+        let swapped = self.height as f32 / self.width.max(1) as f32;
+        let fitted = Self {
+            left: 0,
+            top: 0,
+            width: frame_w,
+            height: frame_h,
+        }
+        .fit_aspect_centered(swapped, min_long, frame_w, frame_h);
+        let cx = i64::from(self.left) + i64::from(self.width) / 2;
+        let cy = i64::from(self.top) + i64::from(self.height) / 2;
+        Self {
+            left: (cx - i64::from(fitted.width) / 2)
+                .clamp(0, i64::from(frame_w.saturating_sub(fitted.width))) as u32,
+            top: (cy - i64::from(fitted.height) / 2)
+                .clamp(0, i64::from(frame_h.saturating_sub(fitted.height))) as u32,
+            width: fitted.width,
+            height: fitted.height,
+        }
+    }
 }
 
 /// Translates the crop window by `delta_px` in `direction`, keeping its size
@@ -5302,6 +5356,20 @@ fn fit_crop_to_aspect(
         .to_margins(width, height)
 }
 
+/// Rotates the crop window one quarter-turn about its center (swapping its
+/// aspect) and fits it to the full `width` × `height` frame, keeping the
+/// center as close as possible.
+#[must_use]
+fn rotate_crop_box(
+    crop: edit_manifest::CropMargins,
+    width: u32,
+    height: u32,
+) -> edit_manifest::CropMargins {
+    CropRect::from_margins(crop, width, height)
+        .rotated_90_fitted(width, height, MIN_CROP_WINDOW)
+        .to_margins(width, height)
+}
+
 /// Maps a keyboard shortcut character to an [`EditAdjust`], or `None` when the
 /// key is not bound. `alt` and `shift` are the event's modifier state.
 ///
@@ -5313,7 +5381,7 @@ fn fit_crop_to_aspect(
 /// (`=`/`]`/`'`/`.`/`i`) applies a POSITIVE step.
 /// `-`/`=` stay the exposure pair here; the crop-mode handler reinterprets them
 /// as the window resize. `r` rotates the display one quarter-turn
-/// counter-clockwise (cumulative; modifiers ignored). The VIM movement keys
+/// counter-clockwise; Shift+`r` rotates the crop window instead. The VIM movement keys
 /// `h`/`j`/`k`/`l` are NOT mapped here — they route to `Message::Nav` in the
 /// subscription, mirroring the arrow keys for navigation (and, in crop mode,
 /// the crop-window move).
@@ -5341,11 +5409,15 @@ fn edit_adjust_for(key: &str, _alt: bool, shift: bool) -> Option<EditAdjust> {
         "." => Some(EditAdjust::White(curve)),
         "u" => Some(EditAdjust::Pivot(-curve)),
         "i" => Some(EditAdjust::Pivot(curve)),
-        // Rotate the display one quarter-turn counter-clockwise. A bare `r`
-        // fires on press and the edit-key release commits the persist + re-bake
-        // (the release arm matches through this same function, so `r` is
-        // covered); modifiers are ignored like the tone-adjacent keys.
-        "r" => Some(EditAdjust::RotateCcw),
+        // `r` rotates the display one quarter-turn counter-clockwise; Shift+`r`
+        // instead rotates the crop window. Both fire on press and the edit-key
+        // release commits the persist + re-bake (the release arm matches through
+        // this same function, so both are covered).
+        "r" => Some(if shift {
+            EditAdjust::RotateCrop
+        } else {
+            EditAdjust::RotateCcw
+        }),
         _ => None,
     }
 }
@@ -6755,6 +6827,15 @@ mod tests {
             edit_adjust_for("i", false, false),
             Some(EditAdjust::Pivot(EDIT_STEP_CURVE))
         );
+        // `r` rotates the display; Shift+`r` rotates the crop window instead.
+        assert_eq!(
+            edit_adjust_for("r", false, false),
+            Some(EditAdjust::RotateCcw)
+        );
+        assert_eq!(
+            edit_adjust_for("r", false, true),
+            Some(EditAdjust::RotateCrop)
+        );
         // The VIM movement keys are NOT edit adjusts — `h`/`j`/`k`/`l` route to
         // `Message::Nav` in the subscription (mirroring the arrows), so they map
         // to `None` here.
@@ -7017,15 +7098,49 @@ mod tests {
     }
 
     #[test]
-    fn fit_crop_to_aspect_honors_a_rotated_display_ratio() {
-        // 3:2 chosen with the display rotated 90° → a 2:3 source box.
-        let aspect = edit_manifest::AspectRatio::R3x2.source_aspect(400, 300, 1);
-        let fit = fit_crop_to_aspect(Marg::default(), 400, 300, aspect);
-        let ratio = fit.cropped_width(400) as f32 / fit.cropped_height(300) as f32;
-        assert!(
-            (ratio - aspect).abs() < 0.02,
-            "source ratio {ratio} != {aspect}"
-        );
+    fn rotate_crop_box_swaps_aspect_and_fits_the_frame() {
+        // A full 400×300 crop (4:3) rotates to the largest 3:4 box, centered.
+        let rotated = rotate_crop_box(Marg::default(), 400, 300);
+        assert_eq!(rotated.cropped_width(400), 225);
+        assert_eq!(rotated.cropped_height(300), 300);
+        // Rotating a second time returns to the full frame.
+        let back = rotate_crop_box(rotated, 400, 300);
+        assert_eq!(back.cropped_width(400), 400);
+        assert_eq!(back.cropped_height(300), 300);
+    }
+
+    #[test]
+    fn rotate_crop_box_expands_small_crops_to_fit() {
+        // A 100×50 box (2:1) at the frame center rotates to a 1:2 box fitted to
+        // the frame (150×300), keeping the center.
+        let crop = Marg {
+            top: 125,
+            right: 150,
+            bottom: 125,
+            left: 150,
+        };
+        let rotated = rotate_crop_box(crop, 400, 300);
+        assert_eq!(rotated.cropped_width(400), 150);
+        assert_eq!(rotated.cropped_height(300), 300);
+        assert_eq!(rotated.left, 125);
+        assert_eq!(rotated.top, 0);
+    }
+
+    #[test]
+    fn rotate_crop_box_clamps_the_center_into_the_frame() {
+        // A square near the top-left rotates to a 300×300 box; its center would
+        // fall outside the frame, so the box clamps to the origin.
+        let crop = Marg {
+            top: 10,
+            right: 290,
+            bottom: 190,
+            left: 10,
+        };
+        let rotated = rotate_crop_box(crop, 400, 300);
+        assert_eq!(rotated.cropped_width(400), 300);
+        assert_eq!(rotated.cropped_height(300), 300);
+        assert_eq!(rotated.left, 0);
+        assert_eq!(rotated.top, 0);
     }
 
     #[test]

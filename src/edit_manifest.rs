@@ -373,17 +373,15 @@ impl AspectRatio {
         }
     }
 
-    /// The source-frame width/height aspect that yields this display ratio for
-    /// the given `rotation` (odd quarter-turns swap the display axes). Returns
+    /// The source-frame width/height aspect for this ratio, aligned to the
+    /// UNROTATED (EXIF-upright) frame — display rotation never swaps it. Returns
     /// the frame's own aspect for [`Self::Original`].
     #[must_use]
     #[allow(clippy::cast_precision_loss)] // frame dims are far below f32's exact range
-    pub fn source_aspect(self, src_w: u32, src_h: u32, rotation: u8) -> f32 {
-        let frame = src_w.max(1) as f32 / src_h.max(1) as f32;
+    pub fn source_aspect(self, src_w: u32, src_h: u32) -> f32 {
         match self.display_ratio() {
-            None => frame,
-            Some(ratio) if rotation & 1 == 0 => ratio,
-            Some(ratio) => 1.0 / ratio,
+            None => src_w.max(1) as f32 / src_h.max(1) as f32,
+            Some(ratio) => ratio,
         }
     }
 }
@@ -1195,20 +1193,15 @@ mod tests {
     }
 
     #[test]
-    fn aspect_source_ratios_align_with_rotation() {
-        // Original keeps the frame's own source aspect regardless of rotation.
-        for rotation in 0..4 {
-            let aspect = AspectRatio::Original.source_aspect(6000, 4000, rotation);
-            assert!((aspect - 1.5).abs() < 1e-6, "rot {rotation}: {aspect}");
-        }
-        // A fixed ratio is a display ratio: odd quarter-turns swap the axes.
+    fn aspect_source_ratios_are_aligned_to_the_unrotated_frame() {
+        // Original keeps the frame's own source aspect.
+        assert!((AspectRatio::Original.source_aspect(6000, 4000) - 1.5).abs() < 1e-6);
+        // A fixed ratio is the source-frame ratio, independent of display rotation.
         let three_two = AspectRatio::R3x2.display_ratio().unwrap();
-        assert!((AspectRatio::R3x2.source_aspect(6000, 4000, 0) - three_two).abs() < 1e-6);
-        assert!((AspectRatio::R3x2.source_aspect(6000, 4000, 1) - 1.0 / three_two).abs() < 1e-6);
-        assert!((AspectRatio::R3x2.source_aspect(6000, 4000, 2) - three_two).abs() < 1e-6);
-        // 4:5 is portrait (0.8 wide/tall) in display orientation.
+        assert!((AspectRatio::R3x2.source_aspect(6000, 4000) - three_two).abs() < 1e-6);
+        // 4:5 is portrait (0.8 wide/tall).
         assert!((AspectRatio::R4x5.display_ratio().unwrap() - 0.8).abs() < 1e-6);
-        assert!((AspectRatio::R4x5.source_aspect(6000, 4000, 1) - 1.25).abs() < 1e-6);
+        assert!((AspectRatio::R4x5.source_aspect(6000, 4000) - 0.8).abs() < 1e-6);
         assert_eq!(AspectRatio::Original.display_ratio(), None);
     }
 
