@@ -131,15 +131,16 @@ const EDIT_STEP_CURVE: f32 = edit_manifest::TONE_STEP * KEY_COARSE_STEPS_TONE as
 /// the fine step, matching the Shift-held slider drag.
 const EDIT_NUDGE_CURVE: f32 = edit_manifest::TONE_TICK;
 /// Keyboard shortcut step for a crop-window move: a bare move key (`h`/`j`/`k`/`l`
-/// or an arrow) translates the crop window by this many source pixels.
-const CROP_STEP_PX: i32 = 5;
-/// Keyboard shortcut nudge step for a crop move with the Shift modifier (a 1px
-/// fine adjustment).
-const CROP_NUDGE_PX: i32 = 1;
+/// or an arrow) translates the crop window by this percent of the frame's
+/// dimension along the move axis.
+const CROP_STEP_PCT: u32 = 2;
+/// Keyboard shortcut nudge for a crop move/resize with the Shift modifier: a
+/// fixed 1px step, so precision doesn't degrade on large images.
+const CROP_NUDGE_PX: u32 = 1;
 /// Keyboard shortcut step for a crop-window resize: a bare `-`/`=` grows or
 /// shrinks the crop window (about its center, aspect-locked) so its long edge
-/// changes by this many source pixels. Shift switches to the 1px `CROP_NUDGE_PX`.
-const CROP_RESIZE_STEP_PX: i32 = 10;
+/// changes by this percent of its own current long edge.
+const CROP_RESIZE_STEP_PCT: u32 = 2;
 /// The smallest crop-window long edge (source pixels) a resize is allowed to
 /// shrink to, so a resize can never collapse the crop to a degenerate sliver.
 const MIN_CROP_WINDOW: u32 = 4;
@@ -986,6 +987,35 @@ pub enum EditAdjust {
     /// frame), independent of the display rotation. A discrete step like
     /// [`EditAdjust::RotateCcw`].
     RotateCrop,
+}
+
+/// Crop-window resize direction: which way a `-`/`=` press scales the window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ResizeCrop {
+    Shrink,
+    Expand,
+}
+
+/// A crop move/resize keyboard step: either a percentage of the relevant
+/// dimension (the bare key, resolution-relative) or a fixed pixel amount (the
+/// Shift nudge, for precision).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CropStep {
+    Percent(u32),
+    Pixels(u32),
+}
+
+impl CropStep {
+    /// The pixel amount this step resolves to against `base` (the frame
+    /// dimension for a move, the crop's long edge for a resize), floored at 1px
+    /// so a step never rounds away to nothing.
+    #[allow(clippy::cast_possible_truncation)]
+    fn resolve(self, base: u32) -> u32 {
+        match self {
+            Self::Percent(pct) => (u64::from(base) * u64::from(pct) / 100).max(1) as u32,
+            Self::Pixels(px) => px,
+        }
+    }
 }
 
 /// Create a COSMIC application from the app model
@@ -1904,20 +1934,19 @@ impl cosmic::Application for AppModel {
                 // stale hold.
                 if self.crop_mode {
                     match adjust {
-                        // `-`/`=` arrive as `Exposure(∓ev)`; the sign picks the
-                        // resize direction (negative shrinks, positive grows)
-                        // and the step/nudge comes from the Shift state.
-                        // (Crop-window MOVE is not an edit adjust — `h`/`j`/`k`/
-                        // `l` route to `Message::Nav`, like the arrows.)
-                        EditAdjust::Exposure(delta) => {
+                        EditAdjust::Exposure(ev) => {
                             let step = if self.modifiers.shift() {
-                                CROP_NUDGE_PX
+                                CropStep::Pixels(CROP_NUDGE_PX)
                             } else {
-                                CROP_RESIZE_STEP_PX
+                                CropStep::Percent(CROP_RESIZE_STEP_PCT)
                             };
                             self.editing_key_held = true;
-                            let delta = if delta < 0.0 { -step } else { step };
-                            self.apply_crop_resize(delta);
+                            let resize = if ev < 0.0 {
+                                ResizeCrop::Shrink
+                            } else {
+                                ResizeCrop::Expand
+                            };
+                            self.apply_crop_resize(resize, step);
                         }
                         EditAdjust::RotateCcw | EditAdjust::RotateCrop => {
                             self.editing_key_held = true;
@@ -2314,13 +2343,13 @@ impl cosmic::Application for AppModel {
                     // rotated (`crop_move_direction` compensates for the CCW
                     // display rotation).
                     let direction = crop_move_direction(dir, self.rotation);
-                    let delta = if self.modifiers.shift() {
-                        CROP_NUDGE_PX
+                    let step = if self.modifiers.shift() {
+                        CropStep::Pixels(CROP_NUDGE_PX)
                     } else {
-                        CROP_STEP_PX
+                        CropStep::Percent(CROP_STEP_PCT)
                     };
                     self.editing_key_held = true;
-                    self.apply_crop_move(direction, delta);
+                    self.apply_crop_move(direction, step);
                     return Task::none();
                 }
                 if self.active.is_some() {
@@ -4256,13 +4285,14 @@ impl AppModel {
         }
     }
 
-    /// Translates the crop window by `delta` source pixels in `direction`,
-    /// writing the RAM roll edit and the live GPU shader uniform. Bounded by the
-    /// FULL-RESOLUTION display-oriented source dims the persisted crop is
-    /// authored against (`DetailProgram::source_dimensions`); with no ready
-    /// detail (decode still in flight) it stays a no-op. Live-only until the
-    /// edit key's release (or crop-mode close) commits.
-    fn apply_crop_move(&mut self, direction: edit_manifest::CropDirection, delta: i32) {
+    /// Translates the crop window one `step` in `direction` (percent-of-frame
+    /// for a bare move, a fixed pixel nudge with Shift), writing the RAM roll
+    /// edit and the live GPU shader uniform. Bounded by the FULL-RESOLUTION
+    /// display-oriented source dims the persisted crop is authored against
+    /// (`DetailProgram::source_dimensions`); with no ready detail (decode still
+    /// in flight) it stays a no-op. Live-only until the edit key's release (or
+    /// crop-mode close) commits.
+    fn apply_crop_move(&mut self, direction: edit_manifest::CropDirection, step: CropStep) {
         let Some((w, h)) = self
             .detail_shader
             .as_ref()
@@ -4270,23 +4300,34 @@ impl AppModel {
         else {
             return;
         };
+        let base = match direction {
+            edit_manifest::CropDirection::Top | edit_manifest::CropDirection::Bottom => h,
+            edit_manifest::CropDirection::Left | edit_manifest::CropDirection::Right => w,
+        };
+        let delta = step.resolve(base);
         let next = move_crop_box(self.crop, direction, delta, w, h);
         self.apply_crop(next);
     }
 
-    /// Resizes the crop window about its center by `delta` source pixels
-    /// (positive grows, negative shrinks; aspect preserved), writing the RAM
-    /// roll edit and the live GPU shader uniform. Bounded by the
-    /// FULL-RESOLUTION display-oriented source dims (see
+    /// Resizes the crop window about its center by `step` (percent of its own
+    /// long edge for a bare `-`/`=`, a fixed pixel nudge with Shift; aspect
+    /// preserved), writing the RAM roll edit and the live GPU shader uniform.
+    /// Bounded by the FULL-RESOLUTION display-oriented source dims (see
     /// [`Self::apply_crop_move`]); with no ready detail it stays a no-op.
     /// Live-only until the edit key's release (or crop-mode close) commits.
-    fn apply_crop_resize(&mut self, delta: i32) {
+    fn apply_crop_resize(&mut self, resize: ResizeCrop, step: CropStep) {
         let Some((w, h)) = self
             .detail_shader
             .as_ref()
             .map(shader::DetailProgram::source_dimensions)
         else {
             return;
+        };
+        let long = self.crop.cropped_width(w).max(self.crop.cropped_height(h));
+        let delta = i32::try_from(step.resolve(long)).unwrap_or(i32::MAX);
+        let delta = match resize {
+            ResizeCrop::Shrink => -delta,
+            ResizeCrop::Expand => delta,
         };
         let next = resize_crop_box(self.crop, delta, w, h);
         self.apply_crop(next);
@@ -5240,7 +5281,7 @@ impl CropRect {
 fn move_crop_box(
     crop: edit_manifest::CropMargins,
     direction: edit_manifest::CropDirection,
-    delta_px: i32,
+    delta_px: u32,
     width: u32,
     height: u32,
 ) -> edit_manifest::CropMargins {
@@ -5286,7 +5327,7 @@ fn move_crop_box(
     clippy::cast_possible_wrap,
     clippy::cast_possible_truncation
 )]
-fn clamp_window_origin(origin: u32, delta: i32, grow: bool, max_origin: u32) -> u32 {
+fn clamp_window_origin(origin: u32, delta: u32, grow: bool, max_origin: u32) -> u32 {
     let moved = if grow {
         i64::from(origin) + i64::from(delta)
     } else {
@@ -7049,6 +7090,18 @@ mod tests {
         let tiny = resize_crop_box(crop, -10_000, 400, 300);
         assert_eq!(tiny.cropped_width(400), MIN_CROP_WINDOW);
         assert_aspects(tiny, 400, 300);
+    }
+
+    #[test]
+    fn crop_step_resolves_percentages_against_the_base_and_floors_at_one() {
+        // A percentage step is a fraction of the base dimension.
+        assert_eq!(CropStep::Percent(10).resolve(200), 20);
+        assert_eq!(CropStep::Percent(5).resolve(300), 15);
+        // Small bases floor at 1px so a step never rounds away to nothing.
+        assert_eq!(CropStep::Percent(1).resolve(4), 1);
+        assert_eq!(CropStep::Percent(5).resolve(1), 1);
+        // A fixed-pixel step ignores the base entirely.
+        assert_eq!(CropStep::Pixels(CROP_NUDGE_PX).resolve(9999), 1);
     }
 
     #[test]
