@@ -328,6 +328,7 @@ pub(crate) fn editing_panel(detail: &DetailState) -> Element<'_, Message> {
             edit_manifest::AspectRatio::R4x3 => fl!("aspect-4-3"),
             edit_manifest::AspectRatio::R4x5 => fl!("aspect-4-5"),
             edit_manifest::AspectRatio::R1x1 => fl!("aspect-1-1"),
+            edit_manifest::AspectRatio::Custom => fl!("aspect-custom"),
         })
         .collect();
     let aspect_selected = edit_manifest::AspectRatio::ALL
@@ -499,6 +500,7 @@ pub(crate) const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("h / j / k / l", "help-crop-move"),
             ("← ↑ ↓ →", "help-crop-move"),
             ("drag", "help-crop-drag"),
+            ("drag edges", "help-crop-resize-drag"),
             ("- / =", "help-crop-resize"),
             ("r / Shift+R", "help-crop-rotate"),
             ("Shift+drag", "help-crop-pan"),

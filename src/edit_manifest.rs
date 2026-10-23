@@ -335,8 +335,10 @@ pub enum CropDirection {
     Right,
 }
 
-/// The crop window's target aspect ratio, as a *display-orientation* ratio for
-/// the fixed variants. `Original` keeps the source frame's own aspect.
+/// The crop window's target aspect ratio, as a source-frame width/height ratio
+/// for the fixed variants. `Original` keeps the source frame's own aspect; the
+/// free-form variants (`Original` and `Custom`) have no fixed ratio, and a
+/// `Custom` crop is one the user dragged to a size of their choosing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum AspectRatio {
     #[default]
@@ -349,23 +351,27 @@ pub enum AspectRatio {
     R4x5,
     #[serde(rename = "1:1")]
     R1x1,
+    #[serde(rename = "custom")]
+    Custom,
 }
 
 impl AspectRatio {
     /// All variants in dropdown order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Original,
         Self::R3x2,
         Self::R4x3,
         Self::R4x5,
         Self::R1x1,
+        Self::Custom,
     ];
 
-    /// The display width/height ratio, or `None` for [`Self::Original`].
+    /// The fixed width/height ratio, or `None` for the free-form variants
+    /// ([`Self::Original`] and [`Self::Custom`]).
     #[must_use]
     pub fn display_ratio(self) -> Option<f32> {
         match self {
-            Self::Original => None,
+            Self::Original | Self::Custom => None,
             Self::R3x2 => Some(3.0 / 2.0),
             Self::R4x3 => Some(4.0 / 3.0),
             Self::R4x5 => Some(4.0 / 5.0),
@@ -1202,7 +1208,12 @@ mod tests {
         // 4:5 is portrait (0.8 wide/tall).
         assert!((AspectRatio::R4x5.display_ratio().unwrap() - 0.8).abs() < 1e-6);
         assert!((AspectRatio::R4x5.source_aspect(6000, 4000) - 0.8).abs() < 1e-6);
+        // The free-form variants have no fixed ratio (Custom behaves like
+        // Original here, and is distinguished at the SetAspect/drag call sites).
         assert_eq!(AspectRatio::Original.display_ratio(), None);
+        assert_eq!(AspectRatio::Custom.display_ratio(), None);
+        assert!((AspectRatio::Custom.source_aspect(6000, 4000) - 1.5).abs() < 1e-6);
+        assert_eq!(AspectRatio::ALL.len(), 6);
     }
 
     #[test]

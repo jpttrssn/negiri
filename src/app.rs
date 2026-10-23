@@ -144,6 +144,9 @@ const CROP_RESIZE_STEP_PCT: u32 = 2;
 /// The smallest crop-window long edge (source pixels) a resize is allowed to
 /// shrink to, so a resize can never collapse the crop to a degenerate sliver.
 const MIN_CROP_WINDOW: u32 = 4;
+/// Grab band (logical points) around a crop edge/corner in crop mode within
+/// which a mouse press resizes instead of moving the window.
+const CROP_EDGE_GRAB_PT: f32 = 8.0;
 
 /// Minimum padding (logical points) kept around the image on every side while
 /// the detail view is in crop mode: the shader's contain-fit base shrinks by
@@ -1201,6 +1204,8 @@ enum DragTarget {
     Pan,
     /// Move the crop window (crop mode, grabbed inside the crop).
     MoveCrop,
+    /// Resize the crop window (crop mode, grabbed on an edge/corner).
+    ResizeCrop(CropHandle),
 }
 
 /// A key event routed from the subscription for mode-aware resolution: the key
@@ -2159,7 +2164,11 @@ impl cosmic::Application for AppModel {
                     return Task::none();
                 }
                 self.roll.detail.aspect = aspect;
-                self.refit_crop_aspect(edit_manifest::CropMargins::default());
+                // `Custom` keeps the current (manually dragged) geometry; every
+                // other value fits the crop to that ratio.
+                if aspect != edit_manifest::AspectRatio::Custom {
+                    self.refit_crop_aspect(edit_manifest::CropMargins::default());
+                }
                 if let Some(selected) = &self.roll.detail.frame {
                     self.roll.manifest.set_aspect(selected, aspect);
                 }
@@ -3913,26 +3922,29 @@ impl AppModel {
 
     /// The cursor to show over the detail preview. Normal mode: a grab hand
     /// once the view is zoomed past the contain fit, grasping while a grab-pan
-    /// drag runs, the arrow at fit. Crop mode: a grab hand over the crop window
-    /// (or with Shift, since it pans), grasping while a crop drag runs, and the
-    /// arrow elsewhere.
+    /// drag runs, the arrow at fit. Crop mode: a resize cursor over an
+    /// edge/corner (and while resizing), a grab hand inside the crop (or with
+    /// Shift, which pans), grasping while a move drag runs, and the arrow
+    /// elsewhere.
     ///
     /// Any `zoom > 1.0` already overflows the preview in at least the
     /// constraining axis (`scale = contain_s · 2^(zoom−1) > contain_s`), so
     /// "zoomed" and "able to pan" coincide at that threshold.
     pub(crate) fn detail_cursor_interaction(&self) -> cosmic::iced::mouse::Interaction {
         use cosmic::iced::mouse::Interaction;
-        let panning = self.roll.detail.drag == Some(DragTarget::Pan);
+        let drag = self.roll.detail.drag;
+        let panning = drag == Some(DragTarget::Pan);
         match self.mode() {
-            Mode::Crop => {
-                if self.roll.detail.drag == Some(DragTarget::MoveCrop) {
-                    Interaction::Grabbing
-                } else if panning || self.modifiers.shift() || self.cursor_in_crop() {
-                    Interaction::Grab
-                } else {
-                    Interaction::None
-                }
-            }
+            Mode::Crop => match drag {
+                Some(DragTarget::MoveCrop) => Interaction::Grabbing,
+                Some(DragTarget::ResizeCrop(handle)) => handle.cursor(),
+                _ if panning || self.modifiers.shift() => Interaction::Grab,
+                _ => match self.crop_handle() {
+                    Some(handle) => handle.cursor(),
+                    None if self.cursor_in_crop() => Interaction::Grab,
+                    None => Interaction::None,
+                },
+            },
             _ => detail_cursor_for(self.roll.detail.zoom.0, panning),
         }
     }
@@ -4282,18 +4294,22 @@ impl AppModel {
                 let prev = self.roll.detail.cursor;
                 self.roll.detail.cursor = Some(pt);
                 if let Some(prev) = prev {
+                    let (dx, dy) = (pt.x - prev.x, pt.y - prev.y);
                     match self.roll.detail.drag {
-                        Some(DragTarget::MoveCrop) => {
-                            self.apply_crop_drag(pt.x - prev.x, pt.y - prev.y);
+                        Some(DragTarget::MoveCrop) => self.apply_crop_drag(dx, dy),
+                        Some(DragTarget::ResizeCrop(handle)) => {
+                            self.apply_crop_resize_drag(handle, dx, dy);
                         }
-                        Some(DragTarget::Pan) => self.pan_view(pt.x - prev.x, pt.y - prev.y),
+                        Some(DragTarget::Pan) => self.pan_view(dx, dy),
                         None => {}
                     }
                 }
             }
             PointerEvent::Release => {
-                let commit = self.roll.detail.drag == Some(DragTarget::MoveCrop)
-                    && self.roll.detail.crop_drag_dirty;
+                let commit = matches!(
+                    self.roll.detail.drag,
+                    Some(DragTarget::MoveCrop | DragTarget::ResizeCrop(_))
+                ) && self.roll.detail.crop_drag_dirty;
                 self.roll.detail.drag = None;
                 self.roll.detail.crop_drag_dirty = false;
                 if commit {
@@ -4304,11 +4320,14 @@ impl AppModel {
         Task::none()
     }
 
-    /// The drag target for a press in crop mode: Shift pans; a grab inside the
-    /// crop moves the window; a grab outside it (no Shift) does nothing.
+    /// The drag target for a press in crop mode: Shift pans; a grab on an
+    /// edge/corner resizes the window; a grab inside it moves it; a grab outside
+    /// (no Shift) does nothing.
     fn crop_drag_target(&self) -> Option<DragTarget> {
         if self.modifiers.shift() {
             Some(DragTarget::Pan)
+        } else if let Some(handle) = self.crop_handle() {
+            Some(DragTarget::ResizeCrop(handle))
         } else if self.cursor_in_crop() {
             Some(DragTarget::MoveCrop)
         } else {
@@ -4316,28 +4335,35 @@ impl AppModel {
         }
     }
 
+    /// The crop handle under the last reported cursor position, if any.
+    fn crop_handle(&self) -> Option<CropHandle> {
+        let rect = self.crop_rect()?;
+        let cursor = self.roll.detail.cursor?;
+        crop_handle_at(rect, cursor, CROP_EDGE_GRAB_PT)
+    }
+
+    /// The crop window's on-screen rect in widget-center-relative logical points,
+    /// or `None` without a decoded detail shader/size.
+    fn crop_rect(&self) -> Option<cosmic::iced::Rectangle> {
+        let shader = self.roll.detail.shader.as_ref()?;
+        let size = self.roll.detail_area_size?;
+        let sf = self.core().scale_factor();
+        Some(shader.crop_rect_center(
+            size.width,
+            size.height,
+            sf,
+            self.roll.detail.zoom.0,
+            self.roll.detail.pan,
+        ))
+    }
+
     /// Whether the last reported cursor position lies inside the crop window on
     /// screen (used for the crop-mode grab cursor and drag target).
     fn cursor_in_crop(&self) -> bool {
-        let Some(shader) = &self.roll.detail.shader else {
+        let (Some(rect), Some(cursor)) = (self.crop_rect(), self.roll.detail.cursor) else {
             return false;
         };
-        let Some(size) = self.roll.detail_area_size else {
-            return false;
-        };
-        let Some(cursor) = self.roll.detail.cursor else {
-            return false;
-        };
-        let sf = self.core().scale_factor();
-        shader
-            .crop_rect_center(
-                size.width,
-                size.height,
-                sf,
-                self.roll.detail.zoom.0,
-                self.roll.detail.pan,
-            )
-            .contains(cursor)
+        rect.contains(cursor)
     }
 
     /// Moves the crop window to follow a cursor drag of `(dx, dy)` logical
@@ -4360,6 +4386,39 @@ impl AppModel {
         if next != self.roll.detail.crop {
             self.roll.detail.crop_drag_dirty = true;
         }
+        self.apply_crop(next);
+    }
+
+    /// Resizes the crop window by dragging the `handle` edge/corner by `(dx, dy)`
+    /// logical points. The selected aspect is preserved unless it is
+    /// [`edit_manifest::AspectRatio::Custom`], in which case the edges move
+    /// freely. No-op without a detail shader/size.
+    #[allow(clippy::cast_possible_truncation)] // source px fit comfortably in i32
+    fn apply_crop_resize_drag(&mut self, handle: CropHandle, dx: f32, dy: f32) {
+        let Some(size) = self.roll.detail_area_size else {
+            return;
+        };
+        let Some(shader) = &self.roll.detail.shader else {
+            return;
+        };
+        let sf = self.core().scale_factor();
+        let (w, h) = shader.source_dimensions();
+        let (fx, fy) =
+            shader.overlay_phys_per_src(size.width, size.height, sf, self.roll.detail.zoom.0);
+        let (dx, dy) = handle.constrain(dx, dy);
+        let (move_x, move_y) = crop_drag_delta(self.roll.detail.rotation, (fx, fy), dx, dy, sf);
+        let edges = handle.upright_edges(self.roll.detail.rotation);
+        let (mx, my) = (move_x.round() as i32, move_y.round() as i32);
+        let free = self.roll.detail.aspect == edit_manifest::AspectRatio::Custom;
+        let next = if free {
+            resize_crop_box_edges(self.roll.detail.crop, edges, mx, my, w, h)
+        } else {
+            resize_crop_box_locked(self.roll.detail.crop, edges, mx, my, w, h)
+        };
+        if next == self.roll.detail.crop {
+            return;
+        }
+        self.roll.detail.crop_drag_dirty = true;
         self.apply_crop(next);
     }
 
@@ -5386,6 +5445,127 @@ fn crop_move_direction(dir: MoveDir, rotation: u8) -> edit_manifest::CropDirecti
     }
 }
 
+/// Which crop-window edges a handle moves, in the EXIF-upright source frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // one independent flag per edge
+struct CropEdges {
+    left: bool,
+    right: bool,
+    top: bool,
+    bottom: bool,
+}
+
+impl CropEdges {
+    fn from_direction(direction: edit_manifest::CropDirection) -> Self {
+        use edit_manifest::CropDirection::{Bottom, Left, Right, Top};
+        let mut edges = Self::default();
+        match direction {
+            Left => edges.left = true,
+            Right => edges.right = true,
+            Top => edges.top = true,
+            Bottom => edges.bottom = true,
+        }
+        edges
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            left: self.left || other.left,
+            right: self.right || other.right,
+            top: self.top || other.top,
+            bottom: self.bottom || other.bottom,
+        }
+    }
+}
+
+/// A draggable crop-window handle, in SCREEN space (what the cursor grabs): the
+/// four edges and four corners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CropHandle {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl CropHandle {
+    /// The cursor to show over this handle (screen diagonals: NW-SE → Down,
+    /// NE-SW → Up).
+    fn cursor(self) -> cosmic::iced::mouse::Interaction {
+        use cosmic::iced::mouse::Interaction;
+        match self {
+            Self::Left | Self::Right => Interaction::ResizingHorizontally,
+            Self::Top | Self::Bottom => Interaction::ResizingVertically,
+            Self::TopLeft | Self::BottomRight => Interaction::ResizingDiagonallyDown,
+            Self::TopRight | Self::BottomLeft => Interaction::ResizingDiagonallyUp,
+        }
+    }
+
+    /// Constrain a screen-space drag `(dx, dy)` to the handle's normal(s): an
+    /// edge handle drops the tangential component so only the normal resizes.
+    fn constrain(self, dx: f32, dy: f32) -> (f32, f32) {
+        match self {
+            Self::Left | Self::Right => (dx, 0.0),
+            Self::Top | Self::Bottom => (0.0, dy),
+            _ => (dx, dy),
+        }
+    }
+
+    /// The EXIF-upright crop-window edges this handle moves, given the display
+    /// `rotation`: the screen outward normal(s) mapped through
+    /// [`crop_move_direction`].
+    fn upright_edges(self, rotation: u8) -> CropEdges {
+        use MoveDir::{Down, Left, Right, Up};
+        let dirs: &[MoveDir] = match self {
+            Self::Left => &[Left],
+            Self::Right => &[Right],
+            Self::Top => &[Up],
+            Self::Bottom => &[Down],
+            Self::TopLeft => &[Left, Up],
+            Self::TopRight => &[Right, Up],
+            Self::BottomLeft => &[Left, Down],
+            Self::BottomRight => &[Right, Down],
+        };
+        dirs.iter().fold(CropEdges::default(), |edges, &dir| {
+            edges.union(CropEdges::from_direction(crop_move_direction(
+                dir, rotation,
+            )))
+        })
+    }
+}
+
+/// The crop handle under `cursor`, within a `grab`-point band around the
+/// center-relative crop rect `rect`, or `None`. Corners win over edges.
+#[must_use]
+fn crop_handle_at(
+    rect: cosmic::iced::Rectangle,
+    cursor: cosmic::iced::Point,
+    grab: f32,
+) -> Option<CropHandle> {
+    let (l, r) = (rect.x, rect.x + rect.width);
+    let (t, b) = (rect.y, rect.y + rect.height);
+    if cursor.x < l - grab || cursor.x > r + grab || cursor.y < t - grab || cursor.y > b + grab {
+        return None;
+    }
+    let (near_l, near_r) = ((cursor.x - l).abs() <= grab, (cursor.x - r).abs() <= grab);
+    let (near_t, near_b) = ((cursor.y - t).abs() <= grab, (cursor.y - b).abs() <= grab);
+    match (near_l, near_r, near_t, near_b) {
+        (true, _, true, _) => Some(CropHandle::TopLeft),
+        (_, true, true, _) => Some(CropHandle::TopRight),
+        (true, _, _, true) => Some(CropHandle::BottomLeft),
+        (_, true, _, true) => Some(CropHandle::BottomRight),
+        (true, _, _, _) => Some(CropHandle::Left),
+        (_, true, _, _) => Some(CropHandle::Right),
+        (_, _, true, _) => Some(CropHandle::Top),
+        (_, _, _, true) => Some(CropHandle::Bottom),
+        _ => None,
+    }
+}
+
 /// A crop window in source pixels: top-left plus size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CropRect {
@@ -5650,6 +5830,137 @@ fn drag_crop_box(
         top: top as u32,
         width: rect.width,
         height: rect.height,
+    }
+    .to_margins(width, height)
+}
+
+/// Free-form resize: moves only the flagged EXIF-upright edges by `(dx, dy)`
+/// source pixels, clamped so the window stays inside the `w` × `h` frame and
+/// keeps at least [`MIN_CROP_WINDOW`] on each axis. Aspect is not preserved.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn resize_crop_box_edges(
+    crop: edit_manifest::CropMargins,
+    edges: CropEdges,
+    dx: i32,
+    dy: i32,
+    width: u32,
+    height: u32,
+) -> edit_manifest::CropMargins {
+    let rect = CropRect::from_margins(crop, width, height);
+    let (mut left, mut top) = (i64::from(rect.left), i64::from(rect.top));
+    let (mut right, mut bottom) = (left + i64::from(rect.width), top + i64::from(rect.height));
+    let min = i64::from(MIN_CROP_WINDOW);
+    let (dx, dy) = (i64::from(dx), i64::from(dy));
+    if edges.left {
+        left = (left + dx).clamp(0, right - min);
+    }
+    if edges.right {
+        right = (right + dx).clamp(left + min, i64::from(width));
+    }
+    if edges.top {
+        top = (top + dy).clamp(0, bottom - min);
+    }
+    if edges.bottom {
+        bottom = (bottom + dy).clamp(top + min, i64::from(height));
+    }
+    CropRect {
+        left: left as u32,
+        top: top as u32,
+        width: (right - left) as u32,
+        height: (bottom - top) as u32,
+    }
+    .to_margins(width, height)
+}
+
+/// Aspect-locked resize: moves the flagged EXIF-upright edges while preserving
+/// the window's current aspect. The opposite edge (or corner) stays fixed; an
+/// x-only or y-only drag keeps the perpendicular center. The size is clamped to
+/// the frame and to [`MIN_CROP_WINDOW`] on its long edge.
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn resize_crop_box_locked(
+    crop: edit_manifest::CropMargins,
+    edges: CropEdges,
+    dx: i32,
+    dy: i32,
+    width: u32,
+    height: u32,
+) -> edit_manifest::CropMargins {
+    let rect = CropRect::from_margins(crop, width, height);
+    let (fw, fh) = (width as f32, height as f32);
+    let (w0, h0) = (rect.width as f32, rect.height as f32);
+    let (left0, top0) = (rect.left as f32, rect.top as f32);
+    // Width/height change implied by the dragged edge(s). Dragging an edge
+    // outward grows the window: the right/bottom edges grow with a positive
+    // delta, the left/top with a negative one.
+    let dw = if edges.right {
+        dx as f32
+    } else if edges.left {
+        -(dx as f32)
+    } else {
+        0.0
+    };
+    let dh = if edges.bottom {
+        dy as f32
+    } else if edges.top {
+        -(dy as f32)
+    } else {
+        0.0
+    };
+    let (sx, sy) = ((w0 + dw) / w0, (h0 + dh) / h0);
+    let s = if dw != 0.0 && dh != 0.0 {
+        if (sx - 1.0).abs() >= (sy - 1.0).abs() {
+            sx
+        } else {
+            sy
+        }
+    } else if dw != 0.0 {
+        sx
+    } else {
+        sy
+    };
+    let aspect = w0 / h0;
+    let mut nw = (w0 * s).max(1.0);
+    let mut nh = nw / aspect;
+    let min = MIN_CROP_WINDOW as f32;
+    let long = nw.max(nh);
+    if long < min {
+        let k = min / long;
+        nw *= k;
+        nh *= k;
+    }
+    if nw > fw || nh > fh {
+        let k = (fw / nw).min(fh / nh);
+        nw *= k;
+        nh *= k;
+    }
+    // Anchor the fixed edge/corner; a free axis (no edge) scales about center.
+    let mut left = if edges.right {
+        left0
+    } else if edges.left {
+        left0 + w0 - nw
+    } else {
+        left0 + (w0 - nw) / 2.0
+    };
+    let mut top = if edges.bottom {
+        top0
+    } else if edges.top {
+        top0 + h0 - nh
+    } else {
+        top0 + (h0 - nh) / 2.0
+    };
+    left = left.clamp(0.0, (fw - nw).max(0.0));
+    top = top.clamp(0.0, (fh - nh).max(0.0));
+    CropRect {
+        left: left.round() as u32,
+        top: top.round() as u32,
+        width: nw.round() as u32,
+        height: nh.round() as u32,
     }
     .to_margins(width, height)
 }
@@ -7657,6 +7968,139 @@ mod tests {
                 assert_eq!(dragged, keyed, "rot {rot} dir {dir:?}");
             }
         }
+    }
+
+    fn edges(left: bool, right: bool, top: bool, bottom: bool) -> CropEdges {
+        CropEdges {
+            left,
+            right,
+            top,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn resize_crop_box_edges_moves_only_the_flagged_edges() {
+        // 200×100 window at (40, 30) in a 400×300 frame.
+        let crop = Marg {
+            top: 30,
+            right: 160,
+            bottom: 170,
+            left: 40,
+        };
+        // Grow the right edge by 50: left/top/height unchanged.
+        let grown = resize_crop_box_edges(crop, edges(false, true, false, false), 50, 0, 400, 300);
+        assert_eq!(grown.left, 40);
+        assert_eq!(grown.top, 30);
+        assert_eq!(grown.cropped_width(400), 250);
+        assert_eq!(grown.cropped_height(300), 100);
+        // Drag the left edge left by 20 (dx negative): width grows leftward.
+        let left = resize_crop_box_edges(crop, edges(true, false, false, false), -20, 0, 400, 300);
+        assert_eq!(left.left, 20);
+        assert_eq!(left.cropped_width(400), 220);
+        // Shrinking past the minimum stops at MIN_CROP_WINDOW.
+        let tiny =
+            resize_crop_box_edges(crop, edges(false, true, false, false), -10_000, 0, 400, 300);
+        assert_eq!(tiny.cropped_width(400), MIN_CROP_WINDOW);
+        // Growing past the frame clamps at the frame edge.
+        let big =
+            resize_crop_box_edges(crop, edges(false, true, false, false), 10_000, 0, 400, 300);
+        assert_eq!(big.left, 40);
+        assert_eq!(big.cropped_width(400), 360);
+        assert_eq!(big.right, 0);
+    }
+
+    #[test]
+    fn resize_crop_box_locked_preserves_aspect_and_anchors_the_opposite_edge() {
+        // 200×100 (2:1) window at (40, 30) in a 400×300 frame.
+        let crop = Marg {
+            top: 30,
+            right: 160,
+            bottom: 170,
+            left: 40,
+        };
+        // Grow the right edge by 40: width 240, ratio held (height 120), left
+        // fixed, vertical center (80) preserved.
+        let grown = resize_crop_box_locked(crop, edges(false, true, false, false), 40, 0, 400, 300);
+        assert_eq!(grown.left, 40);
+        assert_eq!(grown.cropped_width(400), 240);
+        assert_eq!(grown.cropped_height(300), 120);
+        assert_eq!(grown.top, 20);
+        // Drag the left edge right by 40: width 160, height 80, right edge (240)
+        // fixed.
+        let shrunk =
+            resize_crop_box_locked(crop, edges(true, false, false, false), 40, 0, 400, 300);
+        assert_eq!(shrunk.left + shrunk.cropped_width(400), 240);
+        assert_eq!(shrunk.cropped_height(300), 80);
+        // A bottom-right corner drag pins the top-left corner and keeps the ratio.
+        let corner =
+            resize_crop_box_locked(crop, edges(false, true, false, true), 40, 20, 400, 300);
+        assert_eq!(corner.left, 40);
+        assert_eq!(corner.top, 30);
+        assert_eq!(corner.cropped_width(400), 240);
+        assert_eq!(corner.cropped_height(300), 120);
+    }
+
+    #[test]
+    fn crop_handle_at_finds_edges_and_corners_within_the_band() {
+        let rect = cosmic::iced::Rectangle {
+            x: 100.0,
+            y: 100.0,
+            width: 200.0,
+            height: 100.0,
+        };
+        let p = |x, y| cosmic::iced::Point::new(x, y);
+        let g = CROP_EDGE_GRAB_PT;
+        assert_eq!(
+            crop_handle_at(rect, p(100.0, 150.0), g),
+            Some(CropHandle::Left)
+        );
+        assert_eq!(
+            crop_handle_at(rect, p(300.0, 150.0), g),
+            Some(CropHandle::Right)
+        );
+        assert_eq!(
+            crop_handle_at(rect, p(200.0, 100.0), g),
+            Some(CropHandle::Top)
+        );
+        assert_eq!(
+            crop_handle_at(rect, p(200.0, 200.0), g),
+            Some(CropHandle::Bottom)
+        );
+        // Corner wins over the two adjacent edges.
+        assert_eq!(
+            crop_handle_at(rect, p(101.0, 101.0), g),
+            Some(CropHandle::TopLeft)
+        );
+        assert_eq!(
+            crop_handle_at(rect, p(299.0, 199.0), g),
+            Some(CropHandle::BottomRight)
+        );
+        // Inside well away from an edge, and far outside the band, are no handles.
+        assert_eq!(crop_handle_at(rect, p(200.0, 150.0), g), None);
+        assert_eq!(crop_handle_at(rect, p(50.0, 150.0), g), None);
+    }
+
+    #[test]
+    fn crop_handle_edges_follow_the_display_rotation() {
+        for rot in 0..4u8 {
+            // The right edge maps to the upright edge the keyboard's Right move
+            // targets.
+            let expected = CropEdges::from_direction(crop_move_direction(MoveDir::Right, rot));
+            assert_eq!(CropHandle::Right.upright_edges(rot), expected, "rot {rot}");
+            // A corner unions its two screen normals.
+            let want = CropEdges::from_direction(crop_move_direction(MoveDir::Left, rot)).union(
+                CropEdges::from_direction(crop_move_direction(MoveDir::Up, rot)),
+            );
+            assert_eq!(CropHandle::TopLeft.upright_edges(rot), want, "rot {rot}");
+        }
+    }
+
+    #[test]
+    fn crop_handle_constrains_edge_drags_to_the_normal() {
+        assert_eq!(CropHandle::Right.constrain(10.0, 7.0), (10.0, 0.0));
+        assert_eq!(CropHandle::Top.constrain(10.0, 7.0), (0.0, 7.0));
+        assert_eq!(CropHandle::BottomRight.constrain(10.0, 7.0), (10.0, 7.0));
     }
 
     #[test]
