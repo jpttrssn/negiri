@@ -229,16 +229,11 @@ pub(crate) struct AppModel {
     config: Config,
     /// The CFA reconstruction chosen for the preview and for export.
     recon: ReconSettings,
-    /// Film rolls listed on the library page, one directory of negatives each.
-    pub(crate) rolls: Vec<Roll>,
+    /// The library page's state (rolls, selection, search, cover chain, drafts).
+    pub(crate) library: LibraryState,
     /// Directory of the roll currently drilled into (its frame grid and the
     /// detail view). `None` shows the library page of rolls.
     active: Option<PathBuf>,
-    /// The library cell single-clicked (or arrow-key selected) on the library
-    /// page: either the always-first Add Roll tile or a real roll. `None`
-    /// (initial state) until the user selects a cell; drives the selected-tile
-    /// highlight, the `Space` metadata drawer, and Enter/arrow navigation.
-    pub(crate) library_selection: Option<LibrarySelection>,
     /// The open roll's frame-grid selection: keyboard focus (primary), the
     /// multi-selection set (accent rings + copy/paste batch), and the Shift
     /// range anchor. See [`FrameSelection`].
@@ -268,31 +263,6 @@ pub(crate) struct AppModel {
     /// The window height from the last resize, used only to estimate the grid
     /// viewport height before the first real scroll has been observed.
     window_height: f32,
-    /// Names handed to the bounded in-flight roll-cover decodes, so re-baked
-    /// roll tiles never double-spawn against the startup chain (memory bound).
-    cover_inflight: Vec<PathBuf>,
-    /// Search is library-only: while a roll is open the frame grid is never
-    /// searched and the header control is hidden. Input state: `None` hides
-    /// the search input (the header shows only the search icon); `Some(term)`
-    /// shows the input with `term` as the live text, updated on every
-    /// keystroke (echoing cosmic-files, the mere presence of the input is the
-    /// toggle, not the text). The *applied* filter lives in
-    /// [`Self::search_filter`].
-    search: Option<String>,
-    /// The applied search filter, committed only after `SEARCH_DEBOUNCE_MS`
-    /// passes with no further keystrokes. The library page reads this instead
-    /// of [`Self::search`], so typing stays instant while re-filtering lags
-    /// behind it.
-    pub(crate) search_filter: Option<String>,
-    /// Monotonic serial for debounce commits: bumped on every keystroke, clear,
-    /// activate and escape; a `SearchCommitted` message whose serial does not
-    /// match is stale and is discarded.
-    search_version: u64,
-    /// Month-name aliases for the library search, built once at startup from
-    /// the localized `month-01`…`month-12` short names plus the English full
-    /// and 3-letter names. The fluent locale is fixed for the session, so this
-    /// never needs rebuilding.
-    pub(crate) month_aliases: MonthAliases,
     /// File entries from the open roll, displayed as tiles on its frame grid.
     pub(crate) tiles: Vec<Tile>,
     /// File shown enlarged in the detail view in place of the grid, if any.
@@ -396,27 +366,6 @@ pub(crate) struct AppModel {
     /// 90° quarter-turns (`0`…`3`) on top of the EXIF orientation. Loaded from
     /// the stored manifest per open and applied to the GPU shader as a uniform.
     pub(crate) rotation: u8,
-    /// Draft text for the two roll date fields in the roll-info drawer, seeded
-    /// from the selected roll's committed dates on selection change and
-    /// debounce-committed back to the roll + manifest.
-    roll_date_drafts: RollDateDrafts,
-    /// Draft text for the roll-info drawer's editable name heading, seeded from
-    /// the selected roll's current name on selection change and
-    /// debounce-committed back.
-    roll_name_draft: String,
-    /// Draft text for the roll-info drawer's free-form film metadata fields
-    /// (film, location, camera, lens, developer notes), seeded from the
-    /// selected roll's committed metadata on selection change and
-    /// debounce-committed back.
-    roll_meta_draft: edit_manifest::RollMeta,
-    /// Monotonic serial for the roll-info drawer's debounced commit: every
-    /// keystroke bumps it, and a `RollDraftsCommit` whose serial no longer
-    /// matches is dropped (the search input's `search_version` pattern).
-    roll_drafts_version: u64,
-    /// Whether the roll-info drawer's drafts differ from the committed roll and
-    /// a debounced commit is pending; gates the manifest write so an unchanged
-    /// selection switch never touches disk.
-    roll_drafts_dirty: bool,
     /// Whether the detail view is in crop mode — a focused, VIM-like modal
     /// state toggled by the bare `c` key or the View → Crop mode menu item.
     /// Only meaningfully on with a detail view open. While active the surround
@@ -554,6 +503,62 @@ pub(crate) enum LibrarySelection {
     AddRoll,
     /// A real roll card, by its directory.
     Roll(PathBuf),
+}
+
+/// The library page's state: the roll cards, the selected cell, the header
+/// search, the cover-decode chain, and the roll-info drawer's drafts. Groups
+/// everything that belongs to the library page so it can persist independently
+/// of an open roll (whose state will live beside it as `roll: Option<RollView>`).
+pub(crate) struct LibraryState {
+    /// Film rolls listed on the library page, one directory of negatives each.
+    pub(crate) rolls: Vec<Roll>,
+    /// The library cell single-clicked (or arrow-key selected): either the
+    /// always-first Add Roll tile or a real roll. `None` (initial state) until
+    /// the user selects a cell; drives the selected-tile highlight, the `Space`
+    /// metadata drawer, and Enter/arrow navigation.
+    pub(crate) selection: Option<LibrarySelection>,
+    /// Month-name aliases for the library search, built once at startup from
+    /// the localized `month-01`…`month-12` short names plus the English full
+    /// and 3-letter names. The fluent locale is fixed for the session, so this
+    /// never needs rebuilding.
+    pub(crate) month_aliases: MonthAliases,
+    /// The applied search filter, committed only after `SEARCH_DEBOUNCE_MS`
+    /// passes with no further keystrokes. The library page reads this instead
+    /// of `search`, so typing stays instant while re-filtering lags behind it.
+    pub(crate) search_filter: Option<String>,
+    /// Search input state: `None` hides the search input (the header shows only
+    /// the search icon); `Some(term)` shows the input with `term` as the live
+    /// text, updated on every keystroke (echoing cosmic-files, the mere presence
+    /// of the input is the toggle, not the text).
+    search: Option<String>,
+    /// Monotonic serial for debounce commits: bumped on every keystroke, clear,
+    /// activate and escape; a `SearchCommitted` message whose serial does not
+    /// match is stale and is discarded.
+    search_version: u64,
+    /// Names handed to the bounded in-flight roll-cover decodes, so re-baked
+    /// roll tiles never double-spawn against the startup chain (memory bound).
+    cover_inflight: Vec<PathBuf>,
+    /// Draft text for the two roll date fields in the roll-info drawer, seeded
+    /// from the selected roll's committed dates on selection change and
+    /// debounce-committed back to the roll + manifest.
+    roll_date_drafts: RollDateDrafts,
+    /// Draft text for the roll-info drawer's editable name heading, seeded from
+    /// the selected roll's current name on selection change and
+    /// debounce-committed back.
+    roll_name_draft: String,
+    /// Draft text for the roll-info drawer's free-form film metadata fields
+    /// (film, location, camera, lens, developer notes), seeded from the
+    /// selected roll's committed metadata on selection change and
+    /// debounce-committed back.
+    roll_meta_draft: edit_manifest::RollMeta,
+    /// Monotonic serial for the roll-info drawer's debounced commit: every
+    /// keystroke bumps it, and a `RollDraftsCommit` whose serial no longer
+    /// matches is dropped (the search input's `search_version` pattern).
+    roll_drafts_version: u64,
+    /// Whether the roll-info drawer's drafts differ from the committed roll and
+    /// a debounced commit is pending; gates the manifest write so an unchanged
+    /// selection switch never touches disk.
+    roll_drafts_dirty: bool,
 }
 
 /// The frame-grid selection for the open roll: the keyboard focus (primary),
@@ -1299,9 +1304,40 @@ impl cosmic::Application for AppModel {
                 })
                 .unwrap_or_default(),
             recon: ReconSettings::from_env(),
-            rolls: Vec::new(),
+            library: LibraryState {
+                rolls: Vec::new(),
+                selection: None,
+                // The localized short month names (month order 1–12) seed the
+                // search aliases; English full/3-letter names fill the rest.
+                month_aliases: MonthAliases::new(&[
+                    fl!("month-01"),
+                    fl!("month-02"),
+                    fl!("month-03"),
+                    fl!("month-04"),
+                    fl!("month-05"),
+                    fl!("month-06"),
+                    fl!("month-07"),
+                    fl!("month-08"),
+                    fl!("month-09"),
+                    fl!("month-10"),
+                    fl!("month-11"),
+                    fl!("month-12"),
+                ]),
+                search_filter: None,
+                search: None,
+                search_version: 0,
+                cover_inflight: Vec::new(),
+                roll_date_drafts: RollDateDrafts {
+                    key: None,
+                    start: String::new(),
+                    end: String::new(),
+                },
+                roll_name_draft: String::new(),
+                roll_meta_draft: edit_manifest::RollMeta::default(),
+                roll_drafts_version: 0,
+                roll_drafts_dirty: false,
+            },
             active: None,
-            library_selection: None,
             frame_sel: FrameSelection::default(),
             modifiers: keyboard::Modifiers::default(),
             editing_key_held: false,
@@ -1311,26 +1347,6 @@ impl cosmic::Application for AppModel {
             // resize handler estimates the height before that.
             grid_viewport: None,
             window_height: 600.0,
-            cover_inflight: Vec::new(),
-            // The localized short month names (month order 1–12) seed the
-            // search aliases; English full/3-letter names fill the rest.
-            month_aliases: MonthAliases::new(&[
-                fl!("month-01"),
-                fl!("month-02"),
-                fl!("month-03"),
-                fl!("month-04"),
-                fl!("month-05"),
-                fl!("month-06"),
-                fl!("month-07"),
-                fl!("month-08"),
-                fl!("month-09"),
-                fl!("month-10"),
-                fl!("month-11"),
-                fl!("month-12"),
-            ]),
-            search: None,
-            search_filter: None,
-            search_version: 0,
             tiles: Vec::new(),
             selected: None,
             thumb_inflight: Vec::new(),
@@ -1360,15 +1376,6 @@ impl cosmic::Application for AppModel {
             tone: edit_manifest::ToneEdit::default(),
             crop: edit_manifest::CropMargins::default(),
             aspect: edit_manifest::AspectRatio::Original,
-            roll_date_drafts: RollDateDrafts {
-                key: None,
-                start: String::new(),
-                end: String::new(),
-            },
-            roll_name_draft: String::new(),
-            roll_meta_draft: edit_manifest::RollMeta::default(),
-            roll_drafts_version: 0,
-            roll_drafts_dirty: false,
             rotation: 0,
             crop_mode: false,
             help_visible: false,
@@ -1436,7 +1443,7 @@ impl cosmic::Application for AppModel {
         // selected; inside a roll (or with the add tile / nothing selected) it
         // shows disabled on the menu.
         let roll_selected = self.active.is_none()
-            && matches!(&self.library_selection, Some(LibrarySelection::Roll(_)));
+            && matches!(&self.library.selection, Some(LibrarySelection::Roll(_)));
         let remove_roll = if roll_selected {
             menu::Item::Button(fl!("menu-remove-roll"), None, MenuAction::RemoveRoll)
         } else {
@@ -1525,7 +1532,7 @@ impl cosmic::Application for AppModel {
         let details_enabled = self.selected.is_some()
             || (self.active.is_some() && self.frame_sel.primary().is_some())
             || (self.active.is_none()
-                && matches!(&self.library_selection, Some(LibrarySelection::Roll(_))));
+                && matches!(&self.library.selection, Some(LibrarySelection::Roll(_))));
         let details = if details_enabled {
             menu::Item::Button(fl!("menu-details"), None, MenuAction::Details)
         } else {
@@ -1580,7 +1587,7 @@ impl cosmic::Application for AppModel {
         // until it is cleared.
         let mut end = Vec::new();
         if self.active.is_none() {
-            let search: Element<'_, Message> = if let Some(term) = &self.search {
+            let search: Element<'_, Message> = if let Some(term) = &self.library.search {
                 cosmic::widget::text_input::search_input(fl!("search-rolls"), term)
                     .width(Length::Fixed(240.0))
                     .id(search_input_id())
@@ -1670,19 +1677,19 @@ impl cosmic::Application for AppModel {
                 if self.active.is_some() {
                     return None;
                 }
-                let LibrarySelection::Roll(dir) = self.library_selection.as_ref()? else {
+                let LibrarySelection::Roll(dir) = self.library.selection.as_ref()? else {
                     return None;
                 };
-                let roll = self.rolls.iter().find(|roll| &roll.dir == dir)?;
+                let roll = self.library.rolls.iter().find(|roll| &roll.dir == dir)?;
 
                 Some(
                     context_drawer::context_drawer(
                         roll_info_panel(
                             roll,
-                            &self.roll_name_draft,
-                            &self.roll_date_drafts.start,
-                            &self.roll_date_drafts.end,
-                            &self.roll_meta_draft,
+                            &self.library.roll_name_draft,
+                            &self.library.roll_date_drafts.start,
+                            &self.library.roll_date_drafts.end,
+                            &self.library.roll_meta_draft,
                         ),
                         Message::ToggleContextPage(ContextPage::RollInfo),
                     )
@@ -1947,10 +1954,10 @@ impl cosmic::Application for AppModel {
                 // behavior, mirroring cosmic-files. Search is library-only, so
                 // this applies only on the library page — inside a roll the
                 // term is left intact for the return to the library.
-                if self.active.is_none() && self.search.is_some() {
-                    self.search = None;
-                    self.search_filter = None;
-                    self.search_version = self.search_version.wrapping_add(1);
+                if self.active.is_none() && self.library.search.is_some() {
+                    self.library.search = None;
+                    self.library.search_filter = None;
+                    self.library.search_version = self.library.search_version.wrapping_add(1);
                     // Clearing the filter exposes every card; decode its covers.
                     return self.decode_covers();
                 }
@@ -2174,17 +2181,17 @@ impl cosmic::Application for AppModel {
             // shared debounced commit, so typing never fights the read-only view
             // and the manifest is written once per quiet period.
             Message::RollDateDraftChange(field, value) => {
-                self.roll_date_drafts.set(field, value);
+                self.library.roll_date_drafts.set(field, value);
                 self.schedule_roll_draft_commit()
             }
 
             Message::RollNameDraftChange(value) => {
-                self.roll_name_draft = value;
+                self.library.roll_name_draft = value;
                 self.schedule_roll_draft_commit()
             }
 
             Message::RollMetaDraftChange(field, value) => {
-                field.set(&mut self.roll_meta_draft, Some(value));
+                field.set(&mut self.library.roll_meta_draft, Some(value));
                 self.schedule_roll_draft_commit()
             }
 
@@ -2192,8 +2199,8 @@ impl cosmic::Application for AppModel {
             // arrived, otherwise persist the whole draft to the roll it was
             // seeded from.
             Message::RollDraftsCommit(version) => {
-                if version == self.roll_drafts_version
-                    && let Some(dir) = self.roll_date_drafts.key.clone()
+                if version == self.library.roll_drafts_version
+                    && let Some(dir) = self.library.roll_date_drafts.key.clone()
                 {
                     self.commit_roll_drafts(&dir);
                 }
@@ -2234,17 +2241,17 @@ impl cosmic::Application for AppModel {
             }
 
             Message::RollsLoaded(rolls) => {
-                self.rolls = rolls;
+                self.library.rolls = rolls;
                 // A refresh supersedes any earlier cover chain.
-                self.cover_inflight.clear();
+                self.library.cover_inflight.clear();
                 // A roll selection pointing at a roll that left the config is
                 // stale; drop it and close a metadata drawer showing it. An Add
                 // Roll selection always stays valid (the tile is always present).
                 if matches!(
-                    &self.library_selection,
-                    Some(LibrarySelection::Roll(dir)) if !self.rolls.iter().any(|roll| &roll.dir == dir)
+                    &self.library.selection,
+                    Some(LibrarySelection::Roll(dir)) if !self.library.rolls.iter().any(|roll| &roll.dir == dir)
                 ) {
-                    self.library_selection = None;
+                    self.library.selection = None;
                     if self.context_page == ContextPage::RollInfo {
                         // An About panel covering this drawer keeps the slot:
                         // `about_open` alone decides its visibility.
@@ -2258,18 +2265,22 @@ impl cosmic::Application for AppModel {
             }
 
             Message::RollInfoLoaded(roll) => {
-                let is_new = !self.rolls.iter().any(|existing| existing.dir == roll.dir);
+                let is_new = !self
+                    .library
+                    .rolls
+                    .iter()
+                    .any(|existing| existing.dir == roll.dir);
                 cover_trace(format_args!(
                     "RollInfoLoaded: {} cover={:?} frames={} new={is_new} active={} inflight={}",
                     roll.dir.display(),
                     roll.cover,
                     roll.frame_count,
                     self.active.is_some(),
-                    self.cover_inflight.len()
+                    self.library.cover_inflight.len()
                 ));
                 if is_new {
-                    self.rolls.push(roll);
-                    self.rolls.sort_by(|a, b| a.name.cmp(&b.name));
+                    self.library.rolls.push(roll);
+                    self.library.rolls.sort_by(|a, b| a.name.cmp(&b.name));
                 }
                 self.decode_covers()
             }
@@ -2283,7 +2294,7 @@ impl cosmic::Application for AppModel {
                     dir.display(),
                     if result.is_ok() { "ok" } else { "err" }
                 ));
-                if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
+                if let Some(roll) = self.library.rolls.iter_mut().find(|roll| roll.dir == dir) {
                     roll.thumb = match result {
                         Ok(handle) => Thumb::Ready(handle),
                         Err(_) => Thumb::Failed,
@@ -2292,9 +2303,11 @@ impl cosmic::Application for AppModel {
                 cover_trace(format_args!(
                     "CoverReady: matching roll for {}: {}",
                     dir.display(),
-                    self.rolls.iter().any(|roll| roll.dir == dir)
+                    self.library.rolls.iter().any(|roll| roll.dir == dir)
                 ));
-                self.cover_inflight.retain(|pending| pending != &dir);
+                self.library
+                    .cover_inflight
+                    .retain(|pending| pending != &dir);
                 self.decode_covers()
             }
 
@@ -2318,13 +2331,13 @@ impl cosmic::Application for AppModel {
                     cover_trace(format_args!(
                         "RollsAdded: accepted {} (rel={rel:?}, present={})",
                         dir.display(),
-                        self.rolls.iter().any(|roll| roll.dir == dir)
+                        self.library.rolls.iter().any(|roll| roll.dir == dir)
                     ));
-                    if !self.rolls.iter().any(|roll| roll.dir == dir) {
+                    if !self.library.rolls.iter().any(|roll| roll.dir == dir) {
                         self.config.rolls.push(rel);
                         self.persist_config();
                     }
-                    if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
+                    if let Some(roll) = self.library.rolls.iter_mut().find(|roll| roll.dir == dir) {
                         roll.thumb = Thumb::Loading;
                     }
                     let scan_dir = dir.clone();
@@ -2353,7 +2366,7 @@ impl cosmic::Application for AppModel {
 
             Message::RemoveRoll(dir) => self.remove_roll(&dir),
 
-            Message::RemoveSelectedRoll => match self.library_selection.clone() {
+            Message::RemoveSelectedRoll => match self.library.selection.clone() {
                 Some(LibrarySelection::Roll(dir)) => self.remove_roll(&dir),
                 _ => Task::none(),
             },
@@ -2367,7 +2380,7 @@ impl cosmic::Application for AppModel {
                         Task::none()
                     }
                 } else {
-                    match self.library_selection.clone() {
+                    match self.library.selection.clone() {
                         // A roll drills in; the Add Roll tile opens the folder
                         // picker, mirroring how Enter opens a selected roll.
                         Some(LibrarySelection::Roll(dir)) => self.open_roll(dir),
@@ -2480,10 +2493,10 @@ impl cosmic::Application for AppModel {
                 if self.active.is_some() {
                     return Task::none();
                 }
-                if self.search.is_none() {
-                    self.search = Some(String::new());
-                    self.search_filter = None;
-                    self.search_version = self.search_version.wrapping_add(1);
+                if self.library.search.is_none() {
+                    self.library.search = Some(String::new());
+                    self.library.search_filter = None;
+                    self.library.search_version = self.library.search_version.wrapping_add(1);
                 }
                 // Focus the (now visible) input; clearing the filter (when the
                 // input was hidden) can expose more cards, so re-pump covers.
@@ -2494,9 +2507,9 @@ impl cosmic::Application for AppModel {
             }
 
             Message::SearchClear => {
-                self.search = None;
-                self.search_filter = None;
-                self.search_version = self.search_version.wrapping_add(1);
+                self.library.search = None;
+                self.library.search_filter = None;
+                self.library.search_version = self.library.search_version.wrapping_add(1);
                 // Clearing the filter exposes every card; decode its covers.
                 self.decode_covers()
             }
@@ -2504,9 +2517,9 @@ impl cosmic::Application for AppModel {
             Message::SearchInput(term) => {
                 // The input box shows the keystrokes immediately; the applied
                 // filter waits for `SEARCH_DEBOUNCE_MS` of quiet typing.
-                self.search = Some(term.clone());
-                self.search_version = self.search_version.wrapping_add(1);
-                let version = self.search_version;
+                self.library.search = Some(term.clone());
+                self.library.search_version = self.library.search_version.wrapping_add(1);
+                let version = self.library.search_version;
                 cosmic::task::future(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS)).await;
                     Message::SearchCommitted(term, version)
@@ -2516,8 +2529,8 @@ impl cosmic::Application for AppModel {
             Message::SearchCommitted(term, version) => {
                 // Drop stale commits: any keystroke, clear or escape since this
                 // task spawned bumped `search_version`.
-                if version == self.search_version {
-                    self.search_filter = Some(term);
+                if version == self.library.search_version {
+                    self.library.search_filter = Some(term);
                 }
                 // The visible set changed; decode the covers it now shows.
                 self.decode_covers()
@@ -2815,13 +2828,13 @@ impl AppModel {
     /// (respecting an active search). No-op while a roll is open, while no roll
     /// is visible, or when a selection already exists.
     fn select_first_visible_roll(&mut self) {
-        if self.active.is_some() || self.library_selection.is_some() {
+        if self.active.is_some() || self.library.selection.is_some() {
             return;
         }
         let cells = library_cells(
-            &self.rolls,
-            self.search_filter.as_deref().unwrap_or(""),
-            &self.month_aliases,
+            &self.library.rolls,
+            self.library.search_filter.as_deref().unwrap_or(""),
+            &self.library.month_aliases,
         );
         if let Some(LibraryCell::Roll(roll)) = cells
             .iter()
@@ -2834,7 +2847,7 @@ impl AppModel {
     /// Selects a library cell and reseeds the roll-info drafts in the same pass
     /// the selection changes, so the drawer never shows a previous roll's edits.
     fn set_library_selection(&mut self, selection: LibrarySelection) {
-        self.library_selection = Some(selection);
+        self.library.selection = Some(selection);
         self.sync_roll_drafts();
     }
 
@@ -3273,11 +3286,11 @@ impl AppModel {
         }
         let capacity = self
             .thumb_concurrency
-            .saturating_sub(self.cover_inflight.len());
+            .saturating_sub(self.library.cover_inflight.len());
         if capacity == 0 {
             cover_trace(format_args!(
                 "decode_covers: capacity 0 (inflight={})",
-                self.cover_inflight.len()
+                self.library.cover_inflight.len()
             ));
             return Task::none();
         }
@@ -3287,9 +3300,9 @@ impl AppModel {
         // stay `Loading` until scrolled near. The Add Roll tile (cell 0) carries
         // no cover and is skipped.
         let cells = library_cells(
-            &self.rolls,
-            self.search_filter.as_deref().unwrap_or(""),
-            &self.month_aliases,
+            &self.library.rolls,
+            self.library.search_filter.as_deref().unwrap_or(""),
+            &self.library.month_aliases,
         );
         match &self.grid_viewport {
             Some(vp) => cover_trace(format_args!(
@@ -3310,7 +3323,7 @@ impl AppModel {
         let visible = self.visible_range(cells.len());
         cover_trace(format_args!(
             "decode_covers: cap={capacity} inflight={} cells={} visible={visible:?}",
-            self.cover_inflight.len(),
+            self.library.cover_inflight.len(),
             cells.len()
         ));
         let pending: Vec<(PathBuf, String)> = cells
@@ -3319,7 +3332,12 @@ impl AppModel {
             .iter()
             .filter_map(|cell| match cell {
                 LibraryCell::Roll(roll) if matches!(roll.thumb, Thumb::Loading) => {
-                    if self.cover_inflight.iter().any(|dir| dir == &roll.dir) {
+                    if self
+                        .library
+                        .cover_inflight
+                        .iter()
+                        .any(|dir| dir == &roll.dir)
+                    {
                         cover_trace(format_args!(
                             "decode_covers: {} skipped (inflight)",
                             roll.dir.display()
@@ -3355,7 +3373,8 @@ impl AppModel {
         for (dir, _) in &pending {
             cover_trace(format_args!("decode_covers: planned {}", dir.display()));
         }
-        self.cover_inflight
+        self.library
+            .cover_inflight
             .extend(pending.iter().map(|(dir, _)| dir.clone()));
 
         Task::batch(
@@ -3387,10 +3406,10 @@ impl AppModel {
         }
         tasks.push(self.decode_next());
         if let Some(active) = self.active.as_ref() {
-            let Some(roll) = self
-                .rolls
-                .iter_mut()
-                .find(|roll| roll.dir == *active && roll.cover.as_deref() == Some(name.as_str()))
+            let Some(roll) =
+                self.library.rolls.iter_mut().find(|roll| {
+                    roll.dir == *active && roll.cover.as_deref() == Some(name.as_str())
+                })
             else {
                 return Task::batch(tasks);
             };
@@ -3502,7 +3521,7 @@ impl AppModel {
             // Library page: only the roll card's cover needs re-baking under
             // the now-resolved base (frames decode from the disk manifest when
             // the roll is opened).
-            if let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) {
+            if let Some(roll) = self.library.rolls.iter_mut().find(|roll| roll.dir == dir) {
                 roll.thumb = Thumb::Loading;
             }
             self.decode_covers()
@@ -3535,7 +3554,11 @@ impl AppModel {
         // A reflow supersedes any pending auto-calibration measurement.
         self.calibration_inflight = None;
         if let Some(active) = self.active.as_ref()
-            && let Some(roll) = self.rolls.iter_mut().find(|roll| &roll.dir == active)
+            && let Some(roll) = self
+                .library
+                .rolls
+                .iter_mut()
+                .find(|roll| &roll.dir == active)
         {
             roll.thumb = Thumb::Loading;
         }
@@ -3965,7 +3988,7 @@ impl AppModel {
         match view {
             DrawerView::Library => {
                 self.active.is_none()
-                    && matches!(&self.library_selection, Some(LibrarySelection::Roll(_)))
+                    && matches!(&self.library.selection, Some(LibrarySelection::Roll(_)))
             }
             DrawerView::Grid => self.active.is_some() && self.frame_sel.primary().is_some(),
             DrawerView::Detail => self.selected.is_some(),
@@ -3993,42 +4016,42 @@ impl AppModel {
     /// in-flight debounce for the old roll is dropped. Cheap: a path comparison
     /// — it runs at the top of `update` for every message.
     fn sync_roll_drafts(&mut self) {
-        let new_key = match &self.library_selection {
+        let new_key = match &self.library.selection {
             Some(LibrarySelection::Roll(dir)) => Some(dir.clone()),
             _ => None,
         };
-        if self.roll_date_drafts.key == new_key {
+        if self.library.roll_date_drafts.key == new_key {
             return;
         }
         // Flush the outgoing roll's dirty drafts before reseeding (a no-op when
         // nothing changed), then invalidate any pending commit for it.
-        if let Some(old_dir) = self.roll_date_drafts.key.clone() {
+        if let Some(old_dir) = self.library.roll_date_drafts.key.clone() {
             self.commit_roll_drafts(&old_dir);
         }
-        self.roll_drafts_version = self.roll_drafts_version.wrapping_add(1);
-        self.roll_drafts_dirty = false;
+        self.library.roll_drafts_version = self.library.roll_drafts_version.wrapping_add(1);
+        self.library.roll_drafts_dirty = false;
 
         let Some(dir) = new_key else {
-            self.roll_date_drafts.key = None;
+            self.library.roll_date_drafts.key = None;
             return;
         };
-        let Some(roll) = self.rolls.iter().find(|roll| roll.dir == dir) else {
-            self.roll_date_drafts.key = None;
+        let Some(roll) = self.library.rolls.iter().find(|roll| roll.dir == dir) else {
+            self.library.roll_date_drafts.key = None;
             return;
         };
-        self.roll_date_drafts =
+        self.library.roll_date_drafts =
             RollDateDrafts::from_dates(dir, roll.start_date.as_deref(), roll.end_date.as_deref());
-        self.roll_name_draft = roll.name.clone();
-        self.roll_meta_draft = roll.meta.clone();
+        self.library.roll_name_draft = roll.name.clone();
+        self.library.roll_meta_draft = roll.meta.clone();
     }
 
     /// Records that the roll-info drawer's drafts changed and schedules the
     /// shared debounced commit, bumping the serial so only the last keystroke of
     /// a burst lands (the search input's debounce pattern).
     fn schedule_roll_draft_commit(&mut self) -> Task<cosmic::Action<Message>> {
-        self.roll_drafts_dirty = true;
-        self.roll_drafts_version = self.roll_drafts_version.wrapping_add(1);
-        let version = self.roll_drafts_version;
+        self.library.roll_drafts_dirty = true;
+        self.library.roll_drafts_version = self.library.roll_drafts_version.wrapping_add(1);
+        let version = self.library.roll_drafts_version;
         cosmic::task::future(async move {
             tokio::time::sleep(std::time::Duration::from_millis(ROLL_DRAWER_DEBOUNCE_MS)).await;
             Message::RollDraftsCommit(version)
@@ -4041,28 +4064,31 @@ impl AppModel {
     /// ISO date and the resulting range is coherent — a partial/malformed date
     /// keeps the committed value. No-op when nothing is dirty.
     fn commit_roll_drafts(&mut self, dir: &Path) {
-        if !self.roll_drafts_dirty {
+        if !self.library.roll_drafts_dirty {
             return;
         }
-        self.roll_drafts_dirty = false;
-        let Some(roll) = self.rolls.iter_mut().find(|roll| roll.dir == dir) else {
+        self.library.roll_drafts_dirty = false;
+        let Some(roll) = self.library.rolls.iter_mut().find(|roll| roll.dir == dir) else {
             return;
         };
 
         let name = {
-            let trimmed = self.roll_name_draft.trim();
+            let trimmed = self.library.roll_name_draft.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_owned())
         };
         roll.name = name.clone().unwrap_or_else(|| dir_leaf(&roll.dir));
 
-        let start = resolve_date_draft(&self.roll_date_drafts.start, roll.start_date.as_deref());
-        let end = resolve_date_draft(&self.roll_date_drafts.end, roll.end_date.as_deref());
+        let start = resolve_date_draft(
+            &self.library.roll_date_drafts.start,
+            roll.start_date.as_deref(),
+        );
+        let end = resolve_date_draft(&self.library.roll_date_drafts.end, roll.end_date.as_deref());
         if roll_dates_valid(start.as_deref(), end.as_deref()) {
             roll.start_date = start;
             roll.end_date = end;
         }
 
-        roll.meta = self.roll_meta_draft.normalized();
+        roll.meta = self.library.roll_meta_draft.normalized();
 
         record_roll_drawer(
             &roll.dir,
@@ -4078,7 +4104,7 @@ impl AppModel {
     /// Flushes any pending roll-info drawer commit (selection change, quit, or
     /// window close) so a debounced edit is never lost.
     fn flush_roll_drafts(&mut self) {
-        if let Some(dir) = self.roll_date_drafts.key.clone() {
+        if let Some(dir) = self.library.roll_date_drafts.key.clone() {
             self.commit_roll_drafts(&dir);
         }
     }
@@ -4398,11 +4424,11 @@ impl AppModel {
         // — and reveal it out of the viewport. While a search is active the Add
         // Roll tile is hidden, so an empty match set yields no destination.
         let cells = library_cells(
-            &self.rolls,
-            self.search_filter.as_deref().unwrap_or(""),
-            &self.month_aliases,
+            &self.library.rolls,
+            self.library.search_filter.as_deref().unwrap_or(""),
+            &self.library.month_aliases,
         );
-        let selected = library_cell_index(self.library_selection.as_ref(), &cells);
+        let selected = library_cell_index(self.library.selection.as_ref(), &cells);
         let len = cells.len();
         let cols = self.nav_cols();
         if let Some(target) = nav_target(selected, len, cols, dir) {
@@ -4689,7 +4715,7 @@ impl AppModel {
         // If the open roll's cover is among the targets, its library card also
         // re-bakes to mirror the edit.
         if let Some(active) = self.active.as_ref()
-            && let Some(roll) = self.rolls.iter_mut().find(|roll| {
+            && let Some(roll) = self.library.rolls.iter_mut().find(|roll| {
                 roll.dir == *active
                     && roll
                         .cover
@@ -4716,7 +4742,7 @@ impl AppModel {
         if self.active.is_some() {
             return Task::none();
         }
-        let removed = self.rolls.iter().any(|roll| roll.dir == dir);
+        let removed = self.library.rolls.iter().any(|roll| roll.dir == dir);
         if !removed {
             return Task::none();
         }
@@ -4725,14 +4751,14 @@ impl AppModel {
             .rolls
             .retain(|candidate| resolve_relative_roll(candidate).as_deref() != Some(dir));
         self.persist_config();
-        self.rolls.retain(|roll| roll.dir != dir);
+        self.library.rolls.retain(|roll| roll.dir != dir);
 
         // If the removed roll was selected (driving the RollInfo drawer and
         // the keyboard highlight), clear the selection so no stale target
         // remains and close that drawer.
-        if matches!(self.library_selection.as_ref(), Some(LibrarySelection::Roll(sel)) if *sel == dir)
+        if matches!(self.library.selection.as_ref(), Some(LibrarySelection::Roll(sel)) if *sel == dir)
         {
-            self.library_selection = None;
+            self.library.selection = None;
             if self.context_page == ContextPage::RollInfo {
                 // An About panel covering this drawer keeps the slot:
                 // `about_open` alone decides its visibility.

@@ -48,11 +48,11 @@ pub(crate) fn library_view(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
     let cells = library_cells(
-        &app.rolls,
-        app.search_filter.as_deref().unwrap_or(""),
-        &app.month_aliases,
+        &app.library.rolls,
+        app.library.search_filter.as_deref().unwrap_or(""),
+        &app.library.month_aliases,
     );
-    let selected_index = library_cell_index(app.library_selection.as_ref(), &cells);
+    let selected_index = library_cell_index(app.library.selection.as_ref(), &cells);
     // The hint overlays only when a search filters every real roll away (the
     // Add Roll tile is hidden while searching, so `cells` can be empty).
     let empty = !cells
@@ -82,7 +82,7 @@ pub(crate) fn library_view(app: &AppModel) -> Element<'_, Message> {
     // A truly empty library shows no hint (the Add Roll tile alone is
     // self-explanatory), and a grid with matching rolls shows none either —
     // only the search-mismatch case (rolls exist but none match) overlays.
-    if app.rolls.is_empty() || !empty {
+    if app.library.rolls.is_empty() || !empty {
         return body;
     }
 
