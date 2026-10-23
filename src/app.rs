@@ -525,13 +525,6 @@ impl FrameSelection {
         }
     }
 
-    /// Drop the whole selection (roll close / bare-grid escape).
-    fn clear(&mut self) {
-        self.primary = None;
-        self.set.clear();
-        self.anchor = None;
-    }
-
     /// Apply a frame-tile click with the current modifier state. Plain click
     /// focuses and selects one frame; Ctrl+click toggles membership (moving the
     /// focus off a removed frame so the primary stays selected); Shift+click
@@ -1974,31 +1967,14 @@ impl cosmic::Application for AppModel {
                     // survives so the grid still shows where you were. The
                     // editing drawer is not closed; the grid's own remembered
                     // drawer state takes over.
-                    self.roll.detail.frame = None;
-                    self.clear_detail();
+                    self.close_detail();
                     self.restore_drawer_for(DrawerView::Grid);
                     return self.ensure_frame_info_loaded().unwrap_or_else(Task::none);
                 }
-                // On the bare grid Escape backs out of the roll entirely,
-                // resetting every detail- and roll-page field so nothing from
-                // the closed roll leaks into the library (the frame highlight
-                // is dropped as part of the reset; edits were already flushed
-                // by `persist_roll` at the top of this arm).
-                self.roll.dir = None;
-                self.roll.detail.frame = None;
-                self.roll.state.sel.clear();
-                self.grid_viewport = None;
-                self.roll.state.tiles = Vec::new();
-                self.frame_meta_inflight = None;
-                self.thumb_inflight.clear();
-                self.calibration_inflight = None;
-                self.roll.state.detail_inflight = None;
-                self.roll.state.detail_preload_inflight.clear();
-                // The RAM manifest is dropped with the roll; re-opened rolls
-                // re-load it (see `RollOpened`). The overview LRU is
-                // deliberately kept: it survives roll switches by design.
-                self.roll.state.manifest = edit_manifest::RollManifest::default();
-                self.clear_detail();
+                // On the bare grid Escape backs out of the roll entirely
+                // (edits were already flushed by `persist_roll` above); the
+                // overview LRU survives by design.
+                self.close_roll();
                 self.restore_drawer_for(DrawerView::Library);
                 // The library page is visible again: decode the covers it shows.
                 self.decode_covers()
@@ -2902,12 +2878,8 @@ impl AppModel {
             return Task::none();
         }
         self.persist_roll();
+        self.close_roll();
         self.roll.dir = Some(dir.clone());
-        self.roll.detail.frame = None;
-        self.roll.state.sel.clear();
-        self.grid_viewport = None;
-        self.frame_meta_inflight = None;
-        self.clear_detail();
         // Entering the grid: the drawer (if the grid's memory says open) shows
         // the frame-info panel; navigation never closes it.
         self.restore_drawer_for(DrawerView::Grid);
@@ -3895,6 +3867,27 @@ impl AppModel {
     /// open.
     fn clear_detail(&mut self) {
         self.roll.detail.clear();
+        self.editing_key_held = false;
+        self.histogram_generation = self.histogram_generation.wrapping_add(1);
+    }
+
+    /// Closes the open frame's detail view: the grid highlight survives (the
+    /// frame stays the selection primary), only the detail state is reset.
+    fn close_detail(&mut self) {
+        self.roll.detail.frame = None;
+        self.clear_detail();
+    }
+
+    /// Closes the open roll, resetting the whole `RollView` (grid, manifest,
+    /// detail) plus the roll-scoped viewport/decode bookkeeping, so nothing
+    /// leaks onto the library page. The overview/thumbnail LRUs are kept (they
+    /// survive roll switches by design). Persist edits before calling.
+    fn close_roll(&mut self) {
+        self.roll = RollView::default();
+        self.grid_viewport = None;
+        self.thumb_inflight.clear();
+        self.calibration_inflight = None;
+        self.frame_meta_inflight = None;
         self.editing_key_held = false;
         self.histogram_generation = self.histogram_generation.wrapping_add(1);
     }
