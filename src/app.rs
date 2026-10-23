@@ -20,8 +20,8 @@ use crate::pipeline::{
 };
 use crate::shader;
 use crate::ui::{
-    FrameMeta, editing_panel, frame_info_panel, frames_view, help_overlay, library_view,
-    load_frame_meta, roll_info_panel, scrollable_id, search_input_id,
+    FrameMeta, editing_panel, frame_info_panel, help_overlay, library_view, load_frame_meta,
+    roll_info_panel, roll_view, scrollable_id, search_input_id,
 };
 use cosmic::Application;
 use cosmic::app::context_drawer;
@@ -231,9 +231,9 @@ pub(crate) struct AppModel {
     recon: ReconSettings,
     /// The library page's state (rolls, selection, search, cover chain, drafts).
     pub(crate) library: LibraryState,
-    /// The open roll (frame grid + optional detail view), or `None` on the
-    /// library page. See [`RollView`].
-    pub(crate) roll: RollView,
+    /// The open roll (frame grid + optional detail view); `dir` is `None` on the
+    /// library page. See [`RollState`].
+    pub(crate) roll: RollState,
     /// The modifier keys currently held, delivered by the global keyboard
     /// subscription's `ModifiersChanged` event. A frame click reads this to
     /// distinguish a plain click (clear + select) from a Ctrl+click (toggle a
@@ -401,7 +401,7 @@ pub(crate) enum LibrarySelection {
 /// The library page's state: the roll cards, the selected cell, the header
 /// search, the cover-decode chain, and the roll-info drawer's drafts. Groups
 /// everything that belongs to the library page so it can persist independently
-/// of an open roll (whose state will live beside it as `roll: Option<RollView>`).
+/// of an open roll (which lives beside it as `roll: RollState`).
 pub(crate) struct LibraryState {
     /// Film rolls listed on the library page, one directory of negatives each.
     pub(crate) rolls: Vec<Roll>,
@@ -675,12 +675,14 @@ impl DetailState {
     }
 }
 
-/// The open roll's frame-grid state: the tiles, the frame selection, the RAM
-/// edit manifest, and the detail-decode bookkeeping that outlives a detail close
-/// (`detail_inflight`, `detail_preload_inflight`, `detail_area_size`). Grouped
-/// with the optional detail state in a [`RollView`].
+/// The open roll's state: its directory, frame grid (tiles + selection), the RAM
+/// edit manifest, the detail-decode bookkeeping, and the (optional) detail view.
+/// `dir` is `None` when no roll is open (the library page); `detail.frame` is
+/// `None` when no detail view is open.
 #[derive(Default)]
 pub(crate) struct RollState {
+    /// The roll's directory, or `None` when no roll is open.
+    pub(crate) dir: Option<PathBuf>,
     /// File entries from the open roll, displayed as tiles on its frame grid.
     pub(crate) tiles: Vec<Tile>,
     /// The frame-grid selection (focus + multi-selection + Shift anchor).
@@ -695,18 +697,36 @@ pub(crate) struct RollState {
     /// (`DetailAreaResized`). Preview geometry that survives a detail close, so
     /// frame paging keeps the 1:1 zoom cap live.
     pub(crate) detail_area_size: Option<Size>,
-}
-
-/// The open roll: its directory plus the frame-grid state and the (optional)
-/// detail-view state. `dir` is `None` when no roll is open (the library page).
-#[derive(Default)]
-pub(crate) struct RollView {
-    /// The roll's directory, or `None` when no roll is open.
-    pub(crate) dir: Option<PathBuf>,
-    /// The frame grid + per-roll state.
-    pub(crate) state: RollState,
     /// The open frame's detail-view state (`frame` is `None` when closed).
     pub(crate) detail: DetailState,
+}
+
+impl RollState {
+    /// File entries shown as tiles on the frame grid.
+    pub(crate) fn tiles(&self) -> &[Tile] {
+        &self.tiles
+    }
+
+    /// The roll's clear-film base, or the default when uncalibrated.
+    pub(crate) fn base(&self) -> f32 {
+        self.manifest.base_or_default()
+    }
+
+    /// The designated calibration frame name, if any.
+    pub(crate) fn calibration_frame(&self) -> Option<&str> {
+        self.manifest.calibration_frame()
+    }
+
+    /// The roll's start date (ISO `YYYY-MM-DD`), if set.
+    pub(crate) fn start_date(&self) -> Option<&str> {
+        self.manifest.start_date()
+    }
+
+    /// Whether the frame tile `name` is in the multi-selection (drives its
+    /// accent ring).
+    pub(crate) fn frame_is_selected(&self, name: &str) -> bool {
+        self.sel.contains(name)
+    }
 }
 
 /// A film roll: a user-chosen directory of negatives, listed as a cover tile
@@ -1362,7 +1382,7 @@ impl cosmic::Application for AppModel {
                 roll_drafts_version: 0,
                 roll_drafts_dirty: false,
             },
-            roll: RollView::default(),
+            roll: RollState::default(),
             modifiers: keyboard::Modifiers::default(),
             editing_key_held: false,
             // A 3-wide grid is a safe initial guess until the first resize.
@@ -1470,8 +1490,7 @@ impl cosmic::Application for AppModel {
         // (a focused/highlighted frame or an open detail view); on the library
         // page no frame is ever selected, even when a roll is. Paste
         // additionally needs a non-empty edit clipboard to apply.
-        let frame_context =
-            self.roll.state.sel.primary().is_some() || self.roll.detail.frame.is_some();
+        let frame_context = self.roll.sel.primary().is_some() || self.roll.detail.frame.is_some();
         let copy_edits = if frame_context {
             menu::Item::Button(fl!("menu-copy-edits"), None, MenuAction::CopyEdits)
         } else {
@@ -1487,7 +1506,7 @@ impl cosmic::Application for AppModel {
         // roll's calibration frame; meaningful with an eligible frame selected.
         // The handler no-ops without one, so the menu gates on its selection.
         let calibrate_enabled = self.roll.dir.is_some()
-            && (self.roll.detail.frame.is_some() || self.roll.state.sel.primary().is_some());
+            && (self.roll.detail.frame.is_some() || self.roll.sel.primary().is_some());
         let calibrate_items = if calibrate_enabled {
             vec![
                 menu::Item::Divider,
@@ -1525,7 +1544,7 @@ impl cosmic::Application for AppModel {
         // view, a highlighted frame inside a roll, or a roll selected on the
         // library page (the page guards make it a no-op everywhere else).
         let details_enabled = self.roll.detail.frame.is_some()
-            || (self.roll.dir.is_some() && self.roll.state.sel.primary().is_some())
+            || (self.roll.dir.is_some() && self.roll.sel.primary().is_some())
             || (self.roll.dir.is_none()
                 && matches!(&self.library.selection, Some(LibrarySelection::Roll(_))));
         let details = if details_enabled {
@@ -1607,7 +1626,7 @@ impl cosmic::Application for AppModel {
         // beside it. `selected` also gates it: `detail_inflight` is NOT cleared
         // when Escape closes the view (only roll-close does), so this keeps a
         // decode still in flight from spinning forever on the grid below.
-        if self.roll.detail.frame.is_some() && self.roll.state.detail_inflight.is_some() {
+        if self.roll.detail.frame.is_some() && self.roll.detail_inflight.is_some() {
             let spinner = cosmic::widget::indeterminate_circular().size(18.0);
             let spinner = cosmic::widget::tooltip(
                 spinner,
@@ -1658,7 +1677,7 @@ impl cosmic::Application for AppModel {
 
                 Some(
                     context_drawer::context_drawer(
-                        editing_panel(self),
+                        editing_panel(&self.roll.detail, self.roll.base(), self.histogram_mode),
                         Message::ToggleContextPage(ContextPage::Editing),
                     )
                     .title(name),
@@ -1698,14 +1717,14 @@ impl cosmic::Application for AppModel {
                 if self.roll.detail.frame.is_some() || self.roll.dir.is_none() {
                     return None;
                 }
-                let name = self.roll.state.sel.primary()?;
-                if !self.roll.state.tiles.iter().any(|tile| tile.name == name) {
+                let name = self.roll.sel.primary()?;
+                if !self.roll.tiles.iter().any(|tile| tile.name == name) {
                     return None;
                 }
 
                 Some(
                     context_drawer::context_drawer(
-                        frame_info_panel(self, name),
+                        frame_info_panel(&self.roll, name),
                         Message::ToggleContextPage(ContextPage::FrameInfo),
                     )
                     .title(name),
@@ -1725,8 +1744,8 @@ impl cosmic::Application for AppModel {
         // column wrapper also applies the Fill sizing the views otherwise
         // shrink to.
         let content: Element<_> = match self.roll.dir.as_deref() {
-            Some(_) => frames_view(self),
-            None => library_view(self),
+            Some(_) => roll_view(&self.roll, self.detail_cursor_interaction()),
+            None => library_view(&self.library),
         };
 
         let content: Element<_> = widget::column::with_capacity(1)
@@ -1740,7 +1759,7 @@ impl cosmic::Application for AppModel {
         // then the global help overlay above everything when it is open.
         let content = toaster::toaster(&self.toasts, content);
         if self.help_visible {
-            Stack::with_children([content, help_overlay(self)]).into()
+            Stack::with_children([content, help_overlay()]).into()
         } else {
             content
         }
@@ -2056,7 +2075,7 @@ impl cosmic::Application for AppModel {
                 // keeps wheels that keep zooming through a running decode
                 // (up to the projected native cap) from re-entering the busy
                 // slot — the landing re-pump covers a zoom taken mid-load.
-                if self.roll.state.detail_inflight.is_none()
+                if self.roll.detail_inflight.is_none()
                     && self.roll.detail.zoom.0 >= self.native_level_up_zoom()
                     && !self.roll.detail.native_queued
                 {
@@ -2066,7 +2085,7 @@ impl cosmic::Application for AppModel {
             }
 
             Message::DetailAreaResized(size) => {
-                self.roll.state.detail_area_size = Some(size);
+                self.roll.detail_area_size = Some(size);
                 self.reclamp_detail_zoom();
                 Task::none()
             }
@@ -2110,23 +2129,18 @@ impl cosmic::Application for AppModel {
                 self.roll.detail.rotation = self.roll.detail.reset_rotation;
                 if let Some(selected) = &self.roll.detail.frame {
                     self.roll
-                        .state
                         .manifest
                         .set_exposure(selected, self.roll.detail.reset_tone.exposure_ev);
                     self.roll
-                        .state
                         .manifest
                         .set_develop(selected, self.roll.detail.reset_tone);
                     self.roll
-                        .state
                         .manifest
                         .set_crop(selected, self.roll.detail.reset_crop);
                     self.roll
-                        .state
                         .manifest
                         .set_aspect(selected, self.roll.detail.reset_aspect);
                     self.roll
-                        .state
                         .manifest
                         .set_rotation(selected, self.roll.detail.reset_rotation);
                 }
@@ -2136,7 +2150,7 @@ impl cosmic::Application for AppModel {
                         self.roll
                             .detail
                             .reset_tone
-                            .to_develop(self.roll.state.manifest.base_or_default()),
+                            .to_develop(self.roll.manifest.base_or_default()),
                     );
                     shader.set_crop(self.roll.detail.reset_crop);
                     shader.set_rotation(self.roll.detail.reset_rotation);
@@ -2151,12 +2165,8 @@ impl cosmic::Application for AppModel {
                 self.roll.detail.crop = edit_manifest::CropMargins::default();
                 self.roll.detail.aspect = edit_manifest::AspectRatio::Original;
                 if let Some(selected) = &self.roll.detail.frame {
+                    self.roll.manifest.set_crop(selected, self.roll.detail.crop);
                     self.roll
-                        .state
-                        .manifest
-                        .set_crop(selected, self.roll.detail.crop);
-                    self.roll
-                        .state
                         .manifest
                         .set_aspect(selected, self.roll.detail.aspect);
                 }
@@ -2177,7 +2187,7 @@ impl cosmic::Application for AppModel {
                 self.roll.detail.aspect = aspect;
                 self.refit_crop_aspect(edit_manifest::CropMargins::default());
                 if let Some(selected) = &self.roll.detail.frame {
-                    self.roll.state.manifest.set_aspect(selected, aspect);
+                    self.roll.manifest.set_aspect(selected, aspect);
                 }
                 self.commit_edit()
             }
@@ -2380,7 +2390,7 @@ impl cosmic::Application for AppModel {
             Message::OpenSelected => {
                 if self.roll.dir.is_some() {
                     // Frame page: open the highlighted frame in the detail view.
-                    if let Some(name) = self.roll.state.sel.primary().map(str::to_owned) {
+                    if let Some(name) = self.roll.sel.primary().map(str::to_owned) {
                         self.open_frame(&name)
                     } else {
                         Task::none()
@@ -2399,19 +2409,19 @@ impl cosmic::Application for AppModel {
             Message::Key(input) => self.on_key(&input),
 
             Message::FrameSelected(name) => {
-                self.roll.state.sel.apply_click(
+                self.roll.sel.apply_click(
                     &name,
                     self.modifiers.control(),
                     self.modifiers.shift(),
-                    &self.roll.state.tiles,
+                    &self.roll.tiles,
                 );
                 self.ensure_frame_info_loaded().unwrap_or_else(Task::none)
             }
 
             Message::SelectAllFrames => {
                 if self.roll.dir.is_some() {
-                    let names = self.roll.state.tiles.iter().map(|tile| tile.name.clone());
-                    self.roll.state.sel.select_all(names);
+                    let names = self.roll.tiles.iter().map(|tile| tile.name.clone());
+                    self.roll.sel.select_all(names);
                 }
                 Task::none()
             }
@@ -2438,8 +2448,8 @@ impl cosmic::Application for AppModel {
                 // Load the roll manifest and reconcile it against what is on
                 // disk, so edits for removed files never reattach to a name
                 // that later returns.
-                self.roll.state.manifest = edit_manifest::load_roll_manifest(&dir);
-                edit_manifest::reconcile(&mut self.roll.state.manifest, &files);
+                self.roll.manifest = edit_manifest::load_roll_manifest(&dir);
+                edit_manifest::reconcile(&mut self.roll.manifest, &files);
 
                 // The frame grid remounts; any cached viewport is stale until
                 // it scrolls again.
@@ -2447,7 +2457,7 @@ impl cosmic::Application for AppModel {
                 self.thumb_inflight.clear();
                 self.calibration_inflight = None;
 
-                self.roll.state.tiles = files
+                self.roll.tiles = files
                     .into_iter()
                     .map(|name| Tile {
                         name,
@@ -2459,8 +2469,8 @@ impl cosmic::Application for AppModel {
 
                 // Pre-select the first frame so the grid always has a
                 // highlight (the detail view stays closed; Enter opens it).
-                if let Some(first) = self.roll.state.tiles.first() {
-                    self.roll.state.sel.select_only(&first.name);
+                if let Some(first) = self.roll.tiles.first() {
+                    self.roll.sel.select_only(&first.name);
                 }
 
                 // The grid's remembered drawer state can only be applied once a
@@ -2475,10 +2485,10 @@ impl cosmic::Application for AppModel {
                 // flight `decode_next` is gated, and the landing `reflow_base`
                 // decodes every tile once under the measured base.
                 let mut tasks = vec![];
-                if self.roll.state.manifest.calibration_frame().is_none()
-                    && let Some(first) = self.roll.state.tiles.first().map(|tile| tile.name.clone())
+                if self.roll.manifest.calibration_frame().is_none()
+                    && let Some(first) = self.roll.tiles.first().map(|tile| tile.name.clone())
                 {
-                    self.roll.state.manifest.set_calibration_frame(&first);
+                    self.roll.manifest.set_calibration_frame(&first);
                     self.persist_roll();
                     self.calibration_inflight = Some(first.clone());
                     tasks.push(cosmic::task::future(measure_frame_base(dir.clone(), first)));
@@ -2552,13 +2562,7 @@ impl cosmic::Application for AppModel {
                     rebake_trace(format_args!("ThumbReady: {name} -> Failed"));
                     (None, None)
                 };
-                if let Some(tile) = self
-                    .roll
-                    .state
-                    .tiles
-                    .iter_mut()
-                    .find(|tile| tile.name == name)
-                {
+                if let Some(tile) = self.roll.tiles.iter_mut().find(|tile| tile.name == name) {
                     tile.thumb = match ready {
                         Some(handle) => Thumb::Ready(handle),
                         None => Thumb::Failed,
@@ -2576,13 +2580,7 @@ impl cosmic::Application for AppModel {
             }
 
             Message::FrameInfoReady(name, result) => {
-                if let Some(tile) = self
-                    .roll
-                    .state
-                    .tiles
-                    .iter_mut()
-                    .find(|tile| tile.name == name)
-                {
+                if let Some(tile) = self.roll.tiles.iter_mut().find(|tile| tile.name == name) {
                     match result {
                         Ok(meta) => tile.meta = Some(meta),
                         Err(_) => tile.meta_failed = true,
@@ -2835,12 +2833,6 @@ impl AppModel {
         }
     }
 
-    /// Whether the frame tile `name` is in the open roll's multi-selection
-    /// (drives its accent ring); exposed for the grid view.
-    pub(crate) fn frame_is_selected(&self, name: &str) -> bool {
-        self.roll.state.sel.contains(name)
-    }
-
     /// Ensures the library page always has a selection once rolls exist:
     /// whenever nothing is selected, highlight the first visible roll
     /// (respecting an active search). No-op while a roll is open, while no roll
@@ -2900,22 +2892,22 @@ impl AppModel {
             // Read the stored edits BEFORE the decode builds the shader, which
             // consumes the live tone (via `set_develop` in
             // `handle_detail_ready`).
-            let stored_tone = self.roll.state.manifest.tone(name);
+            let stored_tone = self.roll.manifest.tone(name);
             self.roll.detail.frame = Some(name.to_owned());
             // The opened frame becomes the primary of the multi-selection (and
             // the Shift+click anchor), so copy/paste batches stay consistent
             // with what is on screen. Shift+open extends; a plain open collapses
             // the set to the single opened frame.
             if self.modifiers.shift() {
-                self.roll.state.sel.add(name);
+                self.roll.sel.add(name);
             } else {
-                self.roll.state.sel.select_only(name);
+                self.roll.sel.select_only(name);
             }
             self.clear_detail();
             self.roll.detail.tone = stored_tone;
-            self.roll.detail.crop = self.roll.state.manifest.crop(name);
-            self.roll.detail.aspect = self.roll.state.manifest.aspect(name);
-            self.roll.detail.rotation = self.roll.state.manifest.rotation(name) & 3;
+            self.roll.detail.crop = self.roll.manifest.crop(name);
+            self.roll.detail.aspect = self.roll.manifest.aspect(name);
+            self.roll.detail.rotation = self.roll.manifest.rotation(name) & 3;
             // Entering the detail view: the drawer (if the detail's memory says
             // open) shows the editing panel; navigation never closes it.
             self.restore_drawer_for(DrawerView::Detail);
@@ -2947,14 +2939,14 @@ impl AppModel {
         }
         // Deterministic order for the export so a re-run writes files in the
         // same sequence (a HashSet has no stable order).
-        let mut names: Vec<String> = self.roll.state.sel.iter().cloned().collect();
+        let mut names: Vec<String> = self.roll.sel.iter().cloned().collect();
         names.sort();
         names
     }
 
     /// Whether [`Self::export_targets`] would yield at least one frame.
     fn has_export_targets(&self) -> bool {
-        self.roll.dir.is_some() && !self.roll.state.sel.is_empty()
+        self.roll.dir.is_some() && !self.roll.sel.is_empty()
     }
 
     /// Exports every target frame into `dest`, one file per frame named
@@ -2990,8 +2982,8 @@ impl AppModel {
         // full-roll position (the sorted order the grid shows), the offset used
         // for a stable synthetic capture timestamp, and the roll's start date
         // (when set) travels along to stamp DateTimeOriginal on the output.
-        let start_date = self.roll.state.manifest.start_date().map(str::to_owned);
-        let base = self.roll.state.manifest.base_or_default();
+        let start_date = self.roll.manifest.start_date().map(str::to_owned);
+        let base = self.roll.manifest.base_or_default();
         let frames: Vec<(
             String,
             crate::film::Develop,
@@ -3001,12 +2993,11 @@ impl AppModel {
         )> = names
             .into_iter()
             .map(|name| {
-                let develop = self.roll.state.manifest.tone(&name).to_develop(base);
-                let crop = self.roll.state.manifest.crop(&name);
-                let rotation = self.roll.state.manifest.rotation(&name) & 3;
+                let develop = self.roll.manifest.tone(&name).to_develop(base);
+                let crop = self.roll.manifest.crop(&name);
+                let rotation = self.roll.manifest.rotation(&name) & 3;
                 let index = self
                     .roll
-                    .state
                     .tiles
                     .iter()
                     .position(|tile| tile.name == name)
@@ -3118,7 +3109,7 @@ impl AppModel {
     /// The visible tile-index range of the open roll's frame grid (see
     /// [`Self::visible_range`]). Empty when no roll is open.
     fn visible_tile_range(&self) -> std::ops::Range<usize> {
-        self.visible_range(self.roll.state.tiles.len())
+        self.visible_range(self.roll.tiles.len())
     }
 
     /// Scrolls the mounted grid so the tile at `index` (within the matched set
@@ -3218,7 +3209,7 @@ impl AppModel {
             return Task::none();
         }
 
-        let base = self.roll.state.manifest.base_or_default();
+        let base = self.roll.manifest.base_or_default();
         // Decode only tiles near the viewport (visible rows + overscan): a large
         // roll no longer decodes every frame on open — off-screen tiles stay
         // `Loading` until scrolled near, so they cost neither CPU nor RAM.
@@ -3235,7 +3226,6 @@ impl AppModel {
             Option<ThumbMono>,
         )> = self
             .roll
-            .state
             .tiles
             .get(visible)
             .unwrap_or(&[])
@@ -3245,9 +3235,9 @@ impl AppModel {
             .take(capacity)
             .map(|tile| {
                 let name = tile.name.clone();
-                let develop = self.roll.state.manifest.tone(&name).to_develop(base);
-                let crop = self.roll.state.manifest.crop(&name);
-                let rotation = self.roll.state.manifest.rotation(&name) & 3;
+                let develop = self.roll.manifest.tone(&name).to_develop(base);
+                let crop = self.roll.manifest.crop(&name);
+                let rotation = self.roll.manifest.rotation(&name) & 3;
                 let cached = self.thumb_cache.get(&(dir.clone(), name.clone())).cloned();
                 (name, develop, crop, rotation, cached)
             })
@@ -3256,7 +3246,7 @@ impl AppModel {
         if planned.is_empty() {
             rebake_trace(format_args!(
                 "decode_next: no loading tiles (tiles={}, inflight={})",
-                self.roll.state.tiles.len(),
+                self.roll.tiles.len(),
                 self.thumb_inflight.len()
             ));
             return Task::none();
@@ -3418,13 +3408,7 @@ impl AppModel {
             "re_bake_edit: selected={name} active={}",
             self.roll.dir.is_some()
         ));
-        if let Some(tile) = self
-            .roll
-            .state
-            .tiles
-            .iter_mut()
-            .find(|tile| tile.name == name)
-        {
+        if let Some(tile) = self.roll.tiles.iter_mut().find(|tile| tile.name == name) {
             tile.thumb = Thumb::Loading;
             rebake_trace(format_args!("re_bake_edit: tile {name} -> Loading"));
         }
@@ -3470,7 +3454,7 @@ impl AppModel {
             .detail
             .frame
             .clone()
-            .or_else(|| self.roll.state.sel.primary().map(str::to_owned))
+            .or_else(|| self.roll.sel.primary().map(str::to_owned))
         else {
             return Task::none();
         };
@@ -3484,15 +3468,15 @@ impl AppModel {
             // Designate the frame in RAM AND on disk before the decode returns,
             // since `apply_calibration_measurement` reads the manifest back
             // from disk and would otherwise drop the result as stale.
-            self.roll.state.manifest.set_calibration_frame(&name);
+            self.roll.manifest.set_calibration_frame(&name);
             self.persist_roll();
             return cosmic::task::future(measure_frame_base(dir, name));
         };
         let base = measure_base(&cached.image.data).filter(|base| *base >= MIN_PLAUSIBLE_BASE);
-        self.roll.state.manifest.set_calibration_frame(&name);
+        self.roll.manifest.set_calibration_frame(&name);
         match base {
-            Some(base) => self.roll.state.manifest.set_calibrated_base(base),
-            None => self.roll.state.manifest.base = None,
+            Some(base) => self.roll.manifest.set_calibrated_base(base),
+            None => self.roll.manifest.base = None,
         }
         self.reflow_base()
     }
@@ -3537,10 +3521,10 @@ impl AppModel {
             );
         }
         if self.roll.dir.as_deref() == Some(dir) {
-            self.roll.state.manifest.set_calibration_frame(name);
+            self.roll.manifest.set_calibration_frame(name);
             match base {
-                Some(base) => self.roll.state.manifest.set_calibrated_base(base),
-                None => self.roll.state.manifest.base = None,
+                Some(base) => self.roll.manifest.set_calibrated_base(base),
+                None => self.roll.manifest.base = None,
             }
             self.reflow_base()
         } else {
@@ -3567,13 +3551,13 @@ impl AppModel {
         self.roll.detail.shader = None;
         self.roll.detail.native_queued = false;
         self.roll.detail.logged_failure = None;
-        self.roll.state.detail_inflight = None;
-        self.roll.state.detail_preload_inflight.clear();
+        self.roll.detail_inflight = None;
+        self.roll.detail_preload_inflight.clear();
         self.roll.detail.thumb = None;
         self.roll.detail.last_frame = None;
         let _ = self.detail_cache.retain(|_| false);
         // Re-bake every grid tile and the open roll's cover under the new base.
-        for tile in &mut self.roll.state.tiles {
+        for tile in &mut self.roll.tiles {
             tile.thumb = Thumb::Loading;
         }
         self.thumb_inflight.clear();
@@ -3606,8 +3590,8 @@ impl AppModel {
     /// [`NATIVE_ZOOM_THRESHOLD`]) — the flag makes the level-up one-shot, and
     /// the inflight slot makes extra wheels no-ops.
     fn decode_detail_next(&mut self) -> Task<cosmic::Action<Message>> {
-        if self.roll.state.detail_inflight.is_some() || self.roll.detail.frame.is_none() {
-            if self.roll.state.detail_inflight.is_some() {
+        if self.roll.detail_inflight.is_some() || self.roll.detail.frame.is_none() {
+            if self.roll.detail_inflight.is_some() {
                 detail_trace(format_args!(
                     "trigger swallowed: inflight slot busy (zoom={:.3})",
                     self.roll.detail.zoom.0
@@ -3664,7 +3648,7 @@ impl AppModel {
             self.roll.detail.zoom.0
         ));
 
-        self.roll.state.detail_inflight = Some(name.clone());
+        self.roll.detail_inflight = Some(name.clone());
 
         let Some(dir) = self.roll.dir.clone() else {
             return Task::none();
@@ -3693,7 +3677,7 @@ impl AppModel {
             self.roll
                 .detail
                 .tone
-                .to_develop(self.roll.state.manifest.base_or_default()),
+                .to_develop(self.roll.manifest.base_or_default()),
             self.roll.detail.crop,
             self.roll.detail.rotation,
             image_id,
@@ -3743,7 +3727,7 @@ impl AppModel {
             .roll
             .detail
             .tone
-            .to_develop(self.roll.state.manifest.base_or_default());
+            .to_develop(self.roll.manifest.base_or_default());
         self.histogram_generation = self.histogram_generation.wrapping_add(1);
         let generation = self.histogram_generation;
         self.roll.detail.histogram_inflight = true;
@@ -3766,7 +3750,6 @@ impl AppModel {
         result: Result<DetailDecode, FrameError>,
     ) -> Task<cosmic::Action<Message>> {
         self.roll
-            .state
             .detail_preload_inflight
             .retain(|(pending_dir, pending_name)| pending_dir != dir || pending_name != name);
 
@@ -3796,13 +3779,7 @@ impl AppModel {
             return Task::none();
         };
 
-        let Some(current) = self
-            .roll
-            .state
-            .tiles
-            .iter()
-            .position(|tile| tile.name == name)
-        else {
+        let Some(current) = self.roll.tiles.iter().position(|tile| tile.name == name) else {
             return Task::none();
         };
 
@@ -3811,18 +3788,18 @@ impl AppModel {
         let mut neighbors = Vec::new();
         for step in 1..=DETAIL_PRELOAD_DISTANCE {
             if let Some(prev) = current.checked_sub(step) {
-                neighbors.push(self.roll.state.tiles[prev].name.clone());
+                neighbors.push(self.roll.tiles[prev].name.clone());
             }
             if let Some(next) = current
                 .checked_add(step)
-                .filter(|&i| i < self.roll.state.tiles.len())
+                .filter(|&i| i < self.roll.tiles.len())
             {
-                neighbors.push(self.roll.state.tiles[next].name.clone());
+                neighbors.push(self.roll.tiles[next].name.clone());
             }
         }
 
         let capacity =
-            MAX_CONCURRENT_PRELOADS.saturating_sub(self.roll.state.detail_preload_inflight.len());
+            MAX_CONCURRENT_PRELOADS.saturating_sub(self.roll.detail_preload_inflight.len());
         if capacity == 0 {
             return Task::none();
         }
@@ -3834,7 +3811,6 @@ impl AppModel {
                 !self.detail_cache.contains(&key)
                     && !self
                         .roll
-                        .state
                         .detail_preload_inflight
                         .iter()
                         .any(|(pd, pn)| pd == &dir && pn == n)
@@ -3847,7 +3823,6 @@ impl AppModel {
         }
 
         self.roll
-            .state
             .detail_preload_inflight
             .extend(pending.iter().map(|n| (dir.clone(), n.clone())));
 
@@ -3878,12 +3853,12 @@ impl AppModel {
         self.clear_detail();
     }
 
-    /// Closes the open roll, resetting the whole `RollView` (grid, manifest,
+    /// Closes the open roll, resetting the whole `RollState` (grid, manifest,
     /// detail) plus the roll-scoped viewport/decode bookkeeping, so nothing
     /// leaks onto the library page. The overview/thumbnail LRUs are kept (they
     /// survive roll switches by design). Persist edits before calling.
     fn close_roll(&mut self) {
-        self.roll = RollView::default();
+        self.roll = RollState::default();
         self.grid_viewport = None;
         self.thumb_inflight.clear();
         self.calibration_inflight = None;
@@ -3901,7 +3876,7 @@ impl AppModel {
         let Some(shader) = &self.roll.detail.shader else {
             return MAX_DETAIL_ZOOM;
         };
-        let Some(size) = self.roll.state.detail_area_size else {
+        let Some(size) = self.roll.detail_area_size else {
             return MAX_DETAIL_ZOOM;
         };
         let sf = self.core().scale_factor();
@@ -3925,10 +3900,10 @@ impl AppModel {
         let Some(shader) = &self.roll.detail.shader else {
             return MAX_DETAIL_ZOOM;
         };
-        let Some(size) = self.roll.state.detail_area_size else {
+        let Some(size) = self.roll.detail_area_size else {
             return self.max_detail_zoom();
         };
-        if self.roll.state.detail_inflight.is_none() {
+        if self.roll.detail_inflight.is_none() {
             return self.max_detail_zoom();
         }
         let (src_w, src_h) = shader.source_dimensions();
@@ -4026,7 +4001,7 @@ impl AppModel {
                 self.roll.dir.is_none()
                     && matches!(&self.library.selection, Some(LibrarySelection::Roll(_)))
             }
-            DrawerView::Grid => self.roll.dir.is_some() && self.roll.state.sel.primary().is_some(),
+            DrawerView::Grid => self.roll.dir.is_some() && self.roll.sel.primary().is_some(),
             DrawerView::Detail => self.roll.detail.frame.is_some(),
         }
     }
@@ -4153,11 +4128,10 @@ impl AppModel {
         if self.context_page != ContextPage::FrameInfo || !self.core.window.show_context {
             return None;
         }
-        let name = self.roll.state.sel.primary()?.to_owned();
+        let name = self.roll.sel.primary()?.to_owned();
         let dir = self.roll.dir.clone()?;
         let needs_parse = self
             .roll
-            .state
             .tiles
             .iter()
             .find(|tile| tile.name == name)
@@ -4180,7 +4154,7 @@ impl AppModel {
         let Some(dir) = &self.roll.dir else {
             return;
         };
-        if let Err(err) = edit_manifest::save_roll_manifest(dir, &self.roll.state.manifest) {
+        if let Err(err) = edit_manifest::save_roll_manifest(dir, &self.roll.manifest) {
             log::error!("failed to save edits: {err}");
         }
     }
@@ -4375,7 +4349,7 @@ impl AppModel {
         let Some(shader) = &self.roll.detail.shader else {
             return false;
         };
-        let Some(size) = self.roll.state.detail_area_size else {
+        let Some(size) = self.roll.detail_area_size else {
             return false;
         };
         let Some(cursor) = self.roll.detail.cursor else {
@@ -4398,7 +4372,7 @@ impl AppModel {
     /// rotation into a source-pixel delta, moves the window (clamped to the
     /// frame), and writes it live. No-op without a detail shader/size.
     fn apply_crop_drag(&mut self, dx: f32, dy: f32) {
-        let Some(size) = self.roll.state.detail_area_size else {
+        let Some(size) = self.roll.detail_area_size else {
             return;
         };
         let Some(shader) = &self.roll.detail.shader else {
@@ -4423,17 +4397,14 @@ impl AppModel {
             // Inside a roll. With the detail view open, Left/Right page
             // through the frames; on the bare grid they move the highlight.
             if self.roll.detail.frame.is_some() {
-                let current = self.roll.detail.frame.as_ref().and_then(|name| {
-                    self.roll
-                        .state
-                        .tiles
-                        .iter()
-                        .position(|tile| tile.name == *name)
-                });
+                let current =
+                    self.roll.detail.frame.as_ref().and_then(|name| {
+                        self.roll.tiles.iter().position(|tile| tile.name == *name)
+                    });
                 if let Some(target) =
-                    current.and_then(|idx| paginate(idx, self.roll.state.tiles.len(), dir))
+                    current.and_then(|idx| paginate(idx, self.roll.tiles.len(), dir))
                 {
-                    let name = self.roll.state.tiles[target].name.clone();
+                    let name = self.roll.tiles[target].name.clone();
                     return self.open_frame(&name);
                 }
                 return Task::none();
@@ -4441,26 +4412,24 @@ impl AppModel {
 
             // Bare frame grid: move the highlight, then reveal it if it stepped
             // out of the viewport.
-            let selected = self.roll.state.sel.primary().and_then(|name| {
-                self.roll
-                    .state
-                    .tiles
-                    .iter()
-                    .position(|tile| tile.name == name)
-            });
-            let len = self.roll.state.tiles.len();
+            let selected = self
+                .roll
+                .sel
+                .primary()
+                .and_then(|name| self.roll.tiles.iter().position(|tile| tile.name == name));
+            let len = self.roll.tiles.len();
             let cols = self.nav_cols();
             if let Some(target) = nav_target(selected, len, cols, dir) {
-                let name = self.roll.state.tiles[target].name.clone();
+                let name = self.roll.tiles[target].name.clone();
                 // Shift+arrow extends the multi-selection (keeping it
                 // additive); a plain arrow collapses to the new primary.
                 if self.modifiers.shift() {
-                    self.roll.state.sel.add(&name);
+                    self.roll.sel.add(&name);
                 } else {
-                    self.roll.state.sel.select_only(&name);
+                    self.roll.sel.select_only(&name);
                 }
                 return Task::batch([
-                    self.scroll_selection_into_view("frames-grid", target, len, cols),
+                    self.scroll_selection_into_view("roll-grid", target, len, cols),
                     self.ensure_frame_info_loaded().unwrap_or_else(Task::none),
                 ]);
             }
@@ -4494,7 +4463,7 @@ impl AppModel {
     fn set_exposure(&mut self, ev: f32) {
         self.roll.detail.tone.exposure_ev = ev;
         if let Some(selected) = &self.roll.detail.frame {
-            self.roll.state.manifest.set_exposure(selected, ev);
+            self.roll.manifest.set_exposure(selected, ev);
         }
         if let Some(shader) = &mut self.roll.detail.shader {
             shader.set_exposure(ev);
@@ -4517,7 +4486,6 @@ impl AppModel {
         self.roll.detail.tone.pivot_offset = pivot;
         if let Some(selected) = &self.roll.detail.frame {
             self.roll
-                .state
                 .manifest
                 .set_develop(selected, self.roll.detail.tone);
         }
@@ -4526,7 +4494,7 @@ impl AppModel {
                 self.roll
                     .detail
                     .tone
-                    .to_develop(self.roll.state.manifest.base_or_default()),
+                    .to_develop(self.roll.manifest.base_or_default()),
             );
         }
     }
@@ -4657,7 +4625,6 @@ impl AppModel {
         self.roll.detail.rotation = (self.roll.detail.rotation + 1) & 3;
         if let Some(selected) = &self.roll.detail.frame {
             self.roll
-                .state
                 .manifest
                 .set_rotation(selected, self.roll.detail.rotation);
         }
@@ -4711,7 +4678,7 @@ impl AppModel {
     fn apply_crop(&mut self, crop: edit_manifest::CropMargins) {
         self.roll.detail.crop = crop;
         if let Some(selected) = &self.roll.detail.frame {
-            self.roll.state.manifest.set_crop(selected, crop);
+            self.roll.manifest.set_crop(selected, crop);
         }
         if let Some(shader) = &mut self.roll.detail.shader {
             shader.set_crop(crop);
@@ -4726,13 +4693,12 @@ impl AppModel {
     fn copy_edits(&mut self) {
         let source = self
             .roll
-            .state
             .sel
             .primary()
             .or(self.roll.detail.frame.as_deref())
             .map(str::to_owned);
         if let Some(source) = source {
-            self.clipboard = Some(self.roll.state.manifest.tone(&source));
+            self.clipboard = Some(self.roll.manifest.tone(&source));
         }
     }
 
@@ -4750,7 +4716,6 @@ impl AppModel {
         // plus the open detail frame as a defensive fallback.
         let mut targets: Vec<String> = self
             .roll
-            .state
             .sel
             .iter()
             .cloned()
@@ -4764,7 +4729,7 @@ impl AppModel {
 
         // Apply to the RAM manifest for every target.
         for name in &targets {
-            self.roll.state.manifest.set_tone(name, tone);
+            self.roll.manifest.set_tone(name, tone);
         }
 
         // If the live detail frame is a target, sync the on-screen preview
@@ -4775,7 +4740,7 @@ impl AppModel {
             self.roll.detail.tone = tone;
             if let Some(shader) = &mut self.roll.detail.shader {
                 shader.set_exposure(tone.exposure_ev);
-                shader.set_develop(tone.to_develop(self.roll.state.manifest.base_or_default()));
+                shader.set_develop(tone.to_develop(self.roll.manifest.base_or_default()));
             }
         }
 
@@ -4784,13 +4749,7 @@ impl AppModel {
         // Re-bake the affected tiles so the grid reflects the new edits.
         let mut tasks = Vec::with_capacity(2);
         for name in &targets {
-            if let Some(tile) = self
-                .roll
-                .state
-                .tiles
-                .iter_mut()
-                .find(|tile| &tile.name == name)
-            {
+            if let Some(tile) = self.roll.tiles.iter_mut().find(|tile| &tile.name == name) {
                 tile.thumb = Thumb::Loading;
             }
         }
@@ -4866,7 +4825,7 @@ impl AppModel {
     ) -> Task<cosmic::Action<Message>> {
         if detail_result_is_current(
             self.roll.detail.frame.as_deref(),
-            self.roll.state.detail_inflight.as_deref(),
+            self.roll.detail_inflight.as_deref(),
             name,
         ) {
             // Only the first load of an image restarts the thumbnail
@@ -4908,7 +4867,6 @@ impl AppModel {
                     if fresh_open
                         && let Some(tile) = self
                             .roll
-                            .state
                             .tiles
                             .iter()
                             .find(|t| t.name == name)
@@ -4932,7 +4890,7 @@ impl AppModel {
                         self.roll
                             .detail
                             .tone
-                            .to_develop(self.roll.state.manifest.base_or_default()),
+                            .to_develop(self.roll.manifest.base_or_default()),
                         self.roll.detail.crop,
                         self.roll.detail.rotation,
                         image_id,
@@ -4987,7 +4945,7 @@ impl AppModel {
                 self.roll.detail.thumb_opacity = 1.0;
                 self.roll.detail.last_frame = None;
             }
-            self.roll.state.detail_inflight = None;
+            self.roll.detail_inflight = None;
 
             // Landing-time re-pump: a wheel taken while a decode was running
             // fired the trigger into an occupied slot and it was swallowed.
@@ -5013,7 +4971,7 @@ impl AppModel {
 
             // A superseded decode finished and freed the single slot;
             // start the current selection's queued request, if any.
-            self.roll.state.detail_inflight = None;
+            self.roll.detail_inflight = None;
 
             return self.decode_detail_next();
         }
