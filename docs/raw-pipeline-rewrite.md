@@ -152,35 +152,20 @@ and `ResetAll` restores the panel's opened state rather than the calibration
 value. A per-frame base override / calibration-only black reset remains a
 future addition.
 
-## Step 6 result: drawer histogram + curve overlay
+## Step 6 result: drawer histogram
 
-- `pipeline::histogram_from_develop(mono, develop, bins, mode)` bins the mono
-  over one of two axes (`HistogramMode`, toggled in the drawer; **Output
-  default**, persisted while the app runs):
-  - **Output** (default): the developed result `srgb_encode(develop.apply(v))`
-    — the "what does the photo look like" distribution; exposure and every
-    shape control move it.
-  - **Input**: the post-exposure density normalized onto the fixed
-    `p = density / DEFAULT_D_MAX` axis, sharing the tone curve's coordinate;
-    exposure shifts the bars along the axis.
+- `pipeline::histogram_from_develop(mono, develop, bins)` bins the mono into
+  the developed **output** distribution `srgb_encode(develop.apply(v))` — the
+  "what does the photo look like" axis; exposure and every shape control move
+  it. Bins normalize to sum 1.
 - `AppModel` keeps the overview mono as `histogram_mono: Arc<Vec<f32>>` (a
   refcount, never copied per tick) and recomputes the bins on the blocking pool
   whenever the develop changes. Computes **coalesce** — at most one running +
   one queued, so a fast drag does ~two passes instead of one per tick — with a
   monotonic generation so a stale landing never paints.
 - `ui::HistogramPlot` is an `iced` `canvas::Program` at the top of the editing
-  drawer, with a small **Input axis** toggler directly under the plot (off =
-  Output, on = Input):
-  - **Histogram** (bars): whichever axis `HistogramMode` selects, bar heights on
-    a fractional-power (`^0.25`) scale so sparse shadow/highlight populations
-    stay visible beside a dominant peak.
-  - **Curve** (stroke): `film::Develop::curve_point(p)` — the fixed-domain
-    `[0,1] → [0,1]` shape on the input axis. At the identity controls it is the
-    straight diagonal `[0,0] → [1,1]` (the classic tone-curve default);
-    contrast/pivot bend it and the Black/White anchors move where it reaches
-    0/1. **Exposure is excluded** from the curve. The curve is drawn in both
-    modes; in Output mode the bars are in result space, so the curve is an
-    overlay rather than sharing their axis.
+  drawer drawing the output bars with a fractional-power (`^0.25`) height scale
+  so sparse shadow/highlight populations stay visible beside a dominant peak.
 
 ## Steps 7–8 result: tests + verification
 
@@ -195,9 +180,8 @@ future addition.
 - **Anchor resolution**: `edit_manifest::calibration_base_and_frame_round_trip`,
   `clear_calibration_drops_frame_and_base`, `base_or_default`,
   `tone_builds_a_develop_with_the_roll_base`.
-- **Binning**: `pipeline::histogram_*` (normalization, measured + robust density
-  range, outlier rejection, flat/empty fallback) and `ui::curve_points_*`
-  (monotone, narrow-range, contrast steepening), `ui::bin_log_height_*`.
+- **Binning**: `pipeline::histogram_*` (normalization, empty/flat fallback,
+  exposure/greyscale shape tracking) and `ui::bin_log_height_*`.
 - `just check` (clippy `--all-features --locked`) and `cargo test --locked` are
-  green (202 tests); `cargo build --release --locked` compiles.
+  green (237 tests); `cargo build --release --locked` compiles.
 - **Manual visual check** on real negatives is still pending (needs image data).

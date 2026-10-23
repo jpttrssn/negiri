@@ -275,11 +275,6 @@ pub(crate) struct AppModel {
     /// The frame whose EXIF parse is currently in flight for the frame-info
     /// drawer, so a highlight change to the same frame does not double-spawn.
     frame_meta_inflight: Option<String>,
-    /// Which tone axis the drawer histogram bins over (Output = the developed
-    /// result, the default; Input = the develop's input tone, sharing the tone
-    /// curve's axis). User-selected; not persisted to the manifest, but kept
-    /// across frames and opens while the app runs.
-    pub(crate) histogram_mode: crate::pipeline::HistogramMode,
     /// Monotonic generation for histogram requests; a landed result is applied
     /// only when its generation still matches (a newer request superseded it).
     histogram_generation: u64,
@@ -575,8 +570,7 @@ impl FrameSelection {
 /// so closing the detail view is a single reset. `frame` is `None` when no
 /// detail view is open (the frame grid is showing). Fields that must survive
 /// detail close live on `RollState` (`detail_inflight`,
-/// `detail_preload_inflight`, `detail_area_size`) or `AppModel`
-/// (`histogram_mode`).
+/// `detail_preload_inflight`, `detail_area_size`).
 #[allow(clippy::struct_excessive_bools)] // independent per-interaction flags
 pub(crate) struct DetailState {
     /// The frame shown enlarged, or `None` when the detail view is closed.
@@ -705,11 +699,6 @@ impl RollState {
     /// File entries shown as tiles on the frame grid.
     pub(crate) fn tiles(&self) -> &[Tile] {
         &self.tiles
-    }
-
-    /// The roll's clear-film base, or the default when uncalibrated.
-    pub(crate) fn base(&self) -> f32 {
-        self.manifest.base_or_default()
     }
 
     /// The designated calibration frame name, if any.
@@ -902,13 +891,9 @@ pub(crate) enum Message {
     /// A neighbor preload decode finished. Unlike [`Message::DetailReady`] this
     /// only lands into the detail LRU cache; it never becomes the active shader.
     DetailPreloaded(PathBuf, String, Result<DetailDecode, FrameError>),
-    /// A drawer histogram compute landed: the binned developed mono plus the
-    /// measured input density range for `serial` (applied only while it is
-    /// still the latest request).
+    /// A drawer histogram compute landed: the binned developed mono for
+    /// `generation` (applied only while it is still the latest request).
     HistogramReady(u64, Vec<f32>),
-    /// The user toggled the drawer histogram between the develop's output
-    /// distribution (default) and its input tone axis.
-    SetHistogramMode(crate::pipeline::HistogramMode),
     /// The startup roll scan finished.
     RollsLoaded(Vec<Roll>),
     /// A single roll was scanned after being added; push it into the library.
@@ -1395,7 +1380,6 @@ impl cosmic::Application for AppModel {
             thumb_concurrency: thumb_concurrency(),
             calibration_inflight: None,
             frame_meta_inflight: None,
-            histogram_mode: crate::pipeline::HistogramMode::default(),
             histogram_generation: 0,
             help_visible: false,
             clipboard: None,
@@ -1677,7 +1661,7 @@ impl cosmic::Application for AppModel {
 
                 Some(
                     context_drawer::context_drawer(
-                        editing_panel(&self.roll.detail, self.roll.base(), self.histogram_mode),
+                        editing_panel(&self.roll.detail),
                         Message::ToggleContextPage(ContextPage::Editing),
                     )
                     .title(name),
@@ -2014,16 +1998,6 @@ impl cosmic::Application for AppModel {
                 // latest state (coalescing a fast drag into two computes total).
                 if self.roll.detail.histogram_dirty {
                     self.roll.detail.histogram_dirty = false;
-                    return self.request_histogram();
-                }
-                Task::none()
-            }
-
-            Message::SetHistogramMode(mode) => {
-                if self.histogram_mode != mode {
-                    self.histogram_mode = mode;
-                    // Re-bin for the new axis; the generation guard drops any
-                    // in-flight compute for the old mode.
                     return self.request_histogram();
                 }
                 Task::none()
@@ -3731,9 +3705,8 @@ impl AppModel {
         self.histogram_generation = self.histogram_generation.wrapping_add(1);
         let generation = self.histogram_generation;
         self.roll.detail.histogram_inflight = true;
-        let mode = self.histogram_mode;
         cosmic::task::future(async move {
-            let bins = histogram_from_develop(mono.as_slice(), develop, HISTOGRAM_BINS, mode);
+            let bins = histogram_from_develop(mono.as_slice(), develop, HISTOGRAM_BINS);
             Message::HistogramReady(generation, bins)
         })
     }
@@ -3835,7 +3808,7 @@ impl AppModel {
     }
 
     /// Resets the per-frame detail state (keeping `frame`, `detail_area_size`,
-    /// `detail_inflight`, and `histogram_mode`, which outlive a detail close).
+    /// and `detail_inflight`, which outlive a detail close).
     /// A late key release finds `editing_key_held` clear and no-ops rather than
     /// committing a stale selection; the histogram generation is bumped so an
     /// in-flight compute for the closing frame can never paint over the next

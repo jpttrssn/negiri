@@ -33,8 +33,11 @@ const RAW_EXTENSIONS: &[&str] = &[
 /// (case-insensitive). See [`RAW_EXTENSIONS`] for why this is extension-based.
 #[must_use]
 pub(crate) fn is_supported_raw(name: &str) -> bool {
-    name.rsplit_once('.')
-        .is_some_and(|(_, ext)| RAW_EXTENSIONS.iter().any(|raw| ext.eq_ignore_ascii_case(raw)))
+    name.rsplit_once('.').is_some_and(|(_, ext)| {
+        RAW_EXTENSIONS
+            .iter()
+            .any(|raw| ext.eq_ignore_ascii_case(raw))
+    })
 }
 
 fn normalize_samples(image: &rawloader::RawImage) -> Vec<f32> {
@@ -683,7 +686,11 @@ pub(crate) fn scale_crop(
 /// The display-upright dimensions of a sensor whose post-masked-border dims
 /// are `(cw, ch)`: any orientation that swaps the print axes (90°/270°
 /// rotation, transpose) maps the display horizontal onto the sensor vertical.
-pub(crate) fn display_source_dims(cw: u32, ch: u32, orientation: rawloader::Orientation) -> (u32, u32) {
+pub(crate) fn display_source_dims(
+    cw: u32,
+    ch: u32,
+    orientation: rawloader::Orientation,
+) -> (u32, u32) {
     use rawloader::Orientation;
     match orientation {
         Orientation::Rotate90
@@ -732,7 +739,12 @@ pub(crate) fn crop_rgba(
 /// this exact pixel mapping, so the grid tile and the detail view stay in
 /// agreement. `0` (and any multiple of 4) is the identity — the untouched bake
 /// stays byte-identical.
-pub(crate) fn rotate_quarters(rgba: Vec<u8>, width: u32, height: u32, turns: u8) -> (Vec<u8>, u32, u32) {
+pub(crate) fn rotate_quarters(
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    turns: u8,
+) -> (Vec<u8>, u32, u32) {
     let out_w = height;
     let out_h = width;
     match turns & 3 {
@@ -869,12 +881,7 @@ pub(crate) fn bake_geometry16(
 /// The 16-bit analogue of [`crop_rgba`]: crops an RGBA buffer of `u16` samples
 /// to the given margins (which the caller scaled to the print's dims), letting
 /// a degenerate crop leave the frame unchanged.
-fn crop_rgba16(
-    rgba: Vec<u16>,
-    width: u32,
-    height: u32,
-    crop: CropMargins,
-) -> (Vec<u16>, u32, u32) {
+fn crop_rgba16(rgba: Vec<u16>, width: u32, height: u32, crop: CropMargins) -> (Vec<u16>, u32, u32) {
     let cw = crop.cropped_width(width);
     let ch = crop.cropped_height(height);
     if cw == 0 || ch == 0 {
@@ -913,28 +920,9 @@ pub(crate) fn bake_develop(mono: &mut [f32], develop: Develop) {
 /// distribution is insensitive to the subsample.
 const HISTOGRAM_INV_STRIDE: usize = 4;
 
-/// Which tone axis the drawer histogram bins over.
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) enum HistogramMode {
-    /// The developed **output** distribution: each sample is developed to its
-    /// final positive display value and binned there. The default view — "what
-    /// does the result look like"; exposure and every shape control move it.
-    #[default]
-    Output,
-    /// The develop's **input** tone, on the same fixed `p ∈ [0,1]` axis the
-    /// transfer curve uses. Exposure shifts the bars along the fixed axis; the
-    /// curve shape does not change.
-    Input,
-}
-
-/// Bins the mono into `bins` normalized histogram counts for the drawer plot.
-///
-/// `mode` selects the axis (see [`HistogramMode`]):
-/// - **Output** (default): `srgb_encode(develop.apply(sample))` — the final
-///   display value; exposure and shape controls move the distribution.
-/// - **Input**: the post-exposure density normalized onto the fixed
-///   `p = density / DEFAULT_D_MAX` axis, so the bars share the tone curve's
-///   coordinate and exposure shifts them along it.
+/// Bins the mono into `bins` normalized histogram counts for the drawer plot:
+/// the developed **output** distribution `srgb_encode(develop.apply(sample))` —
+/// the final display value, so exposure and every shape control move it.
 ///
 /// `bins` must be non-zero. Runs on the blocking pool from the caller.
 #[must_use]
@@ -943,35 +931,16 @@ pub(crate) enum HistogramMode {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-pub(crate) fn histogram_from_develop(
-    mono: &[f32],
-    develop: Develop,
-    bins: usize,
-    mode: HistogramMode,
-) -> Vec<f32> {
+pub(crate) fn histogram_from_develop(mono: &[f32], develop: Develop, bins: usize) -> Vec<f32> {
     debug_assert!(bins > 0);
     let mut counts = vec![0.0_f32; bins];
     if mono.is_empty() || bins == 0 {
         return counts;
     }
-    let base = develop.base.max(crate::film::MIN_TRANSMISSION_DEV);
-    let gain = (-develop.exposure_ev).exp2();
     let bin_scale = (bins - 1) as f32;
-    let inv_span = 1.0 / crate::film::DEFAULT_D_MAX;
     let mut total = 0.0_f32;
     for &sample in mono.iter().step_by(HISTOGRAM_INV_STRIDE) {
-        let p = match mode {
-            HistogramMode::Output => {
-                srgb_encode(develop.apply(sample)).clamp(0.0, 1.0)
-            }
-            HistogramMode::Input => {
-                // Exposure first (matching the render), then density relative to
-                // base, normalized onto the fixed input axis.
-                let value = (sample * gain).clamp(crate::film::MIN_TRANSMISSION_DEV, base);
-                let density = f32::log10(base / value);
-                (density * inv_span).clamp(0.0, 1.0)
-            }
-        };
+        let p = srgb_encode(develop.apply(sample)).clamp(0.0, 1.0);
         let idx = (p * bin_scale).round() as usize;
         counts[idx.min(bins - 1)] += 1.0;
         total += 1.0;
@@ -1393,77 +1362,67 @@ mod tests {
     }
 
     #[test]
-    fn histogram_bins_sum_to_one_in_both_modes() {
-        // A transmission ramp from opaque to clear spans both axes; the binned
-        // densities must normalize to sum ≈ 1 in either mode.
+    fn histogram_bins_sum_to_one() {
+        // A transmission ramp from opaque to clear spans the output axis; the
+        // binned densities must normalize to sum ≈ 1.
         let base = film::DEFAULT_FILM_BASE;
         let mono: Vec<f32> = (0..=2000).map(|i| base * (i as f32 / 2000.0)).collect();
-        for mode in [HistogramMode::Output, HistogramMode::Input] {
-            let bins = histogram_from_develop(&mono, Develop::with_base(base), 64, mode);
-            assert_eq!(bins.len(), 64);
-            let sum: f32 = bins.iter().sum();
-            assert!((sum - 1.0).abs() < 1e-3, "{mode:?} sum {sum}");
-            // The ramp spans both ends: the lowest and highest bins are populated.
-            assert!(bins[0] > 0.0, "{mode:?} dark end empty");
-            assert!(bins[63] > 0.0, "{mode:?} bright end empty");
-        }
+        let bins = histogram_from_develop(&mono, Develop::with_base(base), 64);
+        assert_eq!(bins.len(), 64);
+        let sum: f32 = bins.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-3, "sum {sum}");
+        // The ramp spans both ends: the lowest and highest bins are populated.
+        assert!(bins[0] > 0.0, "dark end empty");
+        assert!(bins[63] > 0.0, "bright end empty");
     }
 
     #[test]
     fn histogram_is_empty_safe_and_length_preserving() {
         // An empty buffer yields an all-zero bin set of the requested length.
-        let bins =
-            histogram_from_develop(&[], Develop::with_base(0.8), 8, HistogramMode::Output);
+        let bins = histogram_from_develop(&[], Develop::with_base(0.8), 8);
         assert_eq!(bins, vec![0.0; 8]);
         // The result length always matches the request and normalizes.
-        let bins =
-            histogram_from_develop(&[0.5; 16], Develop::with_base(0.8), 3, HistogramMode::Input);
+        let bins = histogram_from_develop(&[0.5; 16], Develop::with_base(0.8), 3);
         assert_eq!(bins.len(), 3);
         let sum: f32 = bins.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "sum {sum}");
     }
 
     #[test]
-    fn histogram_shifts_brighter_with_exposure_in_both_modes() {
-        // Exposure raises the input density and brightens the developed output,
-        // so both modes move the same tone toward the bright end.
+    fn histogram_shifts_brighter_with_exposure() {
+        // Exposure brightens the developed output, moving the distribution
+        // toward the bright end.
         let mono = vec![0.4_f32; 256];
         let base = Develop::with_base(0.8);
         let brighter = Develop {
             exposure_ev: 1.5,
             ..base
         };
-        for mode in [HistogramMode::Output, HistogramMode::Input] {
-            let dim = histogram_from_develop(&mono, base, 16, mode);
-            let bright = histogram_from_develop(&mono, brighter, 16, mode);
-            assert!(
-                mean_bin(&bright) > mean_bin(&dim),
-                "{mode:?}: exposure did not shift the histogram brighter"
-            );
-        }
+        let dim = histogram_from_develop(&mono, base, 16);
+        let bright = histogram_from_develop(&mono, brighter, 16);
+        assert!(
+            mean_bin(&bright) > mean_bin(&dim),
+            "exposure did not shift the histogram brighter"
+        );
     }
 
     #[test]
-    fn histogram_output_mode_tracks_a_shape_control() {
-        // The output distribution follows the shape (contrast), unlike the input
-        // axis which does not.
+    fn histogram_tracks_a_shape_control() {
+        // The output distribution follows the shape (contrast).
         let base = film::DEFAULT_FILM_BASE;
-        let mono: Vec<f32> = (0..=2000).map(|i| base * (i as f32 / 2000.0) * 0.9).collect();
+        let mono: Vec<f32> = (0..=2000)
+            .map(|i| base * (i as f32 / 2000.0) * 0.9)
+            .collect();
         let identity = Develop::with_base(base);
         let more = Develop {
             contrast: 2.0,
             ..identity
         };
-        let id_out = histogram_from_develop(&mono, identity, 32, HistogramMode::Output);
-        let more_out = histogram_from_develop(&mono, more, 32, HistogramMode::Output);
+        let id_out = histogram_from_develop(&mono, identity, 32);
+        let more_out = histogram_from_develop(&mono, more, 32);
         assert!(
             (mean_bin(&id_out) - mean_bin(&more_out)).abs() > 0.1,
             "contrast did not change the output distribution"
         );
-        // Input mode is shape-independent (same density bins).
-        let id_in = histogram_from_develop(&mono, identity, 32, HistogramMode::Input);
-        let more_in = histogram_from_develop(&mono, more, 32, HistogramMode::Input);
-        assert_eq!(id_in, more_in);
     }
 }
-

@@ -201,11 +201,7 @@ pub(crate) fn roll_view(
 /// thumbnail during that brief decode gap. The drawer pane supplies the
 /// width and padding, so the panel fills the available space.
 #[allow(clippy::too_many_lines)] // one linear push per control; no nested logic
-pub(crate) fn editing_panel(
-    detail: &DetailState,
-    base: f32,
-    histogram_mode: crate::pipeline::HistogramMode,
-) -> Element<'_, Message> {
+pub(crate) fn editing_panel(detail: &DetailState) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
     if detail.shader.is_none() {
@@ -216,31 +212,13 @@ pub(crate) fn editing_panel(
             .into();
     }
 
-    // Input-tone histogram + classic `T(p)` curve overlay at the top of the
-    // drawer (see `docs/raw-pipeline-rewrite.md`): one fixed `[0,1]` axis, the
-    // curve the straight diagonal at the identity controls. Drawn only once a
-    // bin set has landed.
+    // Developed-output histogram at the top of the drawer (see
+    // `docs/raw-pipeline-rewrite.md`), drawn once a bin set has landed.
     let histogram = widget::canvas(HistogramPlot {
         bins: detail.histogram.as_deref(),
-        develop: detail.tone.to_develop(base),
     })
     .width(Length::Fill)
     .height(Length::Fixed(HISTOGRAM_HEIGHT));
-
-    // Histogram axis toggle, sat directly under the plot: off (default) bins
-    // the developed output; on bins the develop's input tone (sharing the tone
-    // curve's axis).
-    let show_input = histogram_mode == crate::pipeline::HistogramMode::Input;
-    let histogram_toggle = widget::toggler(show_input)
-        .label(fl!("histogram-input-axis"))
-        .on_toggle(move |on| {
-            Message::SetHistogramMode(if on {
-                crate::pipeline::HistogramMode::Input
-            } else {
-                crate::pipeline::HistogramMode::Output
-            })
-        })
-        .spacing(cosmic::theme::spacing().space_xs);
 
     let label = widget::text(fl!("exposure-label"));
     // Every slider below runs on the same two rungs: a coarse bare drag of
@@ -365,9 +343,8 @@ pub(crate) fn editing_panel(
         )
     });
 
-    widget::column::with_capacity(26)
+    widget::column::with_capacity(25)
         .push(histogram)
-        .push(histogram_toggle)
         .push(label)
         .push(slider)
         .push(contrast_label)
@@ -396,24 +373,13 @@ pub(crate) fn editing_panel(
 /// Fixed height (logical points) of the drawer's histogram plot.
 const HISTOGRAM_HEIGHT: f32 = 120.0;
 
-/// The drawer's tone plot: an input-tone histogram with the develop's transfer
-/// curve overlaid on the **same** fixed `[0,1]` input axis (the classic layout;
-/// darktable draws the module-input histogram behind its tone curve).
-///
-/// - **Histogram** (filled bars): the distribution of the develop's input tone
-///   `p ∈ [0,1]`, binned post-exposure, with log-scaled bar heights so sparse
-///   shadow/highlight populations stay visible next to a dominant peak.
-/// - **Curve** (stroke): the develop's `[0,1] → [0,1]` transfer
-///   ([`crate::film::Develop::curve_point`]): the straight diagonal at the
-///   identity controls, bending with contrast/pivot and reaching 0/1 at the
-///   Black/White anchors. Exposure is not part of the curve — it shifts the
-///   bars, not the shape.
+/// The drawer's histogram: the developed-output distribution as filled bars
+/// with log-scaled heights, so sparse shadow/highlight populations stay visible
+/// next to a dominant peak.
 struct HistogramPlot<'a> {
-    /// Input-tone histogram bin densities (one per bin, normalized to sum 1), or
-    /// `None` while the first compute is in flight.
+    /// Developed-output histogram bin densities (one per bin, normalized to sum
+    /// 1), or `None` while the first compute is in flight.
     bins: Option<&'a [f32]>,
-    /// The live develop the curve overlay traces.
-    develop: crate::film::Develop,
 }
 
 /// The log-scale bar height for one histogram bin as a `[0,1]` fraction of the
@@ -430,25 +396,6 @@ fn bin_log_height(count: f32, max: f32) -> f32 {
     (count / max).clamp(0.0, 1.0).powf(GAMMA)
 }
 
-/// The develop's transfer curve as `(x, y)` plot fractions in `[0,1]`, sampled
-/// at `steps + 1` points: `x = p` (the fixed input axis), `y = T(p)` (the
-/// develop's fixed-domain shape via [`crate::film::Develop::curve_point`]).
-///
-/// At the identity controls this is the straight diagonal `[0,0] → [1,1]`: the
-/// classic tone-curve widget's default. Contrast/pivot bend it, and the
-/// Black/White anchors move where it reaches 0/1. Exposure is excluded.
-#[must_use]
-#[allow(clippy::cast_precision_loss)]
-fn curve_points(develop: crate::film::Develop, steps: usize) -> Vec<(f32, f32)> {
-    let steps = steps.max(1);
-    (0..=steps)
-        .map(|i| {
-            let x = i as f32 / steps as f32;
-            (x, crate::film::Develop::curve_point(&develop, x))
-        })
-        .collect()
-}
-
 impl canvas::Program<Message, cosmic::Theme, cosmic::Renderer> for HistogramPlot<'_> {
     type State = ();
 
@@ -461,8 +408,6 @@ impl canvas::Program<Message, cosmic::Theme, cosmic::Renderer> for HistogramPlot
         bounds: cosmic::iced::Rectangle,
         _cursor: cosmic::iced::mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        // Sampled samples along the curve overlay's display axis.
-        const CURVE_STEPS: usize = 128;
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         let (w, h) = (frame.width(), frame.height());
         if w <= 0.0 || h <= 0.0 {
@@ -500,27 +445,6 @@ impl canvas::Program<Message, cosmic::Theme, cosmic::Renderer> for HistogramPlot
                 frame.fill(&rect, bin_color);
             }
         }
-
-        // Transfer curve: stroke the develop's fixed `[0,1] → [0,1]` shape over
-        // the same input axis as the bars. The identity controls give the
-        // straight diagonal `[0,0] → [1,1]` (canvas y is top-down, hence the
-        // `1 - y` flip).
-        let mut builder = canvas::path::Builder::new();
-        for (i, (x, y)) in curve_points(self.develop, CURVE_STEPS)
-            .into_iter()
-            .enumerate()
-        {
-            let point = cosmic::iced::Point::new(x * w, (1.0 - y) * h);
-            if i == 0 {
-                builder.move_to(point);
-            } else {
-                builder.line_to(point);
-            }
-        }
-        frame.stroke(
-            &builder.build(),
-            canvas::Stroke::default().with_color(accent).with_width(1.5),
-        );
 
         vec![frame.into_geometry()]
     }
@@ -1333,102 +1257,6 @@ mod tests {
         assert!(is_calibration_frame(Some(frame), frame));
         assert!(!is_calibration_frame(Some(frame), "IMG_0008.DNG"));
         assert!(!is_calibration_frame(None, frame));
-    }
-
-    #[test]
-    fn curve_points_identity_is_the_straight_diagonal() {
-        // The default develop (identity contrast/pivot, black 0, white
-        // DEFAULT_D_MAX) must plot as the classic straight diagonal [0,0]->[1,1].
-        let develop = crate::film::Develop::with_base(0.82);
-        let points = curve_points(develop, 64);
-        assert_eq!(points.len(), 65);
-        for (x, y) in points {
-            assert!(
-                (y - x).abs() < 1e-5,
-                "identity curve off-diagonal at x={x}: {y}"
-            );
-        }
-    }
-
-    #[test]
-    fn curve_points_are_monotone_and_in_range() {
-        // A shape control keeps the curve a valid monotone transfer in [0,1].
-        let develop = crate::film::Develop {
-            contrast: 2.0,
-            black: 0.1,
-            white: 2.0,
-            pivot_offset: 0.2,
-            ..crate::film::Develop::with_base(0.82)
-        };
-        let mut prev = -1.0_f32;
-        for (x, y) in curve_points(develop, 128) {
-            assert!((0.0..=1.0).contains(&y), "y out of range at x={x}: {y}");
-            assert!(y >= prev - 1e-6, "curve fell at x={x}: {prev} -> {y}");
-            prev = y;
-        }
-    }
-
-    #[test]
-    fn curve_points_steepen_with_contrast_through_the_pivot() {
-        let identity = crate::film::Develop::with_base(0.82);
-        let more = crate::film::Develop {
-            contrast: 2.0,
-            ..identity
-        };
-        let at = |d, x: f32| {
-            let points = curve_points(d, 100);
-            let idx = (x * 100.0).round() as usize;
-            points[idx].1
-        };
-        assert!(
-            at(more, 0.25) < at(identity, 0.25),
-            "contrast dark not lower"
-        );
-        assert!(
-            at(more, 0.75) > at(identity, 0.75),
-            "contrast bright not higher"
-        );
-    }
-
-    #[test]
-    fn curve_points_reflect_black_and_white_endpoints() {
-        let identity = crate::film::Develop::with_base(0.82);
-        let at = |d, x: f32| {
-            let points = curve_points(d, 100);
-            points[(x * 100.0).round() as usize].1
-        };
-        // Raising the black point moves the black anchor up the input axis: the
-        // curve stays at 0 longer then rises to meet the diagonal, so a
-        // below-mid input comes out darker (shadows crushed).
-        let black_up = crate::film::Develop {
-            black: 0.4,
-            ..identity
-        };
-        assert!(
-            at(black_up, 0.25) < at(identity, 0.25),
-            "black anchor did not crush the toe"
-        );
-        // Lowering the white point brings the white anchor down: a bright input
-        // reaches full output sooner (highlights clipped).
-        let white_down = crate::film::Develop {
-            white: 1.8,
-            ..identity
-        };
-        assert!(
-            at(white_down, 0.75) > at(identity, 0.75),
-            "white anchor did not raise the shoulder"
-        );
-    }
-
-    #[test]
-    fn curve_points_ignore_exposure() {
-        // Exposure shifts the histogram, not the tone-shape curve.
-        let identity = crate::film::Develop::with_base(0.82);
-        let exposed = crate::film::Develop {
-            exposure_ev: 2.0,
-            ..identity
-        };
-        assert_eq!(curve_points(exposed, 32), curve_points(identity, 32));
     }
 
     #[test]

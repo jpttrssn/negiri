@@ -116,22 +116,6 @@ impl Develop {
         };
         shaped.clamp(0.0, 1.0)
     }
-
-    /// The classic tone-curve overlay's `p → y` transfer: a fixed input axis
-    /// `p ∈ [0,1]` mapped through a nominal density ramp (`p · DEFAULT_D_MAX`)
-    /// into the `[black, white]` window, then the contrast/pivot [`Self::shape`].
-    ///
-    /// At the identity develop (`black = 0`, `white = DEFAULT_D_MAX`,
-    /// `contrast = 1`, `pivot = 0`) this is exactly `y = p` — the straight
-    /// diagonal `[0,0] → [1,1]`. The Black/White anchors move where the transfer
-    /// reaches 0 and 1 (raising Black crushes the toe, lowering White clips the
-    /// shoulder); contrast/pivot bend the middle. Exposure is **not** part of
-    /// this curve (it shifts the histogram, not the shape).
-    #[must_use]
-    pub fn curve_point(&self, p: f32) -> f32 {
-        let density = p.clamp(0.0, 1.0) * DEFAULT_D_MAX;
-        self.apply_density(density)
-    }
 }
 
 /// Measured channel/base transmissions below this are implausible — they
