@@ -21,6 +21,19 @@ use cosmic::iced::core::{
     Clipboard, Element, Event, Layout, Length, Point, Rectangle, Shell, Size, Vector, Widget,
 };
 
+/// The cursor position relative to the widget center, given `position` already
+/// relative to the widget's top-left (`cursor.position_in(bounds)`) and the
+/// widget `bounds`. The half-size comes from the bounds' size, not
+/// `bounds.center()` (which is in absolute coordinates) — mixing the two frames
+/// offset every reported point by the widget's absolute origin.
+#[must_use]
+fn center_relative(bounds: Rectangle, position: Point) -> Point {
+    Point::new(
+        position.x - bounds.width / 2.0,
+        position.y - bounds.height / 2.0,
+    )
+}
+
 /// Emits zoom/pan messages on mouse events over the detail preview.
 pub struct DetailArea<'a, Message, Theme = cosmic::Theme, Renderer = cosmic::Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
@@ -208,11 +221,7 @@ where
                     if let Some(on_move) = self.on_move.as_ref()
                         && let Some(position) = cursor.position_in(bounds)
                     {
-                        let center = bounds.center();
-                        shell.publish(on_move(Point::new(
-                            position.x - center.x,
-                            position.y - center.y,
-                        )));
+                        shell.publish(on_move(center_relative(bounds, position)));
                     }
                 } else if state.was_over && state.pressed {
                     // The cursor left while the button was held: end the drag
@@ -342,5 +351,34 @@ where
 {
     fn from(area: DetailArea<'a, Message, Theme, Renderer>) -> Self {
         Element::new(area)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn center_relative_uses_the_bounds_size_not_their_absolute_origin() {
+        // A widget below the header (absolute origin y = 48): the reported point
+        // must be independent of the widget's absolute position.
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 48.0,
+            width: 400.0,
+            height: 300.0,
+        };
+        assert_eq!(
+            center_relative(bounds, Point::new(0.0, 0.0)),
+            Point::new(-200.0, -150.0)
+        );
+        assert_eq!(
+            center_relative(bounds, Point::new(200.0, 150.0)),
+            Point::new(0.0, 0.0)
+        );
+        assert_eq!(
+            center_relative(bounds, Point::new(400.0, 300.0)),
+            Point::new(200.0, 150.0)
+        );
     }
 }
