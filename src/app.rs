@@ -265,8 +265,6 @@ pub(crate) struct AppModel {
     window_height: f32,
     /// File entries from the open roll, displayed as tiles on its frame grid.
     pub(crate) tiles: Vec<Tile>,
-    /// File shown enlarged in the detail view in place of the grid, if any.
-    pub(crate) selected: Option<String>,
     /// Names handed to the bounded in-flight thumbnail decodes, so re-baked
     /// tiles never double-spawn against the startup chain (memory bound).
     thumb_inflight: Vec<String>,
@@ -287,28 +285,12 @@ pub(crate) struct AppModel {
     /// reconciled against the files on disk on each scan. Writes to the
     /// manifest happen only on explicit flush messages, never per frame.
     pub(crate) roll: RollManifest,
-    /// GPU shader program for the detail view, rendering mono data with
-    /// live exposure adjustment.  `None` while the decode is in flight.
-    pub(crate) detail_shader: Option<shader::DetailProgram>,
+    /// The open frame's detail-view state (shader, preview transform, live
+    /// edits, histogram). See [`DetailState`]; its `frame` is `None` when no
+    /// detail view is open.
+    pub(crate) detail: DetailState,
     /// File handed to the one permitted in-flight hi-res detail decode.
     detail_inflight: Option<String>,
-    /// True once the native-resolution decode has been requested or found
-    /// unnecessary (sensor already ≤ the overview size); guards the zoom
-    /// trigger against re-spawning a level-up on every wheel event.
-    detail_native_queued: bool,
-    /// Name of the frame whose detail decode failure was already logged for
-    /// the current selection, so wheel-driven re-decode retries of the same
-    /// (doomed) frame log once instead of once per notch.
-    detail_logged_failure: Option<String>,
-    /// Current opacity of the thumbnail layer during crossfade (1.0→0.0).
-    pub(crate) detail_thumb_opacity: f32,
-    /// Timestamp of the last animation frame for framerate-independent fading.
-    detail_last_frame: Option<Instant>,
-    /// Cached thumbnail kept visible over the shader during crossfade.
-    pub(crate) detail_thumb: Option<Handle>,
-    /// Detail-view zoom in `log2` units: 1.0 = contain fit (whole frame),
-    /// each +1 doubles the rendered scale.
-    detail_zoom: Zoom,
     /// The detail preview's laid-out logical size, reported by `DetailArea`
     /// via `DetailAreaResized`; drives the 1:1 ("100%") zoom cap.
     ///
@@ -318,25 +300,6 @@ pub(crate) struct AppModel {
     /// the cap (the wheel would fall back to `MAX_DETAIL_ZOOM`) until a drawer
     /// toggle forced a resize.
     detail_area_size: Option<Size>,
-    /// Pan offset of the image center from the widget center (logical points).
-    pub(crate) detail_pan: Point,
-    /// What a live drag on the detail preview is doing, latched at press (`None`
-    /// when no button is down).
-    detail_drag: Option<DragTarget>,
-    /// Whether the current crop drag actually moved the crop, so release only
-    /// commits (persist + re-bake) after a real move, not a bare click.
-    crop_drag_dirty: bool,
-    /// Most recent cursor position over the detail preview, widget-relative
-    /// logical points; anchors wheel-zoom at the cursor.
-    detail_cursor: Option<Point>,
-    /// The decoded overview mono for the open frame, sampled to build the
-    /// drawer histogram. Shared as an `Arc` so a per-tick histogram request
-    /// clones only a refcount, never the multi-MB buffer. Built once per decode
-    /// landing.
-    histogram_mono: Option<Arc<Vec<f32>>>,
-    /// Binned histogram of the develop (the drawer's top plot), or `None`
-    /// before the first decode/compute lands.
-    pub(crate) histogram: Option<Vec<f32>>,
     /// Which tone axis the drawer histogram bins over (Output = the developed
     /// result, the default; Input = the develop's input tone, sharing the tone
     /// curve's axis). User-selected; not persisted to the manifest, but kept
@@ -345,52 +308,11 @@ pub(crate) struct AppModel {
     /// Monotonic generation for histogram requests; a landed result is applied
     /// only when its generation still matches (a newer request superseded it).
     histogram_generation: u64,
-    /// True while a histogram compute is in flight. New requests while busy only
-    /// set [`Self::histogram_dirty`], coalescing a fast slider drag into at most
-    /// one running + one queued compute instead of one per tick.
-    histogram_inflight: bool,
-    /// Set when a develop change arrived while a compute was in flight, so the
-    /// landing re-runs once for the latest develop.
-    histogram_dirty: bool,
-    /// The live density develop previewed in the detail view: exposure plus the
-    /// four shape controls (contrast, black, white, midtone pivot). Loaded from
-    /// the stored manifest on open and applied to the GPU shader as uniforms.
-    pub(crate) tone: edit_manifest::ToneEdit,
-    /// Live keyboard crop margins for the detail view; loaded from the stored
-    /// manifest per open and applied to the GPU shader as a uniform UV-remap.
-    pub(crate) crop: edit_manifest::CropMargins,
-    /// The crop window's target aspect ratio (the crop margins are the actual
-    /// geometry); loaded per open and shown in the editing panel's dropdown.
-    pub(crate) aspect: edit_manifest::AspectRatio,
-    /// Live display rotation for the detail view: cumulative counter-clockwise
-    /// 90° quarter-turns (`0`…`3`) on top of the EXIF orientation. Loaded from
-    /// the stored manifest per open and applied to the GPU shader as a uniform.
-    pub(crate) rotation: u8,
-    /// Whether the detail view is in crop mode — a focused, VIM-like modal
-    /// state toggled by the bare `c` key or the View → Crop mode menu item.
-    /// Only meaningfully on with a detail view open. While active the surround
-    /// renders white and the shader dims everything outside the crop (the old
-    /// "view dimmed crop area" overlay), frame paging is disabled, and the
-    /// keyboard accepts only the h/j/k/l crop trims. Never persisted.
-    pub(crate) crop_mode: bool,
     /// Whether the global keyboard-help overlay is shown (toggled by `?`).
     /// While on, the overlay covers the body and the rest of `update()` is
     /// gated so navigation/editing keys do not act on the covered UI. Never
     /// persisted.
     help_visible: bool,
-    /// Edit values as they were when the detail panel was opened — the stored
-    /// manifest values for the selected file. `ResetAll` restores these, not
-    /// the identity, so reset reverts the panel to its opened state.
-    reset_tone: edit_manifest::ToneEdit,
-    /// Crop as it was when the detail panel was opened; `ResetAll` restores it.
-    reset_crop: edit_manifest::CropMargins,
-    /// Crop aspect as it was when the detail panel was opened; `ResetAll`
-    /// restores it.
-    reset_aspect: edit_manifest::AspectRatio,
-    /// Rotation as it was when the detail panel was opened; `ResetAll`
-    /// restores it. Tracked separately from [`Self::rotation`]'s zeroing in
-    /// [`Self::clear_detail`] like the other reset snapshots.
-    reset_rotation: u8,
     /// The last edit copied for paste (Ctrl+C), as a full [`ToneEdit`]. `None`
     /// until the user copies — a paste with nothing copied is a no-op.
     clipboard: Option<edit_manifest::ToneEdit>,
@@ -681,6 +603,110 @@ impl FrameSelection {
         }
 
         self.select_only(clicked);
+    }
+}
+
+/// The open frame's detail-view state: the frame being edited, its live edits,
+/// the GPU preview transform/shader, and the drawer histogram. One value type
+/// so closing the detail view is a single reset. `frame` is `None` when no
+/// detail view is open (the frame grid is showing). Fields that must survive
+/// detail close live on `AppModel` instead (`detail_inflight`,
+/// `detail_preload_inflight`, `detail_area_size`, `histogram_mode`).
+#[allow(clippy::struct_excessive_bools)] // independent per-interaction flags
+pub(crate) struct DetailState {
+    /// The frame shown enlarged, or `None` when the detail view is closed.
+    pub(crate) frame: Option<String>,
+    /// GPU shader program, `None` while the decode is in flight.
+    pub(crate) shader: Option<shader::DetailProgram>,
+    /// True once the native-resolution decode was requested or found
+    /// unnecessary; guards the zoom level-up trigger against re-spawning.
+    native_queued: bool,
+    /// Frame whose detail decode failure was already logged, so wheel-driven
+    /// re-decode retries of the same (doomed) frame log once.
+    logged_failure: Option<String>,
+    /// Thumbnail crossfade opacity (1.0→0.0).
+    pub(crate) thumb_opacity: f32,
+    /// Timestamp of the last crossfade animation frame.
+    last_frame: Option<Instant>,
+    /// Cached thumbnail kept visible over the shader during the crossfade.
+    pub(crate) thumb: Option<Handle>,
+    /// Zoom in `log2` units (1.0 = contain fit).
+    zoom: Zoom,
+    /// Pan offset of the image center from the widget center (logical points).
+    pub(crate) pan: Point,
+    /// Live drag target, latched at press (`None` when no button is down).
+    drag: Option<DragTarget>,
+    /// Whether the current crop drag moved the crop (release commits).
+    crop_drag_dirty: bool,
+    /// Most recent cursor position over the preview (anchors wheel zoom).
+    cursor: Option<Point>,
+    /// Crop mode toggle.
+    pub(crate) crop_mode: bool,
+    /// Live density develop (exposure + shape controls).
+    pub(crate) tone: edit_manifest::ToneEdit,
+    /// Live source-pixel crop margins.
+    pub(crate) crop: edit_manifest::CropMargins,
+    /// Crop target aspect ratio.
+    pub(crate) aspect: edit_manifest::AspectRatio,
+    /// Live display rotation (0–3 counter-clockwise quarter-turns).
+    pub(crate) rotation: u8,
+    /// Edits as they were at panel open; `ResetAll` restores these.
+    reset_tone: edit_manifest::ToneEdit,
+    reset_crop: edit_manifest::CropMargins,
+    reset_aspect: edit_manifest::AspectRatio,
+    reset_rotation: u8,
+    /// Decoded overview mono for the histogram (shared refcount).
+    histogram_mono: Option<Arc<Vec<f32>>>,
+    /// Binned histogram of the develop.
+    pub(crate) histogram: Option<Vec<f32>>,
+    /// Whether a histogram compute is in flight.
+    histogram_inflight: bool,
+    /// A develop change arrived during a compute (re-run once on landing).
+    histogram_dirty: bool,
+}
+
+impl Default for DetailState {
+    fn default() -> Self {
+        Self {
+            frame: None,
+            shader: None,
+            native_queued: false,
+            logged_failure: None,
+            thumb_opacity: 1.0,
+            last_frame: None,
+            thumb: None,
+            zoom: Zoom::CONTAIN,
+            pan: Point::default(),
+            drag: None,
+            crop_drag_dirty: false,
+            cursor: None,
+            crop_mode: false,
+            tone: edit_manifest::ToneEdit::default(),
+            crop: edit_manifest::CropMargins::default(),
+            aspect: edit_manifest::AspectRatio::Original,
+            rotation: 0,
+            reset_tone: edit_manifest::ToneEdit::default(),
+            reset_crop: edit_manifest::CropMargins::default(),
+            reset_aspect: edit_manifest::AspectRatio::Original,
+            reset_rotation: 0,
+            histogram_mono: None,
+            histogram: None,
+            histogram_inflight: false,
+            histogram_dirty: false,
+        }
+    }
+}
+
+impl DetailState {
+    /// Reset every field except `frame` (which the caller owns), freeing the
+    /// shader, histogram mono, and thumbnail. Called when the viewed frame
+    /// changes or the detail view closes.
+    fn clear(&mut self) {
+        let frame = self.frame.take();
+        *self = Self {
+            frame,
+            ..Self::default()
+        };
     }
 }
 
@@ -1348,41 +1374,17 @@ impl cosmic::Application for AppModel {
             grid_viewport: None,
             window_height: 600.0,
             tiles: Vec::new(),
-            selected: None,
             thumb_inflight: Vec::new(),
             thumb_concurrency: thumb_concurrency(),
             calibration_inflight: None,
             frame_meta_inflight: None,
             roll: RollManifest::default(),
-            detail_shader: None,
+            detail: DetailState::default(),
             detail_inflight: None,
-            detail_native_queued: false,
-            detail_logged_failure: None,
-            detail_thumb_opacity: 1.0,
-            detail_last_frame: None,
-            detail_thumb: None,
-            detail_zoom: Zoom::CONTAIN,
             detail_area_size: None,
-            detail_pan: Point::default(),
-            detail_drag: None,
-            crop_drag_dirty: false,
-            detail_cursor: None,
-            histogram_mono: None,
-            histogram: None,
             histogram_mode: crate::pipeline::HistogramMode::default(),
             histogram_generation: 0,
-            histogram_inflight: false,
-            histogram_dirty: false,
-            tone: edit_manifest::ToneEdit::default(),
-            crop: edit_manifest::CropMargins::default(),
-            aspect: edit_manifest::AspectRatio::Original,
-            rotation: 0,
-            crop_mode: false,
             help_visible: false,
-            reset_tone: edit_manifest::ToneEdit::default(),
-            reset_crop: edit_manifest::CropMargins::default(),
-            reset_aspect: edit_manifest::AspectRatio::Original,
-            reset_rotation: 0,
             clipboard: None,
             next_image_id: 0,
             detail_cache: LruCache::new(DETAIL_CACHE_CAPACITY),
@@ -1422,7 +1424,7 @@ impl cosmic::Application for AppModel {
     fn on_escape(&mut self) -> Task<cosmic::Action<Self::Message>> {
         if self.help_visible {
             cosmic::task::message(Message::ToggleHelp)
-        } else if self.crop_mode {
+        } else if self.detail.crop_mode {
             cosmic::task::message(Message::ToggleCropMode)
         } else {
             cosmic::task::message(Message::DetailClosed)
@@ -1476,7 +1478,7 @@ impl cosmic::Application for AppModel {
         // (a focused/highlighted frame or an open detail view); on the library
         // page no frame is ever selected, even when a roll is. Paste
         // additionally needs a non-empty edit clipboard to apply.
-        let frame_context = self.frame_sel.primary().is_some() || self.selected.is_some();
+        let frame_context = self.frame_sel.primary().is_some() || self.detail.frame.is_some();
         let copy_edits = if frame_context {
             menu::Item::Button(fl!("menu-copy-edits"), None, MenuAction::CopyEdits)
         } else {
@@ -1492,7 +1494,7 @@ impl cosmic::Application for AppModel {
         // roll's calibration frame; meaningful with an eligible frame selected.
         // The handler no-ops without one, so the menu gates on its selection.
         let calibrate_enabled = self.active.is_some()
-            && (self.selected.is_some() || self.frame_sel.primary().is_some());
+            && (self.detail.frame.is_some() || self.frame_sel.primary().is_some());
         let calibrate_items = if calibrate_enabled {
             vec![
                 menu::Item::Divider,
@@ -1529,7 +1531,7 @@ impl cosmic::Application for AppModel {
         // page. It stays enabled exactly where the drawer can open — a detail
         // view, a highlighted frame inside a roll, or a roll selected on the
         // library page (the page guards make it a no-op everywhere else).
-        let details_enabled = self.selected.is_some()
+        let details_enabled = self.detail.frame.is_some()
             || (self.active.is_some() && self.frame_sel.primary().is_some())
             || (self.active.is_none()
                 && matches!(&self.library.selection, Some(LibrarySelection::Roll(_))));
@@ -1539,7 +1541,7 @@ impl cosmic::Application for AppModel {
             menu::Item::ButtonDisabled(fl!("menu-details"), None, MenuAction::Details)
         };
 
-        let crop_mode = if self.selected.is_some() {
+        let crop_mode = if self.detail.frame.is_some() {
             menu::Item::Button(fl!("menu-crop-mode"), None, MenuAction::ToggleCropMode)
         } else {
             menu::Item::ButtonDisabled(fl!("menu-crop-mode"), None, MenuAction::ToggleCropMode)
@@ -1612,7 +1614,7 @@ impl cosmic::Application for AppModel {
         // beside it. `selected` also gates it: `detail_inflight` is NOT cleared
         // when Escape closes the view (only roll-close does), so this keeps a
         // decode still in flight from spinning forever on the grid below.
-        if self.selected.is_some() && self.detail_inflight.is_some() {
+        if self.detail.frame.is_some() && self.detail_inflight.is_some() {
             let spinner = cosmic::widget::indeterminate_circular().size(18.0);
             let spinner = cosmic::widget::tooltip(
                 spinner,
@@ -1659,7 +1661,7 @@ impl cosmic::Application for AppModel {
         match self.context_page {
             ContextPage::Editing => {
                 // Without a selection there is nothing to edit.
-                let name = self.selected.as_ref()?;
+                let name = self.detail.frame.as_ref()?;
 
                 Some(
                     context_drawer::context_drawer(
@@ -1700,7 +1702,7 @@ impl cosmic::Application for AppModel {
                 // Only meaningful on the frames grid with a highlighted frame:
                 // the drawer shows that frame's name/dimensions/EXIF, so an
                 // open detail view, an inactive roll, or no highlight closes it.
-                if self.selected.is_some() || self.active.is_none() {
+                if self.detail.frame.is_some() || self.active.is_none() {
                     return None;
                 }
                 let name = self.frame_sel.primary()?;
@@ -1884,10 +1886,10 @@ impl cosmic::Application for AppModel {
         ];
 
         // Drive the thumbnail crossfade while opacity is ramping down.
-        if self.selected.is_some()
-            && self.detail_shader.is_some()
-            && self.detail_thumb.is_some()
-            && self.detail_thumb_opacity > 0.0
+        if self.detail.frame.is_some()
+            && self.detail.shader.is_some()
+            && self.detail.thumb.is_some()
+            && self.detail.thumb_opacity > 0.0
         {
             subscriptions.push(
                 cosmic::iced::time::every(std::time::Duration::from_millis(16))
@@ -1967,12 +1969,12 @@ impl cosmic::Application for AppModel {
                 if self.active.is_none() {
                     return Task::none();
                 }
-                if self.selected.is_some() {
+                if self.detail.frame.is_some() {
                     // Close the detail view immediately — the frame highlight
                     // survives so the grid still shows where you were. The
                     // editing drawer is not closed; the grid's own remembered
                     // drawer state takes over.
-                    self.selected = None;
+                    self.detail.frame = None;
                     self.clear_detail();
                     self.restore_drawer_for(DrawerView::Grid);
                     return self.ensure_frame_info_loaded().unwrap_or_else(Task::none);
@@ -1983,7 +1985,7 @@ impl cosmic::Application for AppModel {
                 // is dropped as part of the reset; edits were already flushed
                 // by `persist_roll` at the top of this arm).
                 self.active = None;
-                self.selected = None;
+                self.detail.frame = None;
                 self.frame_sel.clear();
                 self.grid_viewport = None;
                 self.tiles = Vec::new();
@@ -2009,14 +2011,14 @@ impl cosmic::Application for AppModel {
             }
 
             Message::HistogramReady(generation, bins) => {
-                self.histogram_inflight = false;
+                self.detail.histogram_inflight = false;
                 if generation == self.histogram_generation {
-                    self.histogram = Some(bins);
+                    self.detail.histogram = Some(bins);
                 }
                 // A develop change arrived mid-compute: run once more for the
                 // latest state (coalescing a fast drag into two computes total).
-                if self.histogram_dirty {
-                    self.histogram_dirty = false;
+                if self.detail.histogram_dirty {
+                    self.detail.histogram_dirty = false;
                     return self.request_histogram();
                 }
                 Task::none()
@@ -2036,13 +2038,14 @@ impl cosmic::Application for AppModel {
 
             Message::DetailFadeTick => {
                 let dt = self
-                    .detail_last_frame
+                    .detail
+                    .last_frame
                     .map_or(0.0, |t| t.elapsed().as_secs_f32().min(0.1));
-                self.detail_last_frame = Some(Instant::now());
-                self.detail_thumb_opacity = (self.detail_thumb_opacity - dt * FADE_SPEED).max(0.0);
+                self.detail.last_frame = Some(Instant::now());
+                self.detail.thumb_opacity = (self.detail.thumb_opacity - dt * FADE_SPEED).max(0.0);
                 // Crossfade complete — drop the thumbnail cache.
-                if self.detail_thumb_opacity <= 0.0 {
-                    self.detail_thumb = None;
+                if self.detail.thumb_opacity <= 0.0 {
+                    self.detail.thumb = None;
                 }
                 Task::none()
             }
@@ -2058,15 +2061,15 @@ impl cosmic::Application for AppModel {
 
             Message::DetailZoom(delta) => {
                 let (new_zoom, new_pan) = apply_detail_zoom(
-                    self.detail_zoom.0,
-                    self.detail_pan,
-                    self.detail_cursor,
+                    self.detail.zoom.0,
+                    self.detail.pan,
+                    self.detail.cursor,
                     delta,
                     self.max_detail_zoom_for_wheel(),
                 );
-                self.detail_zoom = Zoom(new_zoom);
-                self.detail_pan = new_pan;
-                if let Some(shader) = &mut self.detail_shader {
+                self.detail.zoom = Zoom(new_zoom);
+                self.detail.pan = new_pan;
+                if let Some(shader) = &mut self.detail.shader {
                     shader.set_view(new_zoom, new_pan);
                 }
                 // Level up to native once the view crosses the trigger zoom;
@@ -2076,8 +2079,8 @@ impl cosmic::Application for AppModel {
                 // (up to the projected native cap) from re-entering the busy
                 // slot — the landing re-pump covers a zoom taken mid-load.
                 if self.detail_inflight.is_none()
-                    && self.detail_zoom.0 >= self.native_level_up_zoom()
-                    && !self.detail_native_queued
+                    && self.detail.zoom.0 >= self.native_level_up_zoom()
+                    && !self.detail.native_queued
                 {
                     return self.decode_detail_next();
                 }
@@ -2123,23 +2126,27 @@ impl cosmic::Application for AppModel {
                 // button is one unconscious click away from a slider, so
                 // mirror the sliders' choice of only-mutate-RAM: the same
                 // `EditSave` points persist it).
-                self.tone = self.reset_tone;
-                self.crop = self.reset_crop;
-                self.aspect = self.reset_aspect;
-                self.rotation = self.reset_rotation;
-                if let Some(selected) = &self.selected {
+                self.detail.tone = self.detail.reset_tone;
+                self.detail.crop = self.detail.reset_crop;
+                self.detail.aspect = self.detail.reset_aspect;
+                self.detail.rotation = self.detail.reset_rotation;
+                if let Some(selected) = &self.detail.frame {
                     self.roll
-                        .set_exposure(selected, self.reset_tone.exposure_ev);
-                    self.roll.set_develop(selected, self.reset_tone);
-                    self.roll.set_crop(selected, self.reset_crop);
-                    self.roll.set_aspect(selected, self.reset_aspect);
-                    self.roll.set_rotation(selected, self.reset_rotation);
+                        .set_exposure(selected, self.detail.reset_tone.exposure_ev);
+                    self.roll.set_develop(selected, self.detail.reset_tone);
+                    self.roll.set_crop(selected, self.detail.reset_crop);
+                    self.roll.set_aspect(selected, self.detail.reset_aspect);
+                    self.roll.set_rotation(selected, self.detail.reset_rotation);
                 }
-                if let Some(shader) = &mut self.detail_shader {
-                    shader.set_exposure(self.reset_tone.exposure_ev);
-                    shader.set_develop(self.reset_tone.to_develop(self.roll.base_or_default()));
-                    shader.set_crop(self.reset_crop);
-                    shader.set_rotation(self.reset_rotation);
+                if let Some(shader) = &mut self.detail.shader {
+                    shader.set_exposure(self.detail.reset_tone.exposure_ev);
+                    shader.set_develop(
+                        self.detail
+                            .reset_tone
+                            .to_develop(self.roll.base_or_default()),
+                    );
+                    shader.set_crop(self.detail.reset_crop);
+                    shader.set_rotation(self.detail.reset_rotation);
                 }
                 self.reclamp_detail_zoom();
                 Task::none()
@@ -2148,14 +2155,14 @@ impl cosmic::Application for AppModel {
             // Reset ONLY the crop to zero (full frame), leaving exposure/tone
             // untouched, and persist the reset immediately.
             Message::ResetCrop => {
-                self.crop = edit_manifest::CropMargins::default();
-                self.aspect = edit_manifest::AspectRatio::Original;
-                if let Some(selected) = &self.selected {
-                    self.roll.set_crop(selected, self.crop);
-                    self.roll.set_aspect(selected, self.aspect);
+                self.detail.crop = edit_manifest::CropMargins::default();
+                self.detail.aspect = edit_manifest::AspectRatio::Original;
+                if let Some(selected) = &self.detail.frame {
+                    self.roll.set_crop(selected, self.detail.crop);
+                    self.roll.set_aspect(selected, self.detail.aspect);
                 }
-                if let Some(shader) = &mut self.detail_shader {
-                    shader.set_crop(self.crop);
+                if let Some(shader) = &mut self.detail.shader {
+                    shader.set_crop(self.detail.crop);
                 }
                 self.reclamp_detail_zoom();
                 self.commit_edit()
@@ -2165,12 +2172,12 @@ impl cosmic::Application for AppModel {
             // centered in the full frame, and persist immediately (like
             // `ResetCrop`).
             Message::SetAspect(aspect) => {
-                if self.detail_shader.is_none() {
+                if self.detail.shader.is_none() {
                     return Task::none();
                 }
-                self.aspect = aspect;
+                self.detail.aspect = aspect;
                 self.refit_crop_aspect(edit_manifest::CropMargins::default());
-                if let Some(selected) = &self.selected {
+                if let Some(selected) = &self.detail.frame {
                     self.roll.set_aspect(selected, aspect);
                 }
                 self.commit_edit()
@@ -2211,10 +2218,10 @@ impl cosmic::Application for AppModel {
                 // Crop mode only means anything over the detail view; without
                 // one the toggle is a no-op (the bare `c` key reaches it from
                 // any page).
-                if let Some(shader) = &mut self.detail_shader {
-                    self.crop_mode = !self.crop_mode;
-                    shader.set_show_mask(self.crop_mode);
-                    shader.set_pad(if self.crop_mode {
+                if let Some(shader) = &mut self.detail.shader {
+                    self.detail.crop_mode = !self.detail.crop_mode;
+                    shader.set_show_mask(self.detail.crop_mode);
+                    shader.set_pad(if self.detail.crop_mode {
                         CROP_MODE_PADDING
                     } else {
                         0.0
@@ -2228,7 +2235,7 @@ impl cosmic::Application for AppModel {
                 // the tile/cover), so any trims made while the mode was on land
                 // on disk exactly when it closes — via `c`, Escape (routed here
                 // by `on_escape`), or the View menu checkbox.
-                if self.crop_mode {
+                if self.detail.crop_mode {
                     Task::none()
                 } else {
                     self.commit_edit()
@@ -2861,7 +2868,7 @@ impl AppModel {
         }
         self.persist_roll();
         self.active = Some(dir.clone());
-        self.selected = None;
+        self.detail.frame = None;
         self.frame_sel.clear();
         self.grid_viewport = None;
         self.frame_meta_inflight = None;
@@ -2880,14 +2887,14 @@ impl AppModel {
     /// tweaks to the outgoing file, loads the stored edits, updates both the
     /// detail selection and the grid highlight, and starts the decode chain.
     fn open_frame(&mut self, name: &str) -> Task<cosmic::Action<Message>> {
-        if self.selected.as_deref() != Some(name) {
+        if self.detail.frame.as_deref() != Some(name) {
             // Persist unsaved tweaks to the outgoing file first.
             self.persist_roll();
             // Read the stored edits BEFORE the decode builds the shader, which
             // consumes the live tone (via `set_develop` in
             // `handle_detail_ready`).
             let stored_tone = self.roll.tone(name);
-            self.selected = Some(name.to_owned());
+            self.detail.frame = Some(name.to_owned());
             // The opened frame becomes the primary of the multi-selection (and
             // the Shift+click anchor), so copy/paste batches stay consistent
             // with what is on screen. Shift+open extends; a plain open collapses
@@ -2898,19 +2905,19 @@ impl AppModel {
                 self.frame_sel.select_only(name);
             }
             self.clear_detail();
-            self.tone = stored_tone;
-            self.crop = self.roll.crop(name);
-            self.aspect = self.roll.aspect(name);
-            self.rotation = self.roll.rotation(name) & 3;
+            self.detail.tone = stored_tone;
+            self.detail.crop = self.roll.crop(name);
+            self.detail.aspect = self.roll.aspect(name);
+            self.detail.rotation = self.roll.rotation(name) & 3;
             // Entering the detail view: the drawer (if the detail's memory says
             // open) shows the editing panel; navigation never closes it.
             self.restore_drawer_for(DrawerView::Detail);
             // Anchor the reset snapshot to the opened state (the stored
             // manifest values), so Reset reverts here rather than to identity.
-            self.reset_tone = stored_tone;
-            self.reset_crop = self.crop;
-            self.reset_aspect = self.aspect;
-            self.reset_rotation = self.rotation;
+            self.detail.reset_tone = stored_tone;
+            self.detail.reset_crop = self.detail.crop;
+            self.detail.reset_aspect = self.detail.aspect;
+            self.detail.reset_rotation = self.detail.rotation;
         }
 
         // The editing drawer stays hidden on a fresh open; the user brings it
@@ -3393,7 +3400,7 @@ impl AppModel {
     /// the cover's on-disk manifest read is fresh too).
     fn re_bake_edit(&mut self) -> Task<cosmic::Action<Message>> {
         let mut tasks = Vec::with_capacity(2);
-        let Some(name) = self.selected.clone() else {
+        let Some(name) = self.detail.frame.clone() else {
             return Task::batch(tasks);
         };
         rebake_trace(format_args!(
@@ -3442,7 +3449,8 @@ impl AppModel {
             return Task::none();
         };
         let Some(name) = self
-            .selected
+            .detail
+            .frame
             .clone()
             .or_else(|| self.frame_sel.primary().map(str::to_owned))
         else {
@@ -3538,13 +3546,13 @@ impl AppModel {
         // A cached overview's `inversion` (or an in-flight decode) was resolved
         // under the old base mode and must not be served: drop the live shader,
         // the LRU, and the in-flight bookkeeping.
-        self.detail_shader = None;
-        self.detail_native_queued = false;
-        self.detail_logged_failure = None;
+        self.detail.shader = None;
+        self.detail.native_queued = false;
+        self.detail.logged_failure = None;
         self.detail_inflight = None;
         self.detail_preload_inflight.clear();
-        self.detail_thumb = None;
-        self.detail_last_frame = None;
+        self.detail.thumb = None;
+        self.detail.last_frame = None;
         let _ = self.detail_cache.retain(|_| false);
         // Re-bake every grid tile and the open roll's cover under the new base.
         for tile in &mut self.tiles {
@@ -3562,7 +3570,7 @@ impl AppModel {
         {
             roll.thumb = Thumb::Loading;
         }
-        let current = self.selected.clone().unwrap_or_default();
+        let current = self.detail.frame.clone().unwrap_or_default();
         Task::batch([
             self.decode_next(),
             self.decode_covers(),
@@ -3580,11 +3588,11 @@ impl AppModel {
     /// [`NATIVE_ZOOM_THRESHOLD`]) — the flag makes the level-up one-shot, and
     /// the inflight slot makes extra wheels no-ops.
     fn decode_detail_next(&mut self) -> Task<cosmic::Action<Message>> {
-        if self.detail_inflight.is_some() || self.selected.is_none() {
+        if self.detail_inflight.is_some() || self.detail.frame.is_none() {
             if self.detail_inflight.is_some() {
                 detail_trace(format_args!(
                     "trigger swallowed: inflight slot busy (zoom={:.3})",
-                    self.detail_zoom.0
+                    self.detail.zoom.0
                 ));
             }
             return Task::none();
@@ -3593,19 +3601,19 @@ impl AppModel {
         // Level 1 is native unless the sensor's long edge exceeds the wgpu
         // texture ceiling; `resize_area` treats a cap ≥ the source edge as
         // identity, so ≤8K scans decode at true full resolution.
-        let cap: u32 = if self.detail_shader.is_none() {
+        let cap: u32 = if self.detail.shader.is_none() {
             HI_RES_SIZE
-        } else if !self.detail_native_queued {
+        } else if !self.detail.native_queued {
             MAX_TEXTURE_EDGE
         } else {
             detail_trace(format_args!(
                 "trigger swallowed: native already queued (zoom={:.3})",
-                self.detail_zoom.0
+                self.detail.zoom.0
             ));
             return Task::none();
         };
 
-        let Some(name) = self.selected.clone() else {
+        let Some(name) = self.detail.frame.clone() else {
             return Task::none();
         };
 
@@ -3634,8 +3642,8 @@ impl AppModel {
 
         detail_trace(format_args!(
             "trigger fire: cap={cap}, shader={}, zoom={:.3}",
-            self.detail_shader.is_some(),
-            self.detail_zoom.0
+            self.detail.shader.is_some(),
+            self.detail.zoom.0
         ));
 
         self.detail_inflight = Some(name.clone());
@@ -3659,25 +3667,25 @@ impl AppModel {
         // Share the overview mono (a refcount, not a buffer copy) so the drawer
         // histogram can be recomputed on the blocking pool as the develop
         // changes.
-        self.histogram_mono = Some(Arc::new(image.data.clone()));
-        self.detail_shader = Some(shader::DetailProgram::new(
+        self.detail.histogram_mono = Some(Arc::new(image.data.clone()));
+        self.detail.shader = Some(shader::DetailProgram::new(
             image.data,
             image.width,
             image.height,
-            self.tone.to_develop(self.roll.base_or_default()),
-            self.crop,
-            self.rotation,
+            self.detail.tone.to_develop(self.roll.base_or_default()),
+            self.detail.crop,
+            self.detail.rotation,
             image_id,
             src_long_edge,
         ));
-        if let Some(shader) = &mut self.detail_shader {
-            shader.set_view(self.detail_zoom.0, self.detail_pan);
-            shader.set_crop(self.crop);
-            shader.set_rotation(self.rotation);
+        if let Some(shader) = &mut self.detail.shader {
+            shader.set_view(self.detail.zoom.0, self.detail.pan);
+            shader.set_crop(self.detail.crop);
+            shader.set_rotation(self.detail.rotation);
             // A fresh program starts with the mask off; re-assert the current
             // crop-mode state so the dim overlay survives re-installs.
-            shader.set_show_mask(self.crop_mode);
-            shader.set_pad(if self.crop_mode {
+            shader.set_show_mask(self.detail.crop_mode);
+            shader.set_pad(if self.detail.crop_mode {
                 CROP_MODE_PADDING
             } else {
                 0.0
@@ -3689,7 +3697,7 @@ impl AppModel {
         // A cached overview that was already at native resolution needs no
         // level-up re-decode.
         if src_long_edge <= HI_RES_SIZE {
-            self.detail_native_queued = true;
+            self.detail.native_queued = true;
         }
     }
 
@@ -3702,18 +3710,18 @@ impl AppModel {
     /// clone is a refcount bump, never a buffer copy. A no-op with no decoded
     /// mono (nothing to sample).
     fn request_histogram(&mut self) -> Task<cosmic::Action<Message>> {
-        let Some(mono) = self.histogram_mono.clone() else {
-            self.histogram = None;
+        let Some(mono) = self.detail.histogram_mono.clone() else {
+            self.detail.histogram = None;
             return Task::none();
         };
-        if self.histogram_inflight {
-            self.histogram_dirty = true;
+        if self.detail.histogram_inflight {
+            self.detail.histogram_dirty = true;
             return Task::none();
         }
-        let develop = self.tone.to_develop(self.roll.base_or_default());
+        let develop = self.detail.tone.to_develop(self.roll.base_or_default());
         self.histogram_generation = self.histogram_generation.wrapping_add(1);
         let generation = self.histogram_generation;
-        self.histogram_inflight = true;
+        self.detail.histogram_inflight = true;
         let mode = self.histogram_mode;
         cosmic::task::future(async move {
             let bins = histogram_from_develop(mono.as_slice(), develop, HISTOGRAM_BINS, mode);
@@ -3810,50 +3818,16 @@ impl AppModel {
         )
     }
 
-    /// Reset all detail-view buffers, crossfade state, the view transform, and
-    /// the non-persisted tone-curve preview (each open starts at the identity).
+    /// Resets the per-frame detail state (keeping `frame`, `detail_area_size`,
+    /// `detail_inflight`, and `histogram_mode`, which outlive a detail close).
+    /// A late key release finds `editing_key_held` clear and no-ops rather than
+    /// committing a stale selection; the histogram generation is bumped so an
+    /// in-flight compute for the closing frame can never paint over the next
+    /// open.
     fn clear_detail(&mut self) {
-        self.detail_shader = None;
-        self.detail_thumb_opacity = 1.0;
-        self.detail_last_frame = None;
-        self.detail_thumb = None;
-        self.detail_zoom = Zoom::CONTAIN;
-        // `detail_area_size` deliberately survives: it is the preview's laid-out
-        // geometry, not per-frame detail state. Frame paging keeps `DetailArea`
-        // mounted with unchanged bounds, so it never re-publishes a size; that
-        // left the field `None` and the 1:1 zoom cap disabled (falling back to
-        // `MAX_DETAIL_ZOOM`) until the editing drawer first changed the bounds —
-        // letting the wheel zoom past native 100% (see the measured-size note on
-        // the field).
-        self.detail_native_queued = false;
-        self.detail_logged_failure = None;
-        self.detail_pan = Point::default();
-        self.detail_drag = None;
-        self.crop_drag_dirty = false;
-        self.detail_cursor = None;
-        // Any held editing key is dead once the detail view (and its edit
-        // context) goes away; a late key release will find it clear and no-op
-        // rather than committing a stale selection.
+        self.detail.clear();
         self.editing_key_held = false;
-        self.histogram_mono = None;
-        self.histogram = None;
-        // Bump the generation so an in-flight histogram compute for the closing
-        // frame can never paint over the next open, and reset the coalescing
-        // flags for the next frame.
         self.histogram_generation = self.histogram_generation.wrapping_add(1);
-        self.histogram_inflight = false;
-        self.histogram_dirty = false;
-        self.tone = edit_manifest::ToneEdit::default();
-        self.crop = edit_manifest::CropMargins::default();
-        self.aspect = edit_manifest::AspectRatio::Original;
-        self.rotation = 0;
-        self.crop_mode = false;
-        // The reset snapshot mirrors the live edit values' lifecycle: reset
-        // to identity on close; the next `ThumbnailActivated` re-syncs it.
-        self.reset_tone = edit_manifest::ToneEdit::default();
-        self.reset_crop = edit_manifest::CropMargins::default();
-        self.reset_aspect = edit_manifest::AspectRatio::Original;
-        self.reset_rotation = 0;
     }
 
     /// The effective maximum zoom for the current detail view: the 1:1 ("100%")
@@ -3862,7 +3836,7 @@ impl AppModel {
     /// [`MAX_DETAIL_ZOOM`] guard. Falls back to [`MAX_DETAIL_ZOOM`] until both
     /// a shader and a reported preview size exist.
     fn max_detail_zoom(&self) -> f32 {
-        let Some(shader) = &self.detail_shader else {
+        let Some(shader) = &self.detail.shader else {
             return MAX_DETAIL_ZOOM;
         };
         let Some(size) = self.detail_area_size else {
@@ -3886,7 +3860,7 @@ impl AppModel {
     /// exact same value, so there is no yank-back. Idle, it is precisely
     /// [`Self::max_detail_zoom`].
     fn max_detail_zoom_for_wheel(&self) -> f32 {
-        let Some(shader) = &self.detail_shader else {
+        let Some(shader) = &self.detail.shader else {
             return MAX_DETAIL_ZOOM;
         };
         let Some(size) = self.detail_area_size else {
@@ -3938,10 +3912,10 @@ impl AppModel {
     /// "zoomed" and "able to pan" coincide at that threshold.
     pub(crate) fn detail_cursor_interaction(&self) -> cosmic::iced::mouse::Interaction {
         use cosmic::iced::mouse::Interaction;
-        let panning = self.detail_drag == Some(DragTarget::Pan);
+        let panning = self.detail.drag == Some(DragTarget::Pan);
         match self.mode() {
             Mode::Crop => {
-                if self.detail_drag == Some(DragTarget::MoveCrop) {
+                if self.detail.drag == Some(DragTarget::MoveCrop) {
                     Interaction::Grabbing
                 } else if panning || self.modifiers.shift() || self.cursor_in_crop() {
                     Interaction::Grab
@@ -3949,7 +3923,7 @@ impl AppModel {
                     Interaction::None
                 }
             }
-            _ => detail_cursor_for(self.detail_zoom.0, panning),
+            _ => detail_cursor_for(self.detail.zoom.0, panning),
         }
     }
 
@@ -3963,17 +3937,17 @@ impl AppModel {
     /// to the shader so the render and state agree.
     fn reclamp_detail_zoom(&mut self) {
         let max = self.max_detail_zoom_for_wheel();
-        if self.detail_zoom.0 > max {
-            self.detail_zoom = Zoom(max);
-            if let Some(shader) = &mut self.detail_shader {
-                shader.set_view(self.detail_zoom.0, self.detail_pan);
+        if self.detail.zoom.0 > max {
+            self.detail.zoom = Zoom(max);
+            if let Some(shader) = &mut self.detail.shader {
+                shader.set_view(self.detail.zoom.0, self.detail.pan);
             }
         }
     }
 
     /// The navigational view currently shown (which owns a context drawer).
     fn current_view(&self) -> DrawerView {
-        if self.selected.is_some() {
+        if self.detail.frame.is_some() {
             DrawerView::Detail
         } else if self.active.is_some() {
             DrawerView::Grid
@@ -3991,7 +3965,7 @@ impl AppModel {
                     && matches!(&self.library.selection, Some(LibrarySelection::Roll(_)))
             }
             DrawerView::Grid => self.active.is_some() && self.frame_sel.primary().is_some(),
-            DrawerView::Detail => self.selected.is_some(),
+            DrawerView::Detail => self.detail.frame.is_some(),
         }
     }
 
@@ -4169,8 +4143,8 @@ impl AppModel {
     /// The current interaction mode, derived from the open views (no stored
     /// state): a detail view with crop mode on, a detail view, or neither.
     fn mode(&self) -> Mode {
-        if self.selected.is_some() {
-            if self.crop_mode {
+        if self.detail.frame.is_some() {
+            if self.detail.crop_mode {
                 Mode::Crop
             } else {
                 Mode::Detail
@@ -4223,7 +4197,7 @@ impl AppModel {
                 // the crop window left on screen even when the frame is rotated
                 // (`crop_move_direction` compensates for the CCW display turn).
                 self.editing_key_held = true;
-                let direction = crop_move_direction(dir, self.rotation);
+                let direction = crop_move_direction(dir, self.detail.rotation);
                 self.apply_crop_move(direction, step);
             }
             Action::ResizeCrop(resize, step) => {
@@ -4258,17 +4232,17 @@ impl AppModel {
     /// cursor in logical points, independent of zoom.
     fn on_view_pointer(&mut self, event: PointerEvent) -> Task<cosmic::Action<Message>> {
         match event {
-            PointerEvent::Press => self.detail_drag = Some(DragTarget::Pan),
+            PointerEvent::Press => self.detail.drag = Some(DragTarget::Pan),
             PointerEvent::Move(pt) => {
-                let prev = self.detail_cursor;
-                self.detail_cursor = Some(pt);
-                if self.detail_drag == Some(DragTarget::Pan)
+                let prev = self.detail.cursor;
+                self.detail.cursor = Some(pt);
+                if self.detail.drag == Some(DragTarget::Pan)
                     && let Some(prev) = prev
                 {
                     self.pan_view(pt.x - prev.x, pt.y - prev.y);
                 }
             }
-            PointerEvent::Release => self.detail_drag = None,
+            PointerEvent::Release => self.detail.drag = None,
         }
         Task::none()
     }
@@ -4276,10 +4250,10 @@ impl AppModel {
     /// Grab-pans the image by `(dx, dy)` logical points (the image follows the
     /// cursor 1:1, independent of zoom).
     fn pan_view(&mut self, dx: f32, dy: f32) {
-        self.detail_pan.x += dx;
-        self.detail_pan.y += dy;
-        if let Some(shader) = &mut self.detail_shader {
-            shader.set_view(self.detail_zoom.0, self.detail_pan);
+        self.detail.pan.x += dx;
+        self.detail.pan.y += dy;
+        if let Some(shader) = &mut self.detail.shader {
+            shader.set_view(self.detail.zoom.0, self.detail.pan);
         }
     }
 
@@ -4290,14 +4264,14 @@ impl AppModel {
     fn on_crop_pointer(&mut self, event: PointerEvent) -> Task<cosmic::Action<Message>> {
         match event {
             PointerEvent::Press => {
-                self.detail_drag = self.crop_drag_target();
-                self.crop_drag_dirty = false;
+                self.detail.drag = self.crop_drag_target();
+                self.detail.crop_drag_dirty = false;
             }
             PointerEvent::Move(pt) => {
-                let prev = self.detail_cursor;
-                self.detail_cursor = Some(pt);
+                let prev = self.detail.cursor;
+                self.detail.cursor = Some(pt);
                 if let Some(prev) = prev {
-                    match self.detail_drag {
+                    match self.detail.drag {
                         Some(DragTarget::MoveCrop) => {
                             self.apply_crop_drag(pt.x - prev.x, pt.y - prev.y);
                         }
@@ -4307,9 +4281,10 @@ impl AppModel {
                 }
             }
             PointerEvent::Release => {
-                let commit = self.detail_drag == Some(DragTarget::MoveCrop) && self.crop_drag_dirty;
-                self.detail_drag = None;
-                self.crop_drag_dirty = false;
+                let commit =
+                    self.detail.drag == Some(DragTarget::MoveCrop) && self.detail.crop_drag_dirty;
+                self.detail.drag = None;
+                self.detail.crop_drag_dirty = false;
                 if commit {
                     return self.commit_edit();
                 }
@@ -4333,13 +4308,13 @@ impl AppModel {
     /// Whether the last reported cursor position lies inside the crop window on
     /// screen (used for the crop-mode grab cursor and drag target).
     fn cursor_in_crop(&self) -> bool {
-        let Some(shader) = &self.detail_shader else {
+        let Some(shader) = &self.detail.shader else {
             return false;
         };
         let Some(size) = self.detail_area_size else {
             return false;
         };
-        let Some(cursor) = self.detail_cursor else {
+        let Some(cursor) = self.detail.cursor else {
             return false;
         };
         let sf = self.core().scale_factor();
@@ -4348,8 +4323,8 @@ impl AppModel {
                 size.width,
                 size.height,
                 sf,
-                self.detail_zoom.0,
-                self.detail_pan,
+                self.detail.zoom.0,
+                self.detail.pan,
             )
             .contains(cursor)
     }
@@ -4362,16 +4337,16 @@ impl AppModel {
         let Some(size) = self.detail_area_size else {
             return;
         };
-        let Some(shader) = &self.detail_shader else {
+        let Some(shader) = &self.detail.shader else {
             return;
         };
         let sf = self.core().scale_factor();
         let (w, h) = shader.source_dimensions();
-        let (fx, fy) = shader.overlay_phys_per_src(size.width, size.height, sf, self.detail_zoom.0);
-        let (move_x, move_y) = crop_drag_delta(self.rotation, (fx, fy), dx, dy, sf);
-        let next = drag_crop_box(self.crop, move_x, move_y, w, h);
-        if next != self.crop {
-            self.crop_drag_dirty = true;
+        let (fx, fy) = shader.overlay_phys_per_src(size.width, size.height, sf, self.detail.zoom.0);
+        let (move_x, move_y) = crop_drag_delta(self.detail.rotation, (fx, fy), dx, dy, sf);
+        let next = drag_crop_box(self.detail.crop, move_x, move_y, w, h);
+        if next != self.detail.crop {
+            self.detail.crop_drag_dirty = true;
         }
         self.apply_crop(next);
     }
@@ -4382,9 +4357,10 @@ impl AppModel {
         if self.active.is_some() {
             // Inside a roll. With the detail view open, Left/Right page
             // through the frames; on the bare grid they move the highlight.
-            if self.selected.is_some() {
+            if self.detail.frame.is_some() {
                 let current = self
-                    .selected
+                    .detail
+                    .frame
                     .as_ref()
                     .and_then(|name| self.tiles.iter().position(|tile| tile.name == *name));
                 if let Some(target) = current.and_then(|idx| paginate(idx, self.tiles.len(), dir)) {
@@ -4444,11 +4420,11 @@ impl AppModel {
     /// stays separate so the sliders can stream drags without re-decoding
     /// thumbnails on every move.
     fn set_exposure(&mut self, ev: f32) {
-        self.tone.exposure_ev = ev;
-        if let Some(selected) = &self.selected {
+        self.detail.tone.exposure_ev = ev;
+        if let Some(selected) = &self.detail.frame {
             self.roll.set_exposure(selected, ev);
         }
-        if let Some(shader) = &mut self.detail_shader {
+        if let Some(shader) = &mut self.detail.shader {
             shader.set_exposure(ev);
         }
     }
@@ -4463,15 +4439,15 @@ impl AppModel {
     /// contrast is a power about the midtone pivot, black/white are density
     /// anchors, and the pivot is a signed offset from the window midpoint.
     fn set_develop_shape(&mut self, contrast: f32, black: f32, white: f32, pivot: f32) {
-        self.tone.contrast = contrast;
-        self.tone.black = black;
-        self.tone.white = white;
-        self.tone.pivot_offset = pivot;
-        if let Some(selected) = &self.selected {
-            self.roll.set_develop(selected, self.tone);
+        self.detail.tone.contrast = contrast;
+        self.detail.tone.black = black;
+        self.detail.tone.white = white;
+        self.detail.tone.pivot_offset = pivot;
+        if let Some(selected) = &self.detail.frame {
+            self.roll.set_develop(selected, self.detail.tone);
         }
-        if let Some(shader) = &mut self.detail_shader {
-            shader.set_develop(self.tone.to_develop(self.roll.base_or_default()));
+        if let Some(shader) = &mut self.detail.shader {
+            shader.set_develop(self.detail.tone.to_develop(self.roll.base_or_default()));
         }
     }
 
@@ -4484,33 +4460,34 @@ impl AppModel {
     fn apply_tone_adjust(&mut self, adjust: ToneAdjust) {
         // Only adjust while a detail view is up, so the bindings never mutate
         // edits for an unseen frame.
-        if self.selected.is_none() {
+        if self.detail.frame.is_none() {
             return;
         }
 
         match adjust {
             ToneAdjust::Exposure(delta) => {
-                let ev = clamp_ev(self.tone.exposure_ev + delta);
+                let ev = clamp_ev(self.detail.tone.exposure_ev + delta);
                 self.set_exposure(ev);
             }
             // Each develop arm only changes one control; the others keep their
             // current values. Contrast steps its stop lift, so the "increase"
             // keys raise the power — matching the slider's rightward drag.
             ToneAdjust::Contrast(delta) => {
-                let contrast = contrast_power_for_lift(contrast_lift(self.tone.contrast) + delta);
+                let contrast =
+                    contrast_power_for_lift(contrast_lift(self.detail.tone.contrast) + delta);
                 self.set_develop_shape(
                     contrast,
-                    self.tone.black,
-                    self.tone.white,
-                    self.tone.pivot_offset,
+                    self.detail.tone.black,
+                    self.detail.tone.white,
+                    self.detail.tone.pivot_offset,
                 );
             }
             ToneAdjust::Black(delta) => {
                 self.set_develop_shape(
-                    self.tone.contrast,
-                    clamp_black(self.tone.black + delta),
-                    self.tone.white,
-                    self.tone.pivot_offset,
+                    self.detail.tone.contrast,
+                    clamp_black(self.detail.tone.black + delta),
+                    self.detail.tone.white,
+                    self.detail.tone.pivot_offset,
                 );
             }
             ToneAdjust::White(delta) => {
@@ -4518,18 +4495,18 @@ impl AppModel {
                 // which is the density anchor mirrored — so a positive step
                 // LOWERS the stored density (see `white_density_from_ui`).
                 self.set_develop_shape(
-                    self.tone.contrast,
-                    self.tone.black,
-                    clamp_white(self.tone.white - delta),
-                    self.tone.pivot_offset,
+                    self.detail.tone.contrast,
+                    self.detail.tone.black,
+                    clamp_white(self.detail.tone.white - delta),
+                    self.detail.tone.pivot_offset,
                 );
             }
             ToneAdjust::Pivot(delta) => {
                 self.set_develop_shape(
-                    self.tone.contrast,
-                    self.tone.black,
-                    self.tone.white,
-                    clamp_pivot(self.tone.pivot_offset + delta),
+                    self.detail.tone.contrast,
+                    self.detail.tone.black,
+                    self.detail.tone.white,
+                    clamp_pivot(self.detail.tone.pivot_offset + delta),
                 );
             }
         }
@@ -4544,7 +4521,8 @@ impl AppModel {
     /// crop-mode close) commits.
     fn apply_crop_move(&mut self, direction: edit_manifest::CropDirection, step: CropStep) {
         let Some((w, h)) = self
-            .detail_shader
+            .detail
+            .shader
             .as_ref()
             .map(shader::DetailProgram::source_dimensions)
         else {
@@ -4555,7 +4533,7 @@ impl AppModel {
             edit_manifest::CropDirection::Left | edit_manifest::CropDirection::Right => w,
         };
         let delta = step.resolve(base);
-        let next = move_crop_box(self.crop, direction, delta, w, h);
+        let next = move_crop_box(self.detail.crop, direction, delta, w, h);
         self.apply_crop(next);
     }
 
@@ -4567,19 +4545,24 @@ impl AppModel {
     /// Live-only until the edit key's release (or crop-mode close) commits.
     fn apply_crop_resize(&mut self, resize: ResizeCrop, step: CropStep) {
         let Some((w, h)) = self
-            .detail_shader
+            .detail
+            .shader
             .as_ref()
             .map(shader::DetailProgram::source_dimensions)
         else {
             return;
         };
-        let long = self.crop.cropped_width(w).max(self.crop.cropped_height(h));
+        let long = self
+            .detail
+            .crop
+            .cropped_width(w)
+            .max(self.detail.crop.cropped_height(h));
         let delta = i32::try_from(step.resolve(long)).unwrap_or(i32::MAX);
         let delta = match resize {
             ResizeCrop::Shrink => -delta,
             ResizeCrop::Expand => delta,
         };
-        let next = resize_crop_box(self.crop, delta, w, h);
+        let next = resize_crop_box(self.detail.crop, delta, w, h);
         self.apply_crop(next);
     }
 
@@ -4588,12 +4571,12 @@ impl AppModel {
     /// keyboard shortcut (via [`Self::apply_action`]) and the editing drawer
     /// button (which additionally persists via [`Self::commit_edit`]).
     fn apply_rotate_ccw(&mut self) {
-        self.rotation = (self.rotation + 1) & 3;
-        if let Some(selected) = &self.selected {
-            self.roll.set_rotation(selected, self.rotation);
+        self.detail.rotation = (self.detail.rotation + 1) & 3;
+        if let Some(selected) = &self.detail.frame {
+            self.roll.set_rotation(selected, self.detail.rotation);
         }
-        if let Some(shader) = &mut self.detail_shader {
-            shader.set_rotation(self.rotation);
+        if let Some(shader) = &mut self.detail.shader {
+            shader.set_rotation(self.detail.rotation);
         }
         // The crop is authored in the source frame, so the display rotation
         // leaves it untouched — the image and crop rotate together.
@@ -4605,13 +4588,14 @@ impl AppModel {
     /// yet).
     fn refit_crop_aspect(&mut self, bound: edit_manifest::CropMargins) {
         let Some((w, h)) = self
-            .detail_shader
+            .detail
+            .shader
             .as_ref()
             .map(shader::DetailProgram::source_dimensions)
         else {
             return;
         };
-        let next = fit_crop_to_aspect(bound, w, h, self.aspect.source_aspect(w, h));
+        let next = fit_crop_to_aspect(bound, w, h, self.detail.aspect.source_aspect(w, h));
         self.apply_crop(next);
     }
 
@@ -4622,13 +4606,14 @@ impl AppModel {
     /// shader.
     fn apply_crop_rotate(&mut self) {
         let Some((w, h)) = self
-            .detail_shader
+            .detail
+            .shader
             .as_ref()
             .map(shader::DetailProgram::source_dimensions)
         else {
             return;
         };
-        let next = rotate_crop_box(self.crop, w, h);
+        let next = rotate_crop_box(self.detail.crop, w, h);
         self.apply_crop(next);
     }
 
@@ -4636,11 +4621,11 @@ impl AppModel {
     /// re-clamps the zoom. The single apply point for every crop mutation
     /// (move, resize, aspect preset, crop rotation).
     fn apply_crop(&mut self, crop: edit_manifest::CropMargins) {
-        self.crop = crop;
-        if let Some(selected) = &self.selected {
+        self.detail.crop = crop;
+        if let Some(selected) = &self.detail.frame {
             self.roll.set_crop(selected, crop);
         }
-        if let Some(shader) = &mut self.detail_shader {
+        if let Some(shader) = &mut self.detail.shader {
             shader.set_crop(crop);
         }
         self.reclamp_detail_zoom();
@@ -4654,7 +4639,7 @@ impl AppModel {
         let source = self
             .frame_sel
             .primary()
-            .or(self.selected.as_deref())
+            .or(self.detail.frame.as_deref())
             .map(str::to_owned);
         if let Some(source) = source {
             self.clipboard = Some(self.roll.tone(&source));
@@ -4677,7 +4662,7 @@ impl AppModel {
             .frame_sel
             .iter()
             .cloned()
-            .chain(self.selected.clone())
+            .chain(self.detail.frame.clone())
             .collect();
         targets.sort();
         targets.dedup();
@@ -4692,11 +4677,11 @@ impl AppModel {
 
         // If the live detail frame is a target, sync the on-screen preview
         // state and the GPU shader to the pasted values.
-        if let Some(open) = self.selected.as_deref()
+        if let Some(open) = self.detail.frame.as_deref()
             && targets.iter().any(|name| name == open)
         {
-            self.tone = tone;
-            if let Some(shader) = &mut self.detail_shader {
+            self.detail.tone = tone;
+            if let Some(shader) = &mut self.detail.shader {
                 shader.set_exposure(tone.exposure_ev);
                 shader.set_develop(tone.to_develop(self.roll.base_or_default()));
             }
@@ -4782,14 +4767,14 @@ impl AppModel {
         result: Result<DetailDecode, FrameError>,
     ) -> Task<cosmic::Action<Message>> {
         if detail_result_is_current(
-            self.selected.as_deref(),
+            self.detail.frame.as_deref(),
             self.detail_inflight.as_deref(),
             name,
         ) {
             // Only the first load of an image restarts the thumbnail
             // crossfade; a native level-up swap must not re-flash the
             // (normally faded) thumb over the fresh hi-res texture.
-            let fresh_open = self.detail_shader.is_none();
+            let fresh_open = self.detail.shader.is_none();
             let mut landed = false;
             match result {
                 Ok(DetailDecode {
@@ -4799,7 +4784,7 @@ impl AppModel {
                     landed = true;
                     detail_trace(format_args!(
                         "arrived ok: {name} {}x{} (src long edge {src_long_edge}), fresh={fresh_open}, zoom={:.3}",
-                        image.width, image.height, self.detail_zoom.0
+                        image.width, image.height, self.detail.zoom.0
                     ));
                     // Stash a fresh overview decode into the LRU so returning
                     // to this frame is instant. Only the level-1 overview is
@@ -4831,35 +4816,35 @@ impl AppModel {
                                 }
                             })
                     {
-                        self.detail_thumb = Some(tile);
+                        self.detail.thumb = Some(tile);
                     }
                     let image_id = self.next_image_id;
                     self.next_image_id = self.next_image_id.wrapping_add(1);
                     // Share the overview mono for the drawer histogram (a
                     // refcount, recomputed on the blocking pool as the develop
                     // changes).
-                    self.histogram_mono = Some(Arc::new(image.data.clone()));
-                    self.detail_shader = Some(shader::DetailProgram::new(
+                    self.detail.histogram_mono = Some(Arc::new(image.data.clone()));
+                    self.detail.shader = Some(shader::DetailProgram::new(
                         image.data,
                         image.width,
                         image.height,
-                        self.tone.to_develop(self.roll.base_or_default()),
-                        self.crop,
-                        self.rotation,
+                        self.detail.tone.to_develop(self.roll.base_or_default()),
+                        self.detail.crop,
+                        self.detail.rotation,
                         image_id,
                         src_long_edge,
                     ));
                     // Carry over any zoom/pan the user applied while the decode
                     // was in flight (the program starts at contain fit).
-                    if let Some(shader) = &mut self.detail_shader {
-                        shader.set_view(self.detail_zoom.0, self.detail_pan);
-                        shader.set_crop(self.crop);
-                        shader.set_rotation(self.rotation);
+                    if let Some(shader) = &mut self.detail.shader {
+                        shader.set_view(self.detail.zoom.0, self.detail.pan);
+                        shader.set_crop(self.detail.crop);
+                        shader.set_rotation(self.detail.rotation);
                         // A fresh program starts with the mask off; re-assert
                         // the current crop-mode state so the dim overlay
                         // survives the level-up re-install.
-                        shader.set_show_mask(self.crop_mode);
-                        shader.set_pad(if self.crop_mode {
+                        shader.set_show_mask(self.detail.crop_mode);
+                        shader.set_pad(if self.detail.crop_mode {
                             CROP_MODE_PADDING
                         } else {
                             0.0
@@ -4876,27 +4861,27 @@ impl AppModel {
                     // NOT the capped overview width: a large sensor downscaled
                     // just under 2048 must still level up to native.
                     if !fresh_open || src_long_edge <= HI_RES_SIZE {
-                        self.detail_native_queued = true;
+                        self.detail.native_queued = true;
                     }
                 }
                 Err(err) => {
                     detail_trace(format_args!(
                         "arrived err: {name}, fresh={fresh_open}, zoom={:.3}",
-                        self.detail_zoom.0
+                        self.detail.zoom.0
                     ));
                     // Wheel-driven re-decodes of the same failing frame land
                     // here repeatedly; log the reason once per selection so an
                     // undecodable file shows one clear line instead of one per
                     // notch.
-                    if self.detail_logged_failure.as_deref() != Some(name) {
+                    if self.detail.logged_failure.as_deref() != Some(name) {
                         log::error!("detail decode failed for {name}: {err}");
-                        self.detail_logged_failure = Some(name.to_string());
+                        self.detail.logged_failure = Some(name.to_string());
                     }
                 }
             }
             if fresh_open {
-                self.detail_thumb_opacity = 1.0;
-                self.detail_last_frame = None;
+                self.detail.thumb_opacity = 1.0;
+                self.detail.last_frame = None;
             }
             self.detail_inflight = None;
 
@@ -4906,12 +4891,12 @@ impl AppModel {
             // lands, start the next level onto the just-freed slot — so
             // zooming during the overview load still reaches native. Gated on
             // the landing having succeeded: an error must not spin the slot.
-            if landed && !self.detail_native_queued {
+            if landed && !self.detail.native_queued {
                 let trigger = self.native_level_up_zoom();
-                if self.detail_zoom.0 >= trigger {
+                if self.detail.zoom.0 >= trigger {
                     detail_trace(format_args!(
                         "landing re-pump: zoom {:.3} >= native level-up zoom {:.3}",
-                        self.detail_zoom.0, trigger
+                        self.detail.zoom.0, trigger
                     ));
                     return self.decode_detail_next();
                 }

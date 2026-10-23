@@ -174,7 +174,7 @@ pub(crate) fn frames_view(app: &AppModel) -> Element<'_, Message> {
                 // crop mode the surround goes white — the working backdrop for
                 // judging the crop — and the dim overlay marks the excluded
                 // area.
-                background: Some(cosmic::iced::Background::Color(if app.crop_mode {
+                background: Some(cosmic::iced::Background::Color(if app.detail.crop_mode {
                     cosmic::iced::Color::WHITE
                 } else {
                     theme.cosmic().background(false).base.into()
@@ -197,7 +197,7 @@ pub(crate) fn frames_view(app: &AppModel) -> Element<'_, Message> {
 pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
-    if app.detail_shader.is_none() {
+    if app.detail.shader.is_none() {
         return widget::column::with_capacity(1)
             .push("Loading...")
             .spacing(space_s)
@@ -210,8 +210,8 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // curve the straight diagonal at the identity controls. Drawn only once a
     // bin set has landed.
     let histogram = widget::canvas(HistogramPlot {
-        bins: app.histogram.as_deref(),
-        develop: app.tone.to_develop(app.roll.base_or_default()),
+        bins: app.detail.histogram.as_deref(),
+        develop: app.detail.tone.to_develop(app.roll.base_or_default()),
     })
     .width(Length::Fill)
     .height(Length::Fixed(HISTOGRAM_HEIGHT));
@@ -242,7 +242,7 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // exactly.
     let slider = widget::slider(
         edit_manifest::exposure_range(),
-        app.tone.exposure_ev,
+        app.detail.tone.exposure_ev,
         Message::ExposureChanged,
     )
     .step(edit_manifest::EV_STEP)
@@ -260,13 +260,13 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // stores); `contrast_power_for_lift` maps to the power the develop takes.
     let contrast_slider = widget::slider(
         edit_manifest::contrast_lift_range(),
-        contrast_lift(app.tone.contrast),
+        contrast_lift(app.detail.tone.contrast),
         move |lift| {
             Message::DevelopChanged(
                 contrast_power_for_lift(lift),
-                app.tone.black,
-                app.tone.white,
-                app.tone.pivot_offset,
+                app.detail.tone.black,
+                app.detail.tone.white,
+                app.detail.tone.pivot_offset,
             )
         },
     )
@@ -274,14 +274,18 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     .shift_step(edit_manifest::TONE_TICK)
     .on_release(Message::EditSave);
     let black_label = widget::text(fl!("black-label"));
-    let black_slider = widget::slider(edit_manifest::black_range(), app.tone.black, move |black| {
-        Message::DevelopChanged(
-            app.tone.contrast,
-            black,
-            app.tone.white,
-            app.tone.pivot_offset,
-        )
-    })
+    let black_slider = widget::slider(
+        edit_manifest::black_range(),
+        app.detail.tone.black,
+        move |black| {
+            Message::DevelopChanged(
+                app.detail.tone.contrast,
+                black,
+                app.detail.tone.white,
+                app.detail.tone.pivot_offset,
+            )
+        },
+    )
     .step(edit_manifest::TONE_STEP)
     .shift_step(edit_manifest::TONE_TICK)
     .on_release(Message::EditSave);
@@ -291,13 +295,13 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // converts back on drag (see `white_ui_from_density`).
     let white_slider = widget::slider(
         edit_manifest::white_range(),
-        white_ui_from_density(app.tone.white),
+        white_ui_from_density(app.detail.tone.white),
         move |ui| {
             Message::DevelopChanged(
-                app.tone.contrast,
-                app.tone.black,
+                app.detail.tone.contrast,
+                app.detail.tone.black,
                 white_density_from_ui(ui),
-                app.tone.pivot_offset,
+                app.detail.tone.pivot_offset,
             )
         },
     )
@@ -307,9 +311,14 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let pivot_label = widget::text(fl!("pivot-label"));
     let pivot_slider = widget::slider(
         edit_manifest::pivot_range(),
-        app.tone.pivot_offset,
+        app.detail.tone.pivot_offset,
         move |pivot| {
-            Message::DevelopChanged(app.tone.contrast, app.tone.black, app.tone.white, pivot)
+            Message::DevelopChanged(
+                app.detail.tone.contrast,
+                app.detail.tone.black,
+                app.detail.tone.white,
+                pivot,
+            )
         },
     )
     .step(edit_manifest::TONE_STEP)
@@ -334,7 +343,7 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .collect();
     let aspect_selected = edit_manifest::AspectRatio::ALL
         .iter()
-        .position(|option| *option == app.aspect);
+        .position(|option| *option == app.detail.aspect);
     let aspect_label = widget::text(fl!("aspect-label"));
     let aspect_dropdown = widget::dropdown(aspect_labels, aspect_selected, move |index| {
         Message::SetAspect(
@@ -1225,13 +1234,13 @@ fn calibration_frame_dot() -> Element<'static, Message> {
 /// fades out via `.opacity()`.
 fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
     let space_s = cosmic::theme::spacing().space_s;
-    let name = app.selected.as_ref()?;
+    let name = app.detail.frame.as_ref()?;
     let tile = app.tiles.iter().find(|tile| &tile.name == name)?;
 
     let preview: Element<'_, Message> = match (
-        app.detail_shader.as_ref(),
-        app.detail_thumb.as_ref(),
-        app.detail_thumb_opacity > 0.0,
+        app.detail.shader.as_ref(),
+        app.detail.thumb.as_ref(),
+        app.detail.thumb_opacity > 0.0,
     ) {
         (Some(shader), Some(thumb), true) => {
             // Crossfade in progress — thumbnail fading out over shader.
@@ -1241,7 +1250,7 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .content_fit(ContentFit::Contain)
-                    .opacity(app.detail_thumb_opacity)
+                    .opacity(app.detail.thumb_opacity)
                     .into(),
             ])
             .into()
