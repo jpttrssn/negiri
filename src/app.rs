@@ -2028,9 +2028,9 @@ impl cosmic::Application for AppModel {
 
             Message::ExposureChanged(ev) => {
                 // RAM-only until an edit flush point; the shader stays live.
-                // Shared with the keyboard `Action` path via `set_exposure`.
-                self.set_exposure(ev);
-                self.request_histogram()
+                let mut tone = self.roll.detail.tone;
+                tone.exposure_ev = ev;
+                self.apply_tone_live(tone)
             }
 
             Message::Pointer(event) => self.on_pointer(event),
@@ -2089,9 +2089,12 @@ impl cosmic::Application for AppModel {
             Message::DevelopChanged(contrast, black, white, pivot) => {
                 // RAM-only until an edit flush point (slider `on_release`,
                 // `DetailClosed`, window close) — same lifecycle as exposure.
-                // Shared with the keyboard `Action` path via `set_develop`.
-                self.set_develop_shape(contrast, black, white, pivot);
-                self.request_histogram()
+                let mut tone = self.roll.detail.tone;
+                tone.contrast = contrast;
+                tone.black = black;
+                tone.white = white;
+                tone.pivot_offset = pivot;
+                self.apply_tone_live(tone)
             }
 
             Message::ResetAll => {
@@ -2102,17 +2105,13 @@ impl cosmic::Application for AppModel {
                 // button is one unconscious click away from a slider, so
                 // mirror the sliders' choice of only-mutate-RAM: the same
                 // `EditSave` points persist it).
-                self.roll.detail.tone = self.roll.detail.reset_tone;
+                // Tone goes through the shared live path (RAM + shader +
+                // histogram); crop/aspect/rotation do not affect the histogram.
+                let tone_task = self.apply_tone_live(self.roll.detail.reset_tone);
                 self.roll.detail.crop = self.roll.detail.reset_crop;
                 self.roll.detail.aspect = self.roll.detail.reset_aspect;
                 self.roll.detail.rotation = self.roll.detail.reset_rotation;
                 if let Some(selected) = &self.roll.detail.frame {
-                    self.roll
-                        .manifest
-                        .set_exposure(selected, self.roll.detail.reset_tone.exposure_ev);
-                    self.roll
-                        .manifest
-                        .set_develop(selected, self.roll.detail.reset_tone);
                     self.roll
                         .manifest
                         .set_crop(selected, self.roll.detail.reset_crop);
@@ -2124,18 +2123,11 @@ impl cosmic::Application for AppModel {
                         .set_rotation(selected, self.roll.detail.reset_rotation);
                 }
                 if let Some(shader) = &mut self.roll.detail.shader {
-                    shader.set_exposure(self.roll.detail.reset_tone.exposure_ev);
-                    shader.set_develop(
-                        self.roll
-                            .detail
-                            .reset_tone
-                            .to_develop(self.roll.manifest.base_or_default()),
-                    );
                     shader.set_crop(self.roll.detail.reset_crop);
                     shader.set_rotation(self.roll.detail.reset_rotation);
                 }
                 self.reclamp_detail_zoom();
-                Task::none()
+                tone_task
             }
 
             // Reset ONLY the crop to zero (full frame), leaving exposure/tone
@@ -4204,8 +4196,7 @@ impl AppModel {
             Action::Navigate(dir) => return self.navigate(dir),
             Action::Tone(adjust) => {
                 self.editing_key_held = true;
-                self.apply_tone_adjust(adjust);
-                return self.request_histogram();
+                return self.apply_tone_adjust(adjust);
             }
             Action::RotateDisplay => {
                 self.editing_key_held = true;
@@ -4487,109 +4478,62 @@ impl AppModel {
         Task::none()
     }
 
-    /// Writes the open frame's exposure live: the RAM roll edit and the GPU
-    /// shader uniform. The slider (`ExposureChanged`) and a keyboard step
-    /// (`ToneAdjust::Exposure`) both route here; committing (persist + re-bake)
-    /// stays separate so the sliders can stream drags without re-decoding
-    /// thumbnails on every move.
-    fn set_exposure(&mut self, ev: f32) {
-        self.roll.detail.tone.exposure_ev = ev;
+    /// Writes the open frame's full tone edit live — the RAM roll edit and the
+    /// GPU shader uniforms — and schedules the drawer histogram recompute. The
+    /// single entry point for every live tone change (slider drags, keyboard
+    /// steps, paste, reset), so the histogram can never go stale relative to the
+    /// image. The commit (persist + re-bake) stays separate, on release, so the
+    /// sliders can stream drags without re-decoding thumbnails on every move.
+    fn apply_tone_live(&mut self, tone: edit_manifest::ToneEdit) -> Task<cosmic::Action<Message>> {
+        self.roll.detail.tone = tone;
         if let Some(selected) = &self.roll.detail.frame {
-            self.roll.manifest.set_exposure(selected, ev);
+            self.roll.manifest.set_exposure(selected, tone.exposure_ev);
+            self.roll.manifest.set_develop(selected, tone);
         }
         if let Some(shader) = &mut self.roll.detail.shader {
-            shader.set_exposure(ev);
+            shader.set_exposure(tone.exposure_ev);
+            shader.set_develop(tone.to_develop(self.roll.manifest.base_or_default()));
         }
-    }
-
-    /// Writes the open frame's density develop shape live: the RAM roll edit
-    /// and the GPU shader uniforms. The slider (`DevelopChanged`) and a
-    /// keyboard step (`ToneAdjust::Contrast`/`Black`/`White`/`Pivot`) both
-    /// route here; committing (persist + re-bake) stays separate like
-    /// [`Self::set_exposure`].
-    ///
-    /// The values map straight onto [`film::Develop`]'s shape controls:
-    /// contrast is a power about the midtone pivot, black/white are density
-    /// anchors, and the pivot is a signed offset from the window midpoint.
-    fn set_develop_shape(&mut self, contrast: f32, black: f32, white: f32, pivot: f32) {
-        self.roll.detail.tone.contrast = contrast;
-        self.roll.detail.tone.black = black;
-        self.roll.detail.tone.white = white;
-        self.roll.detail.tone.pivot_offset = pivot;
-        if let Some(selected) = &self.roll.detail.frame {
-            self.roll
-                .manifest
-                .set_develop(selected, self.roll.detail.tone);
-        }
-        if let Some(shader) = &mut self.roll.detail.shader {
-            shader.set_develop(
-                self.roll
-                    .detail
-                    .tone
-                    .to_develop(self.roll.manifest.base_or_default()),
-            );
-        }
+        self.request_histogram()
     }
 
     /// Applies a keyboard-shortcut tone adjustment, mirroring the slider
-    /// messages: mutate the RAM roll edit and the live shader only — the
-    /// commit (persist + re-bake) happens on key release via
-    /// [`Self::commit_edit`], the same cadence as a slider drag/release.
-    /// No-ops unless a detail view is open (there is nothing to edit
-    /// otherwise).
-    fn apply_tone_adjust(&mut self, adjust: ToneAdjust) {
+    /// messages: builds the new tone from the current one and applies it live
+    /// via [`Self::apply_tone_live`]. The commit (persist + re-bake) happens on
+    /// key release via [`Self::commit_edit`], the same cadence as a slider
+    /// drag/release. No-ops unless a detail view is open.
+    fn apply_tone_adjust(&mut self, adjust: ToneAdjust) -> Task<cosmic::Action<Message>> {
         // Only adjust while a detail view is up, so the bindings never mutate
         // edits for an unseen frame.
         if self.roll.detail.frame.is_none() {
-            return;
+            return Task::none();
         }
 
+        let mut tone = self.roll.detail.tone;
         match adjust {
             ToneAdjust::Exposure(delta) => {
-                let ev = clamp_ev(self.roll.detail.tone.exposure_ev + delta);
-                self.set_exposure(ev);
+                tone.exposure_ev = clamp_ev(tone.exposure_ev + delta);
             }
             // Each develop arm only changes one control; the others keep their
             // current values. Contrast steps its stop lift, so the "increase"
             // keys raise the power — matching the slider's rightward drag.
             ToneAdjust::Contrast(delta) => {
-                let contrast =
-                    contrast_power_for_lift(contrast_lift(self.roll.detail.tone.contrast) + delta);
-                self.set_develop_shape(
-                    contrast,
-                    self.roll.detail.tone.black,
-                    self.roll.detail.tone.white,
-                    self.roll.detail.tone.pivot_offset,
-                );
+                tone.contrast = contrast_power_for_lift(contrast_lift(tone.contrast) + delta);
             }
             ToneAdjust::Black(delta) => {
-                self.set_develop_shape(
-                    self.roll.detail.tone.contrast,
-                    clamp_black(self.roll.detail.tone.black + delta),
-                    self.roll.detail.tone.white,
-                    self.roll.detail.tone.pivot_offset,
-                );
+                tone.black = clamp_black(tone.black + delta);
             }
             ToneAdjust::White(delta) => {
                 // `delta` is in the White slider's UI axis (right = brighter),
                 // which is the density anchor mirrored — so a positive step
                 // LOWERS the stored density (see `white_density_from_ui`).
-                self.set_develop_shape(
-                    self.roll.detail.tone.contrast,
-                    self.roll.detail.tone.black,
-                    clamp_white(self.roll.detail.tone.white - delta),
-                    self.roll.detail.tone.pivot_offset,
-                );
+                tone.white = clamp_white(tone.white - delta);
             }
             ToneAdjust::Pivot(delta) => {
-                self.set_develop_shape(
-                    self.roll.detail.tone.contrast,
-                    self.roll.detail.tone.black,
-                    self.roll.detail.tone.white,
-                    clamp_pivot(self.roll.detail.tone.pivot_offset + delta),
-                );
+                tone.pivot_offset = clamp_pivot(tone.pivot_offset + delta);
             }
         }
+        self.apply_tone_live(tone)
     }
 
     /// Translates the crop window one `step` in `direction` (percent-of-frame
@@ -4764,26 +4708,27 @@ impl AppModel {
             self.roll.manifest.set_tone(name, tone);
         }
 
-        // If the live detail frame is a target, sync the on-screen preview
-        // state and the GPU shader to the pasted values.
-        if let Some(open) = self.roll.detail.frame.as_deref()
-            && targets.iter().any(|name| name == open)
-        {
-            self.roll.detail.tone = tone;
-            if let Some(shader) = &mut self.roll.detail.shader {
-                shader.set_exposure(tone.exposure_ev);
-                shader.set_develop(tone.to_develop(self.roll.manifest.base_or_default()));
-            }
-        }
+        // If the live detail frame is a target, sync the on-screen preview state,
+        // the GPU shader, and the drawer histogram to the pasted values.
+        let tone_task = self
+            .roll
+            .detail
+            .frame
+            .as_deref()
+            .is_some_and(|open| targets.iter().any(|name| name == open))
+            .then(|| self.apply_tone_live(tone));
 
         self.persist_roll();
 
         // Re-bake the affected tiles so the grid reflects the new edits.
-        let mut tasks = Vec::with_capacity(2);
+        let mut tasks = Vec::with_capacity(3);
         for name in &targets {
             if let Some(tile) = self.roll.tiles.iter_mut().find(|tile| &tile.name == name) {
                 tile.thumb = Thumb::Loading;
             }
+        }
+        if let Some(task) = tone_task {
+            tasks.push(task);
         }
         tasks.push(self.decode_next());
         // If the open roll's cover is among the targets, its library card also
