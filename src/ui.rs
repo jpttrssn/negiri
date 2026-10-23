@@ -120,7 +120,7 @@ pub(crate) fn search_input_id() -> cosmic::iced::widget::Id {
 pub(crate) fn frames_view(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
-    let tiles: Element<'_, Message> = if app.tiles.is_empty() {
+    let tiles: Element<'_, Message> = if app.roll.state.tiles.is_empty() {
         widget::container(widget::text(fl!("no-files")))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -128,11 +128,11 @@ pub(crate) fn frames_view(app: &AppModel) -> Element<'_, Message> {
             .align_y(Vertical::Center)
             .into()
     } else {
-        let grid = Grid::with_children(app.tiles.iter().map(|tile| {
+        let grid = Grid::with_children(app.roll.state.tiles.iter().map(|tile| {
             tile_view(
                 tile,
                 app.frame_is_selected(&tile.name),
-                is_calibration_frame(app.roll.calibration_frame(), &tile.name),
+                is_calibration_frame(app.roll.state.manifest.calibration_frame(), &tile.name),
             )
         }))
         .fluid(THUMB_SIZE)
@@ -174,11 +174,13 @@ pub(crate) fn frames_view(app: &AppModel) -> Element<'_, Message> {
                 // crop mode the surround goes white — the working backdrop for
                 // judging the crop — and the dim overlay marks the excluded
                 // area.
-                background: Some(cosmic::iced::Background::Color(if app.detail.crop_mode {
-                    cosmic::iced::Color::WHITE
-                } else {
-                    theme.cosmic().background(false).base.into()
-                })),
+                background: Some(cosmic::iced::Background::Color(
+                    if app.roll.detail.crop_mode {
+                        cosmic::iced::Color::WHITE
+                    } else {
+                        theme.cosmic().background(false).base.into()
+                    },
+                )),
                 ..Default::default()
             }),
         );
@@ -197,7 +199,7 @@ pub(crate) fn frames_view(app: &AppModel) -> Element<'_, Message> {
 pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let space_s = cosmic::theme::spacing().space_s;
 
-    if app.detail.shader.is_none() {
+    if app.roll.detail.shader.is_none() {
         return widget::column::with_capacity(1)
             .push("Loading...")
             .spacing(space_s)
@@ -210,8 +212,12 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // curve the straight diagonal at the identity controls. Drawn only once a
     // bin set has landed.
     let histogram = widget::canvas(HistogramPlot {
-        bins: app.detail.histogram.as_deref(),
-        develop: app.detail.tone.to_develop(app.roll.base_or_default()),
+        bins: app.roll.detail.histogram.as_deref(),
+        develop: app
+            .roll
+            .detail
+            .tone
+            .to_develop(app.roll.state.manifest.base_or_default()),
     })
     .width(Length::Fill)
     .height(Length::Fixed(HISTOGRAM_HEIGHT));
@@ -242,7 +248,7 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // exactly.
     let slider = widget::slider(
         edit_manifest::exposure_range(),
-        app.detail.tone.exposure_ev,
+        app.roll.detail.tone.exposure_ev,
         Message::ExposureChanged,
     )
     .step(edit_manifest::EV_STEP)
@@ -260,13 +266,13 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // stores); `contrast_power_for_lift` maps to the power the develop takes.
     let contrast_slider = widget::slider(
         edit_manifest::contrast_lift_range(),
-        contrast_lift(app.detail.tone.contrast),
+        contrast_lift(app.roll.detail.tone.contrast),
         move |lift| {
             Message::DevelopChanged(
                 contrast_power_for_lift(lift),
-                app.detail.tone.black,
-                app.detail.tone.white,
-                app.detail.tone.pivot_offset,
+                app.roll.detail.tone.black,
+                app.roll.detail.tone.white,
+                app.roll.detail.tone.pivot_offset,
             )
         },
     )
@@ -276,13 +282,13 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let black_label = widget::text(fl!("black-label"));
     let black_slider = widget::slider(
         edit_manifest::black_range(),
-        app.detail.tone.black,
+        app.roll.detail.tone.black,
         move |black| {
             Message::DevelopChanged(
-                app.detail.tone.contrast,
+                app.roll.detail.tone.contrast,
                 black,
-                app.detail.tone.white,
-                app.detail.tone.pivot_offset,
+                app.roll.detail.tone.white,
+                app.roll.detail.tone.pivot_offset,
             )
         },
     )
@@ -295,13 +301,13 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     // converts back on drag (see `white_ui_from_density`).
     let white_slider = widget::slider(
         edit_manifest::white_range(),
-        white_ui_from_density(app.detail.tone.white),
+        white_ui_from_density(app.roll.detail.tone.white),
         move |ui| {
             Message::DevelopChanged(
-                app.detail.tone.contrast,
-                app.detail.tone.black,
+                app.roll.detail.tone.contrast,
+                app.roll.detail.tone.black,
                 white_density_from_ui(ui),
-                app.detail.tone.pivot_offset,
+                app.roll.detail.tone.pivot_offset,
             )
         },
     )
@@ -311,12 +317,12 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
     let pivot_label = widget::text(fl!("pivot-label"));
     let pivot_slider = widget::slider(
         edit_manifest::pivot_range(),
-        app.detail.tone.pivot_offset,
+        app.roll.detail.tone.pivot_offset,
         move |pivot| {
             Message::DevelopChanged(
-                app.detail.tone.contrast,
-                app.detail.tone.black,
-                app.detail.tone.white,
+                app.roll.detail.tone.contrast,
+                app.roll.detail.tone.black,
+                app.roll.detail.tone.white,
                 pivot,
             )
         },
@@ -343,7 +349,7 @@ pub(crate) fn editing_panel(app: &AppModel) -> Element<'_, Message> {
         .collect();
     let aspect_selected = edit_manifest::AspectRatio::ALL
         .iter()
-        .position(|option| *option == app.detail.aspect);
+        .position(|option| *option == app.roll.detail.aspect);
     let aspect_label = widget::text(fl!("aspect-label"));
     let aspect_dropdown = widget::dropdown(aspect_labels, aspect_selected, move |index| {
         Message::SetAspect(
@@ -731,14 +737,16 @@ pub(crate) fn frame_info_panel<'a>(app: &'a AppModel, name: &str) -> Element<'a,
     // seconds (the tile order is the grid order, which is also the export
     // order). Only present when the roll carries a start date; independent of
     // the file's own EXIF.
-    let dated = app.roll.start_date().and_then(|start| {
-        app.tiles
+    let dated = app.roll.state.manifest.start_date().and_then(|start| {
+        app.roll
+            .state
+            .tiles
             .iter()
             .position(|tile| tile.name == name)
             .and_then(|index| exif_writer::shifted_datetime(start, index))
     });
 
-    let tile = app.tiles.iter().find(|tile| tile.name == name);
+    let tile = app.roll.state.tiles.iter().find(|tile| tile.name == name);
     let meta_rows: Vec<Element<'_, Message>> =
         if let Some(meta) = tile.and_then(|t| t.meta.as_ref()) {
             let mut rows = Vec::with_capacity(8);
@@ -1234,13 +1242,18 @@ fn calibration_frame_dot() -> Element<'static, Message> {
 /// fades out via `.opacity()`.
 fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
     let space_s = cosmic::theme::spacing().space_s;
-    let name = app.detail.frame.as_ref()?;
-    let tile = app.tiles.iter().find(|tile| &tile.name == name)?;
+    let name = app.roll.detail.frame.as_ref()?;
+    let tile = app
+        .roll
+        .state
+        .tiles
+        .iter()
+        .find(|tile| &tile.name == name)?;
 
     let preview: Element<'_, Message> = match (
-        app.detail.shader.as_ref(),
-        app.detail.thumb.as_ref(),
-        app.detail.thumb_opacity > 0.0,
+        app.roll.detail.shader.as_ref(),
+        app.roll.detail.thumb.as_ref(),
+        app.roll.detail.thumb_opacity > 0.0,
     ) {
         (Some(shader), Some(thumb), true) => {
             // Crossfade in progress — thumbnail fading out over shader.
@@ -1250,7 +1263,7 @@ fn detail_view(app: &AppModel) -> Option<Element<'_, Message>> {
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .content_fit(ContentFit::Contain)
-                    .opacity(app.detail.thumb_opacity)
+                    .opacity(app.roll.detail.thumb_opacity)
                     .into(),
             ])
             .into()
