@@ -239,20 +239,10 @@ pub(crate) struct AppModel {
     /// (initial state) until the user selects a cell; drives the selected-tile
     /// highlight, the `Space` metadata drawer, and Enter/arrow navigation.
     pub(crate) library_selection: Option<LibrarySelection>,
-    /// Frame-grid highlight: the tile single-clicked (or last opened / paged
-    /// to) inside an open roll. Distinct from `selected` (the opened detail
-    /// frame) so the highlight survives closing the detail view and drives the
-    /// accent ring, Enter, and arrow-key navigation. Also the "primary" of any
-    /// multi-selection: it is always a member of `selected_frames`.
-    frame_selected: Option<String>,
-    /// Multi-selected frames on the open roll's grid. A plain click (or the
-    /// primary `frame_selected`) always lands here; Ctrl+click toggles a frame
-    /// in/out, Shift+click selects the range from the anchor through the
-    /// clicked frame, and Ctrl+A selects every frame in the roll. Used as the
-    /// batch target for copy/paste edits.
-    pub(crate) selected_frames: HashSet<String>,
-    /// Last frame used as the Shift+click range anchor within the grid.
-    selection_anchor: Option<String>,
+    /// The open roll's frame-grid selection: keyboard focus (primary), the
+    /// multi-selection set (accent rings + copy/paste batch), and the Shift
+    /// range anchor. See [`FrameSelection`].
+    frame_sel: FrameSelection,
     /// The modifier keys currently held, delivered by the global keyboard
     /// subscription's `ModifiersChanged` event. A frame click reads this to
     /// distinguish a plain click (clear + select) from a Ctrl+click (toggle a
@@ -566,6 +556,129 @@ pub(crate) enum LibrarySelection {
     Roll(PathBuf),
 }
 
+/// The frame-grid selection for the open roll: the keyboard focus (primary),
+/// the multi-selection set, and the Shift-range anchor. One value type so every
+/// mutation (plain click, Ctrl+click toggle, Shift range, Ctrl+A, clear) lives
+/// here and the invariant "the primary is always a member of the set" is
+/// enforced in one place. `primary` drives the keyboard position, the frame-info
+/// target, Enter, and the single-frame fallback for copy/export; `set` drives
+/// the accent rings and the copy/paste batch.
+#[derive(Debug, Clone, Default)]
+struct FrameSelection {
+    /// The focused frame: keyboard nav position, frame-info target, Enter, and
+    /// the single-frame copy/export fallback. `Some` implies a member of `set`.
+    primary: Option<String>,
+    /// The multi-selection: accent rings + the copy/paste batch target.
+    set: HashSet<String>,
+    /// The Shift+click / Shift+arrow range origin within the grid order.
+    anchor: Option<String>,
+}
+
+impl FrameSelection {
+    /// The focused frame, if any.
+    fn primary(&self) -> Option<&str> {
+        self.primary.as_deref()
+    }
+
+    /// Whether `name` is in the multi-selection (drives its accent ring).
+    fn contains(&self, name: &str) -> bool {
+        self.set.contains(name)
+    }
+
+    /// Whether nothing is selected.
+    fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    /// The selected frame names (unordered; sort at the call site when an order
+    /// is needed).
+    fn iter(&self) -> impl Iterator<Item = &String> {
+        self.set.iter()
+    }
+
+    /// Focus exactly `name` and make it the sole selection (plain click, arrow
+    /// nav, pre-select, plain open). `anchor` follows so a later Shift+click
+    /// ranges from here.
+    fn select_only(&mut self, name: &str) {
+        self.primary = Some(name.to_owned());
+        self.set.clear();
+        self.set.insert(name.to_owned());
+        self.anchor = Some(name.to_owned());
+    }
+
+    /// Add `name` to the selection and focus it (Shift+open / Shift+arrow),
+    /// keeping the existing members.
+    fn add(&mut self, name: &str) {
+        self.primary = Some(name.to_owned());
+        self.set.insert(name.to_owned());
+        self.anchor = Some(name.to_owned());
+    }
+
+    /// Select every frame (Ctrl+A). The primary is kept when it is still a
+    /// member (it always is), else cleared.
+    fn select_all(&mut self, names: impl Iterator<Item = String>) {
+        self.set = names.collect();
+        if self
+            .primary
+            .as_deref()
+            .is_some_and(|p| !self.set.contains(p))
+        {
+            self.primary = None;
+        }
+    }
+
+    /// Drop the whole selection (roll close / bare-grid escape).
+    fn clear(&mut self) {
+        self.primary = None;
+        self.set.clear();
+        self.anchor = None;
+    }
+
+    /// Apply a frame-tile click with the current modifier state. Plain click
+    /// focuses and selects one frame; Ctrl+click toggles membership (moving the
+    /// focus off a removed frame so the primary stays selected); Shift+click
+    /// selects the inclusive range from the anchor through the clicked frame in
+    /// grid `order` (missing anchor → a plain single selection).
+    fn apply_click(&mut self, clicked: &str, ctrl: bool, shift: bool, order: &[Tile]) {
+        if shift
+            && let Some(anchor) = self.anchor.as_deref()
+            && let (Some(click_idx), Some(anchor_idx)) = (
+                order.iter().position(|tile| tile.name == clicked),
+                order.iter().position(|tile| tile.name == anchor),
+            )
+        {
+            let (lo, hi) = if anchor_idx <= click_idx {
+                (anchor_idx, click_idx)
+            } else {
+                (click_idx, anchor_idx)
+            };
+            self.set.clear();
+            for tile in &order[lo..=hi] {
+                self.set.insert(tile.name.clone());
+            }
+            self.primary = Some(clicked.to_owned());
+            self.anchor = Some(clicked.to_owned());
+            return;
+        }
+        // No usable anchor: fall through to toggle/single.
+
+        if ctrl {
+            if self.set.remove(clicked) {
+                // Keep the focus a member: on removing the focused frame, move
+                // the focus to another member (or none when the set empties).
+                if self.primary.as_deref() == Some(clicked) {
+                    self.primary = self.set.iter().next().cloned();
+                }
+            } else {
+                self.add(clicked);
+            }
+            return;
+        }
+
+        self.select_only(clicked);
+    }
+}
+
 /// A film roll: a user-chosen directory of negatives, listed as a cover tile
 /// on the library page. Double-clicking (or Enter on the selected roll) drills
 /// into its frame grid.
@@ -782,7 +895,7 @@ pub(crate) enum Message {
     /// Open the library cell currently selected by a single click
     /// (`library_selection`), from Enter or a double click — a roll drills into
     /// its frame grid, the Add Roll tile opens the folder picker; on the frame
-    /// page it opens the frame currently highlighted by `frame_selected`.
+    /// page it opens the currently highlighted frame (the selection primary).
     OpenSelected,
     /// A roll tile was double-clicked — drill into its frame grid.
     RollActivated(PathBuf),
@@ -1189,9 +1302,7 @@ impl cosmic::Application for AppModel {
             rolls: Vec::new(),
             active: None,
             library_selection: None,
-            frame_selected: None,
-            selected_frames: HashSet::new(),
-            selection_anchor: None,
+            frame_sel: FrameSelection::default(),
             modifiers: keyboard::Modifiers::default(),
             editing_key_held: false,
             // A 3-wide grid is a safe initial guess until the first resize.
@@ -1358,7 +1469,7 @@ impl cosmic::Application for AppModel {
         // (a focused/highlighted frame or an open detail view); on the library
         // page no frame is ever selected, even when a roll is. Paste
         // additionally needs a non-empty edit clipboard to apply.
-        let frame_context = self.frame_selected.is_some() || self.selected.is_some();
+        let frame_context = self.frame_sel.primary().is_some() || self.selected.is_some();
         let copy_edits = if frame_context {
             menu::Item::Button(fl!("menu-copy-edits"), None, MenuAction::CopyEdits)
         } else {
@@ -1373,8 +1484,8 @@ impl cosmic::Application for AppModel {
         // "Calibrate from this frame" designates the current frame as the
         // roll's calibration frame; meaningful with an eligible frame selected.
         // The handler no-ops without one, so the menu gates on its selection.
-        let calibrate_enabled =
-            self.active.is_some() && (self.selected.is_some() || self.frame_selected.is_some());
+        let calibrate_enabled = self.active.is_some()
+            && (self.selected.is_some() || self.frame_sel.primary().is_some());
         let calibrate_items = if calibrate_enabled {
             vec![
                 menu::Item::Divider,
@@ -1412,7 +1523,7 @@ impl cosmic::Application for AppModel {
         // view, a highlighted frame inside a roll, or a roll selected on the
         // library page (the page guards make it a no-op everywhere else).
         let details_enabled = self.selected.is_some()
-            || (self.active.is_some() && self.frame_selected.is_some())
+            || (self.active.is_some() && self.frame_sel.primary().is_some())
             || (self.active.is_none()
                 && matches!(&self.library_selection, Some(LibrarySelection::Roll(_))));
         let details = if details_enabled {
@@ -1585,8 +1696,8 @@ impl cosmic::Application for AppModel {
                 if self.selected.is_some() || self.active.is_none() {
                     return None;
                 }
-                let name = self.frame_selected.as_ref()?;
-                if !self.tiles.iter().any(|tile| &tile.name == name) {
+                let name = self.frame_sel.primary()?;
+                if !self.tiles.iter().any(|tile| tile.name == name) {
                     return None;
                 }
 
@@ -1866,9 +1977,7 @@ impl cosmic::Application for AppModel {
                 // by `persist_roll` at the top of this arm).
                 self.active = None;
                 self.selected = None;
-                self.frame_selected = None;
-                self.selected_frames.clear();
-                self.selection_anchor = None;
+                self.frame_sel.clear();
                 self.grid_viewport = None;
                 self.tiles = Vec::new();
                 self.frame_meta_inflight = None;
@@ -2252,7 +2361,7 @@ impl cosmic::Application for AppModel {
             Message::OpenSelected => {
                 if self.active.is_some() {
                     // Frame page: open the highlighted frame in the detail view.
-                    if let Some(name) = self.frame_selected.clone() {
+                    if let Some(name) = self.frame_sel.primary().map(str::to_owned) {
                         self.open_frame(&name)
                     } else {
                         Task::none()
@@ -2271,26 +2380,19 @@ impl cosmic::Application for AppModel {
             Message::Key(input) => self.on_key(&input),
 
             Message::FrameSelected(name) => {
-                // The clicked tile is always the keyboard focus / primary, even
-                // when a multi-select toggle removes it from the selection set.
-                self.frame_selected = Some(name.clone());
-                let (updated, anchor) = apply_frame_click(
-                    std::mem::take(&mut self.selected_frames),
+                self.frame_sel.apply_click(
                     &name,
                     self.modifiers.control(),
                     self.modifiers.shift(),
-                    self.selection_anchor.as_deref(),
                     &self.tiles,
                 );
-                self.selected_frames = updated;
-                self.selection_anchor = anchor;
                 self.ensure_frame_info_loaded().unwrap_or_else(Task::none)
             }
 
             Message::SelectAllFrames => {
                 if self.active.is_some() {
-                    self.selected_frames =
-                        self.tiles.iter().map(|tile| tile.name.clone()).collect();
+                    let names = self.tiles.iter().map(|tile| tile.name.clone());
+                    self.frame_sel.select_all(names);
                 }
                 Task::none()
             }
@@ -2339,10 +2441,7 @@ impl cosmic::Application for AppModel {
                 // Pre-select the first frame so the grid always has a
                 // highlight (the detail view stays closed; Enter opens it).
                 if let Some(first) = self.tiles.first() {
-                    self.frame_selected = Some(first.name.clone());
-                    self.selected_frames.clear();
-                    self.selected_frames.insert(first.name.clone());
-                    self.selection_anchor = Some(first.name.clone());
+                    self.frame_sel.select_only(&first.name);
                 }
 
                 // The grid's remembered drawer state can only be applied once a
@@ -2705,6 +2804,12 @@ impl AppModel {
         }
     }
 
+    /// Whether the frame tile `name` is in the open roll's multi-selection
+    /// (drives its accent ring); exposed for the grid view.
+    pub(crate) fn frame_is_selected(&self, name: &str) -> bool {
+        self.frame_sel.contains(name)
+    }
+
     /// Ensures the library page always has a selection once rolls exist:
     /// whenever nothing is selected, highlight the first visible roll
     /// (respecting an active search). No-op while a roll is open, while no roll
@@ -2744,9 +2849,7 @@ impl AppModel {
         self.persist_roll();
         self.active = Some(dir.clone());
         self.selected = None;
-        self.frame_selected = None;
-        self.selected_frames.clear();
-        self.selection_anchor = None;
+        self.frame_sel.clear();
         self.grid_viewport = None;
         self.frame_meta_inflight = None;
         self.clear_detail();
@@ -2772,18 +2875,15 @@ impl AppModel {
             // `handle_detail_ready`).
             let stored_tone = self.roll.tone(name);
             self.selected = Some(name.to_owned());
-            self.frame_selected = Some(name.to_owned());
             // The opened frame becomes the primary of the multi-selection (and
             // the Shift+click anchor), so copy/paste batches stay consistent
-            // with what is on screen.  Shift+open extends; a plain open
-            // collapses the set to the single opened frame.
+            // with what is on screen. Shift+open extends; a plain open collapses
+            // the set to the single opened frame.
             if self.modifiers.shift() {
-                self.selected_frames.insert(name.to_owned());
+                self.frame_sel.add(name);
             } else {
-                self.selected_frames.clear();
-                self.selected_frames.insert(name.to_owned());
+                self.frame_sel.select_only(name);
             }
-            self.selection_anchor = Some(name.to_owned());
             self.clear_detail();
             self.tone = stored_tone;
             self.crop = self.roll.crop(name);
@@ -2811,27 +2911,23 @@ impl AppModel {
         ])
     }
 
-    /// The frames the next export should target: every multi-selected frame
-    /// when the user has built a multi-selection, otherwise just the focused/
-    /// highlighted frame (which also mirrors the open detail frame). Empty when
-    /// no roll is open or nothing is focused.
+    /// The frames the next export should target: the frame-grid selection (the
+    /// focused frame is always a member). Empty when no roll is open or nothing
+    /// is selected.
     fn export_targets(&self) -> Vec<String> {
         if self.active.is_none() {
             return Vec::new();
         }
-        if self.selected_frames.is_empty() {
-            return self.frame_selected.iter().cloned().collect();
-        }
         // Deterministic order for the export so a re-run writes files in the
         // same sequence (a HashSet has no stable order).
-        let mut names: Vec<String> = self.selected_frames.iter().cloned().collect();
+        let mut names: Vec<String> = self.frame_sel.iter().cloned().collect();
         names.sort();
         names
     }
 
     /// Whether [`Self::export_targets`] would yield at least one frame.
     fn has_export_targets(&self) -> bool {
-        self.active.is_some() && (self.frame_selected.is_some() || !self.selected_frames.is_empty())
+        self.active.is_some() && !self.frame_sel.is_empty()
     }
 
     /// Exports every target frame into `dest`, one file per frame named
@@ -3329,7 +3425,7 @@ impl AppModel {
         let Some(name) = self
             .selected
             .clone()
-            .or_else(|| self.frame_selected.clone())
+            .or_else(|| self.frame_sel.primary().map(str::to_owned))
         else {
             return Task::none();
         };
@@ -3871,7 +3967,7 @@ impl AppModel {
                 self.active.is_none()
                     && matches!(&self.library_selection, Some(LibrarySelection::Roll(_)))
             }
-            DrawerView::Grid => self.active.is_some() && self.frame_selected.is_some(),
+            DrawerView::Grid => self.active.is_some() && self.frame_sel.primary().is_some(),
             DrawerView::Detail => self.selected.is_some(),
         }
     }
@@ -3995,7 +4091,7 @@ impl AppModel {
         if self.context_page != ContextPage::FrameInfo || !self.core.window.show_context {
             return None;
         }
-        let name = self.frame_selected.clone()?;
+        let name = self.frame_sel.primary()?.to_owned();
         let dir = self.active.clone()?;
         let needs_parse = self
             .tiles
@@ -4275,23 +4371,20 @@ impl AppModel {
             // Bare frame grid: move the highlight, then reveal it if it stepped
             // out of the viewport.
             let selected = self
-                .frame_selected
-                .as_ref()
-                .and_then(|name| self.tiles.iter().position(|tile| tile.name == *name));
+                .frame_sel
+                .primary()
+                .and_then(|name| self.tiles.iter().position(|tile| tile.name == name));
             let len = self.tiles.len();
             let cols = self.nav_cols();
             if let Some(target) = nav_target(selected, len, cols, dir) {
                 let name = self.tiles[target].name.clone();
-                self.frame_selected = Some(name.clone());
                 // Shift+arrow extends the multi-selection (keeping it
                 // additive); a plain arrow collapses to the new primary.
                 if self.modifiers.shift() {
-                    self.selected_frames.insert(name.clone());
+                    self.frame_sel.add(&name);
                 } else {
-                    self.selected_frames.clear();
-                    self.selected_frames.insert(name.clone());
+                    self.frame_sel.select_only(&name);
                 }
-                self.selection_anchor = Some(name.clone());
                 return Task::batch([
                     self.scroll_selection_into_view("frames-grid", target, len, cols),
                     self.ensure_frame_info_loaded().unwrap_or_else(Task::none),
@@ -4529,12 +4622,16 @@ impl AppModel {
 
     /// Copies the focused frame's full edit (exposure + tone curve) to the
     /// edit clipboard for a later [`Self::paste_edits`]. The focus is the
-    /// primary grid frame (`frame_selected`), falling back to the open detail
-    /// frame `selected`. No-op when there is nothing focused/selected.
+    /// primary grid frame, falling back to the open detail frame `selected`.
+    /// No-op when there is nothing focused/selected.
     fn copy_edits(&mut self) {
-        let source = self.frame_selected.as_deref().or(self.selected.as_deref());
+        let source = self
+            .frame_sel
+            .primary()
+            .or(self.selected.as_deref())
+            .map(str::to_owned);
         if let Some(source) = source {
-            self.clipboard = Some(self.roll.tone(source));
+            self.clipboard = Some(self.roll.tone(&source));
         }
     }
 
@@ -4548,12 +4645,12 @@ impl AppModel {
             return Task::none();
         };
 
-        // Target frames: the multi-selection, else the focused (or open) frame.
+        // Target frames: the whole selection (the focused frame is a member),
+        // plus the open detail frame as a defensive fallback.
         let mut targets: Vec<String> = self
-            .selected_frames
+            .frame_sel
             .iter()
             .cloned()
-            .chain(self.frame_selected.clone())
             .chain(self.selected.clone())
             .collect();
         targets.sort();
@@ -4996,66 +5093,6 @@ fn open_roll_picker() -> Task<cosmic::Action<Message>> {
             Err(_) => Message::Ignore,
         }
     })
-}
-
-/// Updates the multi-selection after a frame tile is clicked, given the current
-/// modifier state and the visible (filtered) `order` of frames.
-///
-/// - Plain click: replace the selection with just the clicked frame.
-/// - Ctrl+click: toggle the clicked frame's membership.
-/// - Shift+click: replace the selection with the inclusive range from the
-///   `anchor` through the clicked frame (in `order`); a missing anchor or a
-///   clicked frame outside `order` collapses to a plain single selection.
-///
-/// Returns the new selection set and the new shift-anchor (the clicked frame,
-/// unless it was toggled out by a Ctrl+click, in which case the anchor is
-/// unchanged so a later Shift+click still sources a valid frame).
-fn apply_frame_click(
-    mut selected: HashSet<String>,
-    clicked: &str,
-    ctrl: bool,
-    shift: bool,
-    anchor: Option<&str>,
-    order: &[Tile],
-) -> (HashSet<String>, Option<String>) {
-    // Index of the clicked frame in the grid order (None when not present).
-    let click_idx = order.iter().position(|tile| tile.name == clicked);
-
-    if shift {
-        // Range: anchor through clicked, inclusive, in display order.
-        if let Some(anchor) = anchor
-            && let (Some(click_idx), Some(anchor_idx)) =
-                (click_idx, order.iter().position(|tile| tile.name == anchor))
-        {
-            let (lo, hi) = if anchor_idx <= click_idx {
-                (anchor_idx, click_idx)
-            } else {
-                (click_idx, anchor_idx)
-            };
-            selected.clear();
-            for tile in &order[lo..=hi] {
-                selected.insert(tile.name.clone());
-            }
-            return (selected, Some(clicked.to_owned()));
-        }
-        // No usable anchor: fall through to a plain single selection.
-    }
-
-    if ctrl {
-        if selected.contains(clicked) {
-            selected.remove(clicked);
-            // Keep the anchor stable (the toggled-off frame is gone from the
-            // set but may still be the focus); return the old anchor.
-            return (selected, anchor.map(str::to_owned));
-        }
-        selected.insert(clicked.to_owned());
-        return (selected, Some(clicked.to_owned()));
-    }
-
-    // Plain click: single selection.
-    selected.clear();
-    selected.insert(clicked.to_owned());
-    (selected, Some(clicked.to_owned()))
 }
 
 /// Column count for a fluid grid of `THUMB_SIZE` cells at `available` width,
@@ -5846,7 +5883,7 @@ pub(crate) enum ContextPage {
     /// The metadata drawer for the library roll selection (`library_selection`).
     RollInfo,
     /// The frame-info drawer on the frames grid: name, dimensions, and basic
-    /// EXIF for the highlighted frame (`frame_selected`).
+    /// EXIF for the highlighted frame (`frame_sel.primary()`).
     FrameInfo,
 }
 
@@ -7198,52 +7235,78 @@ mod tests {
         assert_eq!(key_action(Mode::Browse, &ch("r"), false, false), None);
     }
 
+    fn frame_tiles() -> Vec<Tile> {
+        vec![tile("a"), tile("b"), tile("c"), tile("d")]
+    }
+
     #[test]
-    fn plain_click_selects_a_single_frame() {
-        let tiles = vec![tile("a"), tile("b"), tile("c")];
-        let (set, anchor) = apply_frame_click(HashSet::new(), "b", false, false, None, &tiles);
-        let mut v: Vec<_> = set.into_iter().collect();
-        v.sort();
-        assert_eq!(v, vec!["b".to_string()]);
-        assert_eq!(anchor.as_deref(), Some("b"));
+    fn plain_click_selects_and_focuses_a_single_frame() {
+        let tiles = frame_tiles();
+        let mut sel = FrameSelection::default();
+        sel.apply_click("b", false, false, &tiles);
+        assert_eq!(sel.primary(), Some("b"));
+        let mut names: Vec<_> = sel.iter().cloned().collect();
+        names.sort();
+        assert_eq!(names, vec!["b".to_string()]);
     }
 
     #[test]
     fn ctrl_click_toggles_membership() {
-        let tiles = vec![tile("a"), tile("b"), tile("c")];
-        let start: HashSet<String> = ["a", "b"].into_iter().map(str::to_owned).collect();
-        // Toggle "b" off.
-        let (set, anchor) = apply_frame_click(start.clone(), "b", true, false, Some("a"), &tiles);
-        assert_eq!(set.len(), 1);
-        assert!(set.contains("a"));
-        assert!(!set.contains("b"));
-        assert_eq!(anchor.as_deref(), Some("a"));
-        // Toggle "c" on.
-        let (set, _) = apply_frame_click(start, "c", true, false, Some("a"), &tiles);
-        assert_eq!(set.len(), 3);
+        let tiles = frame_tiles();
+        let mut sel = FrameSelection::default();
+        sel.select_only("a");
+        sel.add("b");
+        // Toggle "b" off: it leaves the set and the focus moves to "a".
+        sel.apply_click("b", true, false, &tiles);
+        assert_eq!(sel.primary(), Some("a"));
+        assert!(sel.contains("a"));
+        assert!(!sel.contains("b"));
+        // Toggle "c" on: it joins and becomes the focus.
+        sel.apply_click("c", true, false, &tiles);
+        assert_eq!(sel.primary(), Some("c"));
+        assert_eq!(sel.iter().count(), 2);
+        assert!(sel.contains("a") && sel.contains("c"));
     }
 
     #[test]
-    fn shift_click_selects_range_anchor_to_clicked() {
-        let tiles = vec![tile("a"), tile("b"), tile("c"), tile("d")];
-        // Anchor "a", click "c" → selects a..=c.
-        let (set, anchor) = apply_frame_click(HashSet::new(), "c", false, true, Some("a"), &tiles);
-        let mut v: Vec<_> = set.into_iter().collect();
-        v.sort();
-        assert_eq!(v, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
-        assert_eq!(anchor.as_deref(), Some("c"));
+    fn ctrl_click_removing_the_last_frame_clears_the_focus() {
+        let tiles = frame_tiles();
+        let mut sel = FrameSelection::default();
+        sel.select_only("a");
+        sel.apply_click("a", true, false, &tiles);
+        assert!(sel.is_empty());
+        assert_eq!(sel.primary(), None);
+    }
+
+    #[test]
+    fn shift_click_selects_the_anchor_range() {
+        let tiles = frame_tiles();
+        // Anchor "a", click "c" → selects a..=c, focus "c".
+        let mut sel = FrameSelection::default();
+        sel.select_only("a");
+        sel.apply_click("c", false, true, &tiles);
+        assert_eq!(sel.primary(), Some("c"));
+        let mut names: Vec<_> = sel.iter().cloned().collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
         // Reverse range: anchor "d", click "b" → selects b..=d.
-        let (set, _) = apply_frame_click(HashSet::new(), "b", false, true, Some("d"), &tiles);
-        assert_eq!(set.len(), 3);
-        assert!(set.contains("b") && set.contains("c") && set.contains("d"));
+        let mut sel = FrameSelection::default();
+        sel.select_only("d");
+        sel.apply_click("b", false, true, &tiles);
+        assert_eq!(sel.iter().count(), 3);
+        assert!(sel.contains("b") && sel.contains("c") && sel.contains("d"));
     }
 
     #[test]
     fn shift_click_without_anchor_collapses_to_single() {
-        let tiles = vec![tile("a"), tile("b"), tile("c")];
-        let (set, _) = apply_frame_click(HashSet::new(), "b", false, true, None, &tiles);
-        assert_eq!(set.len(), 1);
-        assert!(set.contains("b"));
+        let tiles = frame_tiles();
+        let mut sel = FrameSelection::default();
+        sel.apply_click("b", false, true, &tiles);
+        assert_eq!(sel.primary(), Some("b"));
+        assert_eq!(sel.iter().count(), 1);
     }
 
     use edit_manifest::CropDirection as Dir;

@@ -131,7 +131,7 @@ pub(crate) fn frames_view(app: &AppModel) -> Element<'_, Message> {
         let grid = Grid::with_children(app.tiles.iter().map(|tile| {
             tile_view(
                 tile,
-                app.selected_frames.contains(&tile.name),
+                app.frame_is_selected(&tile.name),
                 is_calibration_frame(app.roll.calibration_frame(), &tile.name),
             )
         }))
